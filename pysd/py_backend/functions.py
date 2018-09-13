@@ -1012,3 +1012,58 @@ def log(x, base):
     base: base of the logarithm
     """
     return np.log(x) / np.log(base)
+
+
+def logical_operation(*conditions, func):
+    """
+    Numpy's logical_or expanded to take into account the case logical_or(Vector, Matrix)
+    by making np.logical_or(Matrix, Vector)
+    -----
+    Works well for 2 arguments only. May misbehave if >2 arguments passed.
+    """
+    try:
+        conditions = xr.align(*conditions)
+    except AttributeError:
+        #print(list(map(type, conditions)), type(conditions[0]) == bool, type(conditions[1]) == bool)
+        for x in conditions:
+            if type(x) != xr.DataArray:
+                break
+        else:
+            print('======\nError: unable to align DataArrays in logical_', conditions, '\n======')
+            raise
+    try:
+        c0, c1 = conditions[0], conditions[1]
+        if len(c0.shape) > len(c1.shape) and c0.dims[0] == c1.dims[0]:
+            c0 = c0.T
+        elif len(c1.shape) > len(c0.shape) and c0.dims[0] == c1.dims[0]:
+            c0, c1 = c1.T, c0
+        elif c0.dims == reversed(c1.dims):
+            c1 = c1.T
+        conditions = (c0, c1) + conditions[2:]  # the rest of the conditions are assumed to be ok and not checked. If not: ValueError exception
+    except:
+        pass
+    try:
+        ret = func(*conditions)
+    except ValueError:
+        ret = func(*reversed(conditions))
+    return ret
+
+
+def logical_or(*conditions):
+    """
+    Numpy's logical_or expanded to take into account the case logical_or(Vector, Matrix)
+    by making np.logical_or(Matrix, Vector)
+    -----
+    Works well for 2 arguments only. May misbehave if >2 arguments passed.
+    """
+    return logical_operation(*conditions, func=np.logical_or)
+
+
+def logical_and(*conditions):
+    """
+    Numpy's logical_and expanded to take into account the case logical_or(Vector, Matrix)
+    by making np.logical_and(Matrix, Vector)
+    -----
+    Works well for 2 arguments only. May misbehave if >2 arguments passed.
+    """
+    return logical_operation(*conditions, func=np.logical_and)
