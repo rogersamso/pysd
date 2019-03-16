@@ -410,3 +410,21 @@ def get_value_by_insensitive_key_or_value(key, dict):
             return real_value
 
     return None
+
+
+def align_by_dims(ret, dims_tuple):
+    """
+    Returns aligned xr.DataArray in accordance with dims_tuple
+    or the input, if it's another type (supposedly, float).
+    Notice that the name transpose() is misleading: it transposes only if no argument.
+    Otherwise, it aligns accordingly.
+    :param ret: xr.DataArray or float
+    :param indices_tuple: tuple of str
+    :return: type(ret)
+    """
+    try:
+        aligned = ret.dims == dims_tuple
+    except:
+        return ret
+    else:
+        return ret if aligned else ret.transpose(*dims_tuple)

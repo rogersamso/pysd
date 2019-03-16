@@ -22,6 +22,9 @@ import xarray as xr
 from funcsigs import signature
 import os
 
+small_vensim = 1e-14
+
+
 try:
     import scipy.stats as stats
 
@@ -131,7 +134,7 @@ class Stateful(object):
 
 
 class Integ(Stateful):
-    def __init__(self, ddt, initial_value):
+    def __init__(self, ddt, initial_value, id=1):
         """
 
         Parameters
@@ -144,6 +147,7 @@ class Integ(Stateful):
         self.init_func = initial_value
         self.ddt = ddt
         self.shape_info = None
+        self.id = id
 
     def initialize(self):
         self.state = self.init_func()
@@ -171,7 +175,7 @@ class Delay(Stateful):
     # This method forces them to acknowledge that additional structure is being created
     # in the delay object.
 
-    def __init__(self, delay_input, delay_time, initial_value, order):
+    def __init__(self, delay_input, delay_time, initial_value, order, id=1):
         """
 
         Parameters
@@ -187,6 +191,7 @@ class Delay(Stateful):
         self.input_func = delay_input
         self.order_func = order
         self.order = None
+        self.id = id
 
     def initialize(self):
         order = self.order_func()
@@ -344,6 +349,7 @@ class Macro(Stateful):
             if progress:
                 remaining.difference_update(progress)
             else:
+                element.initialize()
                 raise KeyError('Unresolvable Reference: Probable circular initialization' +
                                '\n'.join([repr(e) for e in remaining]))
 
@@ -920,7 +926,36 @@ def lookup_discrete(x, xs, ys):
 
 
 def if_then_else(condition, val_if_true, val_if_false):
-    return np.where(condition, val_if_true, val_if_false)
+    con_xr = type(condition) == xr.DataArray
+
+    # short circuit if a scalar condition
+    # made to avoid computation of other part
+    # if not con_xr:
+    #    return val_if_true if condition else val_if_false
+
+    true_xr = type(val_if_true) == xr.DataArray
+    false_xr = type(val_if_false) == xr.DataArray
+
+    if true_xr and false_xr and con_xr:
+        val_if_true, val_if_false, condition = xr.align(val_if_true, val_if_false, condition)
+        return val_if_true.where(condition, val_if_false)
+    elif not true_xr and false_xr and con_xr:
+        val_if_false, condition = xr.align(val_if_false, condition)
+        return val_if_false.where(np.logical_not(condition), val_if_true)
+    elif true_xr and not false_xr and con_xr:
+        val_if_true, condition = xr.align(val_if_true, condition)
+        return val_if_true.where(condition, val_if_false)
+    elif true_xr and false_xr:
+        val_if_true, val_if_false = xr.align(val_if_true, val_if_false)
+        return val_if_true.where(condition, val_if_false)
+    elif not true_xr and false_xr:
+        return val_if_false.where(not condition, val_if_true)
+    elif true_xr and not false_xr:
+        return val_if_true.where(condition, val_if_false)
+    elif con_xr:
+        return (condition * 0 + val_if_true).where(condition, val_if_false)
+    else:
+        return np.where(condition, val_if_true, val_if_false)
 
 
 def xidz(numerator, denominator, value_if_denom_is_zero):
@@ -942,11 +977,25 @@ def xidz(numerator, denominator, value_if_denom_is_zero):
     numerator / denominator if denominator > 1e-6
     otherwise, returns value_if_denom_is_zero
     """
-    small = 1e-6  # What is considered zero according to Vensim Help
-    if abs(denominator) < small:
-        return value_if_denom_is_zero
+    small = small_vensim  # What is considered zero according to Vensim Help
+    num_xr = type(numerator) == xr.DataArray
+    den_xr = type(denominator) == xr.DataArray
+    val_xr = type(value_if_denom_is_zero) == xr.DataArray
+
+    # alignment
+    if num_xr and den_xr and not val_xr:
+        numerator, denominator = xr.align(numerator, denominator)
+    elif num_xr and den_xr and val_xr:
+        numerator, denominator, value_if_denom_is_zero = xr.align(numerator, denominator, value_if_denom_is_zero)
+    elif num_xr and not den_xr and val_xr:
+        numerator, value_if_denom_is_zero = xr.align(numerator, value_if_denom_is_zero)
+    elif not num_xr and den_xr and val_xr:
+        denominator, value_if_denom_is_zero = xr.align(denominator, value_if_denom_is_zero)
+
+    if not num_xr and not den_xr:
+        return np.where(np.absolute(denominator) < small, value_if_denom_is_zero, np.divide(numerator, denominator))
     else:
-        return numerator * 1.0 / denominator
+        return (numerator / denominator).where(np.absolute(denominator) >= small, value_if_denom_is_zero)
 
 
 def zidz(numerator, denominator):
@@ -967,11 +1016,17 @@ def zidz(numerator, denominator):
     otherwise zero.
     """
     # Todo: make this work for arrays
-    small = 1e-6  # What is considered zero according to Vensim Help
-    if abs(denominator) < small:
-        return 0
+    small = small_vensim  # What is considered zero according to Vensim Help
+    num_xr = type(numerator) == xr.DataArray
+    den_xr = type(denominator) == xr.DataArray
+
+    if num_xr and den_xr:
+        numerator, denominator = xr.align(numerator, denominator)
+        return (numerator / denominator).where(np.absolute(denominator) >= small, 0)
+    elif num_xr or den_xr:
+        return (numerator / denominator).where(np.absolute(denominator) >= small, 0)
     else:
-        return numerator * 1.0 / denominator
+        return (numerator / denominator if abs(denominator) >= small else 0)
 
 
 def active_initial(expr, init_val):
@@ -1012,3 +1067,72 @@ def log(x, base):
     base: base of the logarithm
     """
     return np.log(x) / np.log(base)
+
+
+def sum(data=None, dim=None):
+    if dim is None:
+        if type(data) == xr.DataArray:
+            return np.sum(data).values
+        else:
+            return np.sum(data)
+    else:
+        try:
+            return data.sum(dim=dim)
+        except:
+            print('Array ', data, 'IS NOT DataArray')
+            raise
+
+
+def logical_operation(*conditions, func):
+    """
+    Numpy's logical_or expanded to take into account the case logical_or(Vector, Matrix)
+    by making np.logical_or(Matrix, Vector)
+    -----
+    Works well for 2 arguments only. May misbehave if >2 arguments passed.
+    """
+    try:
+        conditions = xr.align(*conditions)
+    except AttributeError:
+        #print(list(map(type, conditions)), type(conditions[0]) == bool, type(conditions[1]) == bool)
+        for x in conditions:
+            if type(x) != xr.DataArray:
+                break
+        else:
+            print('======\nError: unable to align DataArrays in logical_', conditions, '\n======')
+            raise
+    try:
+        c0, c1 = conditions[0], conditions[1]
+        if len(c0.shape) > len(c1.shape) and c0.dims[0] == c1.dims[0]:
+            c0 = c0.T
+        elif len(c1.shape) > len(c0.shape) and c0.dims[0] == c1.dims[0]:
+            c0, c1 = c1.T, c0
+        elif c0.dims == reversed(c1.dims):
+            c1 = c1.T
+        conditions = (c0, c1) + conditions[2:]  # the rest of the conditions are assumed to be ok and not checked. If not: ValueError exception
+    except:
+        pass
+    try:
+        ret = func(*conditions)
+    except ValueError:
+        ret = func(*reversed(conditions))
+    return ret
+
+
+def logical_or(*conditions):
+    """
+    Numpy's logical_or expanded to take into account the case logical_or(Vector, Matrix)
+    by making np.logical_or(Matrix, Vector)
+    -----
+    Works well for 2 arguments only. May misbehave if >2 arguments passed.
+    """
+    return logical_operation(*conditions, func=np.logical_or)
+
+
+def logical_and(*conditions):
+    """
+    Numpy's logical_and expanded to take into account the case logical_or(Vector, Matrix)
+    by making np.logical_and(Matrix, Vector)
+    -----
+    Works well for 2 arguments only. May misbehave if >2 arguments passed.
+    """
+    return logical_operation(*conditions, func=np.logical_and)
