@@ -212,13 +212,14 @@ class Delay(Stateful):
 
 
 class Smooth(Stateful):
-    def __init__(self, smooth_input, smooth_time, initial_value, order):
+    def __init__(self, smooth_input, smooth_time, initial_value, order, id=1):
         super(Smooth, self).__init__()
         self.init_func = initial_value
         self.smooth_time_func = smooth_time
         self.input_func = smooth_input
         self.order_func = order
         self.order = None
+        self.id = id
 
     def initialize(self):
         self.order = self.order_func()  # The order can only be set once
