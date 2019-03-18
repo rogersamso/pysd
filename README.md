@@ -1,9 +1,10 @@
-PySD
+PySD fork for pymedeas models
 ====
 [![Coverage Status](https://coveralls.io/repos/github/JamesPHoughton/pysd/badge.svg?branch=master)](https://coveralls.io/github/JamesPHoughton/pysd?branch=master)
 [![Code Health](https://landscape.io/github/JamesPHoughton/pysd/master/landscape.svg?style=flat)](https://landscape.io/github/JamesPHoughton/pysd/master)
 [![Build Status](https://travis-ci.org/JamesPHoughton/pysd.svg?branch=master)](https://travis-ci.org/JamesPHoughton/pysd)
 
+This is a fork of the [official PySD repository](https://github.com/JamesPHoughton/pysd), which includes some adaptations needed to run the [pymedeas models](https://gitlab.com/MEDEAS/pymedeas_models).
 
 Simulating System Dynamics Models in Python
 
