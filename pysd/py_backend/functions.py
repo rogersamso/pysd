@@ -897,6 +897,7 @@ def lookup(x, xs, ys):
     """
     return np.interp(x, xs, ys)
 
+
 def lookup_extrapolation(x, xs, ys):
     """
     Intermediate values are calculated with linear interpolation between the intermediate points.
@@ -915,6 +916,7 @@ def lookup_extrapolation(x, xs, ys):
         return ys[length - 1] + (x - xs[length - 1]) * k
     return np.interp(x, xs, ys)
 
+
 def lookup_discrete(x, xs, ys):
     """
     Intermediate values take on the value associated with the next lower x-coordinate (also called a step-wise function). The last two points of a discrete graphical function must have the same y value.
@@ -927,16 +929,17 @@ def lookup_discrete(x, xs, ys):
 
 
 def if_then_else(condition, val_if_true, val_if_false):
-    con_xr = type(condition) == xr.DataArray
 
+    # checking if parameters are xarrays
+    con_xr = isinstance(condition, xr.DataArray)
+    true_xr = isinstance(val_if_true, xr.DataArray)
+    false_xr = isinstance(val_if_false, xr.DataArray)
     # short circuit if a scalar condition
     # made to avoid computation of other part
     # if not con_xr:
     #    return val_if_true if condition else val_if_false
 
-    true_xr = type(val_if_true) == xr.DataArray
-    false_xr = type(val_if_false) == xr.DataArray
-
+    # Todo improve this!!!
     if true_xr and false_xr and con_xr:
         val_if_true, val_if_false, condition = xr.align(val_if_true, val_if_false, condition)
         return val_if_true.where(condition, val_if_false)
@@ -979,9 +982,9 @@ def xidz(numerator, denominator, value_if_denom_is_zero):
     otherwise, returns value_if_denom_is_zero
     """
     small = small_vensim  # What is considered zero according to Vensim Help
-    num_xr = type(numerator) == xr.DataArray
-    den_xr = type(denominator) == xr.DataArray
-    val_xr = type(value_if_denom_is_zero) == xr.DataArray
+    num_xr = isinstance(numerator, xr.DataArray)
+    den_xr = isinstance(denominator, xr.DataArray)
+    val_xr = isinstance(value_if_denom_is_zero, xr.DataArray)
 
     # alignment
     if num_xr and den_xr and not val_xr:
@@ -1018,8 +1021,8 @@ def zidz(numerator, denominator):
     """
     # Todo: make this work for arrays
     small = small_vensim  # What is considered zero according to Vensim Help
-    num_xr = type(numerator) == xr.DataArray
-    den_xr = type(denominator) == xr.DataArray
+    num_xr = isinstance(numerator, xr.DataArray)
+    den_xr = isinstance(denominator, xr.DataArray)
 
     if num_xr and den_xr:
         numerator, denominator = xr.align(numerator, denominator)
@@ -1071,8 +1074,8 @@ def log(x, base):
 
 
 def sum(data=None, dim=None):
-    if dim is None:
-        if type(data) == xr.DataArray:
+    if not dim:
+        if isinstance(data, xr.DataArray):
             return np.sum(data).values
         else:
             return np.sum(data)
@@ -1096,7 +1099,7 @@ def logical_operation(*conditions, func):
     except AttributeError:
         #print(list(map(type, conditions)), type(conditions[0]) == bool, type(conditions[1]) == bool)
         for x in conditions:
-            if type(x) != xr.DataArray:
+            if not isinstance(x, xr.DataArray):
                 break
         else:
             print('======\nError: unable to align DataArrays in logical_', conditions, '\n======')
