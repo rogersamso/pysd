@@ -795,6 +795,7 @@ class Model(Macro):
 
         for t2 in time_steps[1:]:
             if self.time() in return_timestamps:
+                print("time = {}".format(int(self.time())))
                 outputs.append({key: getattr(self.components, key)() for key in capture_elements})
             self._euler_step(t2 - self.time())
             self.time.update(t2)  # this will clear the stepwise caches
