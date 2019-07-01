@@ -308,6 +308,16 @@ class Macro(Stateful):
         self._stateful_elements = [getattr(self.components, name) for name in dir(self.components)
                                    if isinstance(getattr(self.components, name),
                                                  Stateful)]
+
+        # getting stateful elements contained inside lists
+        # this could be optimised with list comprehensions
+        for name in dir(self.components):
+            if isinstance(getattr(self.components, name), list):
+                for element in getattr(self.components, name):
+                    if isinstance(element, Stateful):
+                        self._stateful_elements.append(element)
+
+
         if return_func is not None:
             self.return_func = getattr(self.components, return_func)
         else:
