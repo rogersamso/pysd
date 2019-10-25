@@ -366,6 +366,7 @@ functions = {
     "exprnd": "np.random.exponential",
     "random uniform": "functions.random_uniform",
     "sum": "np.sum",
+    "pysd_sum": "functions.sum",
     "arccos": "np.arccos",
     "arcsin": "np.arcsin",
     "arctan": "np.arctan",
