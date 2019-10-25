@@ -1123,6 +1123,14 @@ def sum(data=None, dim=None):
             print('Array ', data, 'IS NOT DataArray')
             raise
 
+def sum1(arr):
+    dim = arr.dims[0]
+    return sum(arr, dim)
+
+def sum2(arr):
+    dim = arr.dims[1]
+    return sum(arr, dim)
+
 
 def logical_operation(*conditions, func):
     """
