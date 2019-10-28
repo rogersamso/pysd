@@ -735,7 +735,7 @@ def parse_general_expression(element, namespace=None, subscript_dict=None, macro
                     data = np.array([float(s) for s in text.split(',')]).reshape(shape)
                 else:
                     data = np.tile(float(n.text), shape)
-                datastr = np.array2string(data, separator=',').replace('\n', '').replace(' ', '')
+                datastr = np.array2string(data, separator=',', threshold=1500).replace('\n', '').replace(' ', '')
                 return textwrap.dedent("""\
                     xr.DataArray(data=%(datastr)s,
                                  coords=%(coords)s,
