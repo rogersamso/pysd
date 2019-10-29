@@ -237,11 +237,12 @@ class Smooth(Stateful):
 
 
 class Trend(Stateful):
-    def __init__(self, trend_input, average_time, initial_trend):
+    def __init__(self, trend_input, average_time, initial_trend, id=1):
         super(Trend, self).__init__()
         self.init_func = initial_trend
         self.average_time_function = average_time
         self.input_func = trend_input
+        self.id = id
 
     def initialize(self):
         self.state = self.input_func() / (1 + self.init_func() * self.average_time_function())
