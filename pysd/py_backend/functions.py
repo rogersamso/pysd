@@ -1114,8 +1114,7 @@ def log(x, base):
 def sum(data=None, dim=None):
     if not dim:
         if isinstance(data, xr.DataArray):
-            return float(np.sum(data.astype(np.float64)))
-        
+            return np.sum(data).values
         else:
             return np.sum(data)
     else:
