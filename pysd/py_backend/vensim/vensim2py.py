@@ -365,7 +365,9 @@ functions = {
     "log": "functions.log",
     "exprnd": "np.random.exponential",
     "random uniform": "functions.random_uniform",
-    "sum": "np.sum",
+    "sum": "functions.sum",
+    "sum1": "functions.sum1",
+    "sum2": "functions.sum2",
     "arccos": "np.arccos",
     "arcsin": "np.arcsin",
     "arctan": "np.arctan",
@@ -640,7 +642,7 @@ def parse_general_expression(element, namespace=None, subscript_dict=None, macro
     subscript_list = "[" _ ((sub_name / sub_element) _ ","? _)+ "]"
 
     array = (number _ ("," / ";")? _)+ !~r"."  # negative lookahead for anything other than an array
-    number = ~r"\d+\.?\d*(e[+-]\d+)?"
+    number = ("+"/"-")? ~r"\d+\.?\d*(e[+-]\d+)?"
 
     id = ( basic_id / escape_group )
     basic_id = ~r"\w[\w\d_\s\']*"IU
@@ -733,7 +735,7 @@ def parse_general_expression(element, namespace=None, subscript_dict=None, macro
                     data = np.array([float(s) for s in text.split(',')]).reshape(shape)
                 else:
                     data = np.tile(float(n.text), shape)
-                datastr = np.array2string(data, separator=',').replace('\n', '').replace(' ', '')
+                datastr = np.array2string(data, separator=',', threshold=1500).replace('\n', '').replace(' ', '')
                 return textwrap.dedent("""\
                     xr.DataArray(data=%(datastr)s,
                                  coords=%(coords)s,
