@@ -6,8 +6,6 @@ PySD fork for pymedeas models
 
 This is a fork of the [official PySD repository](https://github.com/JamesPHoughton/pysd), which includes some adaptations needed to run the [pymedeas models](https://gitlab.com/MEDEAS/pymedeas_models).
 
-Simulating System Dynamics Models in Python
-
 This project is a simple library for running [System Dynamics](http://en.wikipedia.org/wiki/System_dynamics) models in python, with the purpose of improving integration of *Big Data* and *Machine Learning* into the SD workflow. 
 
 
