@@ -19,6 +19,7 @@ import warnings
 import random
 import inspect
 import xarray as xr
+import pickle
 from funcsigs import signature
 import os
 
@@ -112,8 +113,11 @@ class Stateful(object):
     # the integrator needs to be able to 'get' the current state of the object,
     # and get the derivative. It calculates the new state, and updates it. The state
     # can be any object which is subject to basic (element-wise) algebraic operations
+    idCounter = -1
     def __init__(self):
         self._state = None
+        self.idNumber = Stateful.idCounter
+        Stateful.idCounter += 1
 
     def __call__(self, *args, **kwargs):
         return self.state
@@ -318,6 +322,9 @@ class Macro(Stateful):
                     if isinstance(element, Stateful):
                         self._stateful_elements.append(element)
 
+        self._stateful_elements_ids = [element.idNumber
+                                       for element in self._stateful_elements]
+
 
         if return_func is not None:
             self.return_func = getattr(self.components, return_func)
@@ -325,6 +332,7 @@ class Macro(Stateful):
             self.return_func = lambda: 0
 
         self.py_model_file = py_model_file
+        self.init_order_file = self.py_model_file[:-3] + '_init_order.pkl'
 
 
     def __call__(self):
@@ -334,7 +342,7 @@ class Macro(Stateful):
         """ Returns the version of pysd complier that used for generating this model """
         return self.components.__pysd_version__
         
-    def initialize(self, initialization_order=None):
+    def initialize(self):
         """
         This function tries to initialize the stateful objects.
 
@@ -361,24 +369,45 @@ class Macro(Stateful):
             'scope': self,
             'time': self.time
         })
+        remaining = np.array(self._stateful_elements)
+        
+        init_file_exists = os.path.exists(self.init_order_file)
+        init_order = None
+       
+        if init_file_exists:
+            with open(self.init_order_file, 'rb') as f:
+                init_order = pickle.load(f)
+            if len(remaining) == len(init_order):
+                print("Reading initialization order")
+                order = [self._stateful_elements_ids.index(o) for o in init_order]
+                remaining = remaining[order]
 
-        remaining = set(self._stateful_elements)
+        new_init_order = []
+        n_remain = len(remaining)
 
-        while remaining:
-            progress = set()
-            for element in remaining:
+        while n_remain > 0:
+            new_added = np.zeros(n_remain, dtype=bool)
+            for i, element in enumerate(remaining):
                 try:
                     element.initialize()
-                    progress.add(element)
+                    new_added[i] = True
+                    new_init_order.append(element.idNumber)
                 except (KeyError, TypeError, AttributeError):
                     pass
 
-            if progress:
-                remaining.difference_update(progress)
+            if new_added.any():
+                remaining = remaining[~new_added]
+                n_remain = len(remaining)
             else:
                 element.initialize()
-                raise KeyError('Unresolvable Reference: Probable circular initialization' +
-                               '\n'.join([repr(e) for e in remaining]))
+                raise KeyError('Unresolvable Reference: '
+                               + 'Probable circular initialization'
+                               + '\n'.join([repr(e) for e in remaining]))
+
+        if not (init_file_exists and new_init_order == init_order):
+            print("Saving initialization order")
+            with open(self.init_order_file, 'wb') as f:
+                pickle.dump(new_init_order, f)
 
     def ddt(self):
         return np.array([component.ddt() for component in self._stateful_elements], dtype=object)
