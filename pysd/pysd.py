@@ -49,7 +49,7 @@ def read_vensim(mdl_file):
     return model
 
 
-def load(py_model_file):
+def load(py_model_file, initialize=True):
     """
     Load a python-converted model file.
 
@@ -58,10 +58,13 @@ def load(py_model_file):
     py_model_file : <string>
         Filename of a model which has already been converted into a
          python format.
+    initialize : bool
+        True for initialize Stateful variables when loading the model.
+        Default is True.
 
     Examples
     --------
     >>> model = load('../tests/test-models/samples/teacup/teacup.py')
     """
     from .py_backend import functions
-    return functions.Model(py_model_file)
+    return functions.Model(py_model_file, initialize)
