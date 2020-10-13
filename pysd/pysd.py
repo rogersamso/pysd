@@ -13,16 +13,15 @@ Sept 2016: Major refactor, putting most internal code into the Model and Macro o
 """
 
 
-def read_xmile(xmile_file):
+def read_xmile(xmile_file, initialize=True):
     """ Construct a model object from `.xmile` file. """
-    from . import py_backend
     from .py_backend.xmile.xmile2py import translate_xmile
     py_model_file = translate_xmile(xmile_file)
-    model = load(py_model_file)
+    model = load(py_model_file, initialize)
     model.xmile_file = xmile_file
     return model
 
-def read_vensim(mdl_file):
+def read_vensim(mdl_file, initialize=True):
     """
     Construct a model from Vensim `.mdl` file.
 
@@ -42,14 +41,13 @@ def read_vensim(mdl_file):
     """
 
     from .py_backend.vensim.vensim2py import translate_vensim
-    from .py_backend import functions
     py_model_file = translate_vensim(mdl_file)
-    model = functions.Model(py_model_file)
+    model = load(py_model_file, initialize)
     model.mdl_file = mdl_file
     return model
 
 
-def load(py_model_file):
+def load(py_model_file, initialize=True):
     """
     Load a python-converted model file.
 
@@ -58,10 +56,13 @@ def load(py_model_file):
     py_model_file : <string>
         Filename of a model which has already been converted into a
          python format.
+    initialize : bool
+        True for initialize Stateful variables when loading the model.
+        Default is True.
 
     Examples
     --------
     >>> model = load('../tests/test-models/samples/teacup/teacup.py')
     """
     from .py_backend import functions
-    return functions.Model(py_model_file)
+    return functions.Model(py_model_file, initialize)
