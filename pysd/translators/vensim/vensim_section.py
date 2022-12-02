@@ -14,7 +14,7 @@ from ..structures.abstract_model import\
     AbstractElement, AbstractControlElement, AbstractSection
 
 from . import vensim_utils as vu
-from .vensim_element import Element, SubscriptRange, Component
+from .vensim_element import Element, SubscriptRange, Component, Constraint
 
 
 class Section():
@@ -113,7 +113,7 @@ class Section():
             # parse all elements
             self.elements = [element.parse() for element in self.elements]
 
-            # split subscript from other components
+            # split subscripts and constraints from other components
             self.subscripts = [
                 element for element in self.elements
                 if isinstance(element, SubscriptRange)
@@ -122,11 +122,17 @@ class Section():
                 element for element in self.elements
                 if isinstance(element, Component)
             ]
+            self.constraints = [
+                element for element in self.elements
+                if isinstance(element, Constraint)
+            ]
 
             # reorder element list for better printing
-            self.elements = self.subscripts + self.components
+            self.elements = self.subscripts + self.components + \
+                self.constraints
 
             [component.parse() for component in self.components]
+            [constraint.parse() for constraint in self.constraints]
 
     def get_abstract_section(self) -> AbstractSection:
         """
@@ -155,6 +161,10 @@ class Section():
                 for subs_range in self.subscripts
             ],
             elements=self._merge_components(),
+            reality_checks=[
+                constraint.get_abstract_constraint()
+                for constraint in self.constraints
+            ],
             split=self.split,
             views_dict=self.views_dict
         )

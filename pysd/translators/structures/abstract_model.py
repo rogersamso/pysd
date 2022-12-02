@@ -313,9 +313,20 @@ class AbstractSubscriptRange:
 
 
 @dataclass
+class AbstractConstraint:
+
+    name: str
+    condition: object
+    consequence: object
+
+    def __str__(self) -> str:  # pragma: no cover
+        raise NotImplemented()
+
+
+@dataclass
 class AbstractSection:
     """
-    Dataclass for an element.
+    Dataclass for a section.
 
     Parameters
     ----------
@@ -336,6 +347,8 @@ class AbstractSection:
         Tuple of AbstractSubscriptRanges that are defined in the section.
     elements: tuple
         Tuple of AbstractElements that are defined in the section.
+    reality_checks: list
+        List of AbstractConstraint
     split: bool
         If split is True the created section will split the variables
         depending on the views_dict.
@@ -351,6 +364,7 @@ class AbstractSection:
     returns: List[str]
     subscripts: Tuple[AbstractSubscriptRange]
     elements: Tuple[AbstractElement]
+    reality_checks: List[AbstractConstraint]
     split: bool
     views_dict: Union[dict, None]
 
@@ -390,7 +404,7 @@ class AbstractSection:
 @dataclass
 class AbstractModel:
     """
-    Dataclass for an element.
+    Dataclass for a model.
 
     Parameters
     ----------

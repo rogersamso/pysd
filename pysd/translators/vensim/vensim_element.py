@@ -4,6 +4,7 @@ Depending on the LHS value, either a SubscriptRange object or a Component
 object will be returned. There are 4 components types:
 
 - Component: Regular component, defined with '='.
+- Constraint: constraint for Reality check, defined with ':THE CONDITION:'
 - UnchangeableConstant: Unchangeable constant, defined with '=='.
 - Data: Data component, defined with ':='
 - Lookup: Lookup component, defined with '()'
@@ -21,7 +22,8 @@ import numpy as np
 
 from ..structures.abstract_model import\
     AbstractData, AbstractLookup, AbstractComponent,\
-    AbstractUnchangeableConstant, AbstractSubscriptRange
+    AbstractUnchangeableConstant, AbstractSubscriptRange, \
+    AbstractConstraint
 
 from . import vensim_utils as vu
 from .vensim_structures import structures, parsing_ops
@@ -206,6 +208,10 @@ class ElementsComponentVisitor(parsimonious.NodeVisitor):
             prefix_start + str(i) for i in range(num_start, num_end + 1)
             ]
 
+    def visit_constraint_definition(self, n, vc):
+        self.component = Constraint(self.name,
+                                    self.expression)
+
     def visit_name(self, n, vc):
         self.name = vc[0].strip()
 
@@ -224,6 +230,55 @@ class ElementsComponentVisitor(parsimonious.NodeVisitor):
 
     def generic_visit(self, n, vc):
         return "".join(filter(None, vc)) or n.text
+
+
+class Constraint():
+    """
+    Constraint definition, defined by :THE CONDITION" in Vensim.
+    """
+
+    def __init__(self, name: str, expression: str):
+        self.name = name
+        self.expression = expression
+        self.condition = None
+        self.consequence = None
+
+    def __str__(self):
+        return "\nConstraint definition:  %s\n\t%s\n" % (
+            self.name,
+            "%s <- %s" % (self.condition, self.consequence)
+            )
+
+    @property
+    def _verbose(self) -> str:  # pragma: no cover
+        """Get constraint information."""
+        return self.__str__()
+
+    @property
+    def verbose(self):  # pragma: no cover
+        """Print constraint information to standard output."""
+        print(self._verbose)
+
+    def parse(self) -> None:
+        tree = vu.Grammar.get("components").parse(self.expression)
+        self.ast = ConstraintVisitor(tree).translation
+
+    def get_abstract_constraint(self) -> AbstractConstraint:
+        """
+        Instantiates an AbstractConstraint object used for building.
+        This method is automatically called by the Sections's
+        get_abstract_section method.
+
+        Returns
+        -------
+        AbstractConstraint: AbstractConstraint
+          AbstractConstraint object that may be used for building
+          the model in another programming language.
+
+        """
+        return AbstractConstraint(name=self.name,
+                                  condition=self.ast[0],
+                                  consequence=self.ast[1])
 
 
 class SubscriptRange():
@@ -711,3 +766,15 @@ class EquationVisitor(parsimonious.NodeVisitor):
 
     def add_element(self, element):
         return vu.add_element(self.elements, element)
+
+
+class ConstraintVisitor(EquationVisitor):
+
+    def __init__(self, ast):
+        super().__init__(ast)
+
+    def visit_expr_type(self, n, vc):
+        pass
+
+    def visit_constraint_def(self, n, vc):
+        self.translation = (self.elements[vc[1]], self.elements[vc[5]])

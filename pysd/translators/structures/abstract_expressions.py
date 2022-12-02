@@ -144,6 +144,23 @@ class GameStructure(AbstractSyntax):
 
 
 @dataclass
+class ConstraintStructure(AbstractSyntax):
+    """
+    Dataclass for a constraint structure.
+
+    Parameters
+    ----------
+    expression: AST
+        The expression inside the game call.
+
+    """
+    expression: Union[AbstractSyntax, float]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return "ConstraintStructure:\n\t%s" % self.expression
+
+
+@dataclass
 class AllocateAvailableStructure(AbstractSyntax):
     """
     Dataclass for a Allocate Available structure.

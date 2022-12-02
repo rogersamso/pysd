@@ -1,6 +1,8 @@
 # Parsing Expression Grammar: components
 
-expr_type = array / final_expr
+expr_type = array / constraint_def / final_expr
+
+constraint_def = _ final_expr? _ ":IMPLIES:" _ final_expr
 
 final_expr = logic_expr (_ logic_oper _ logic_expr)*  # logic operators (:and:, :or:)
 logic_expr = not_oper? _ comp_expr  # :not: operator
@@ -12,6 +14,7 @@ neg_expr = pre_oper? _ expr  # pre operators (-, +)
 expr = lookup_with_def / call / parens / number / reference / nan
 
 lookup_with_def = ~r"(WITH\ LOOKUP)"I _ "(" _ final_expr _ "," _ "(" _  limits?  ( _ "(" _ raw_number _ "," _ raw_number _ ")" _ ","? _ )+ _ ")" _ ")"
+
 
 nan = ":NA:"
 
