@@ -9,6 +9,7 @@ import re
 from typing import Union, List
 from pathlib import Path
 import warnings
+import logging
 import parsimonious
 from collections.abc import Mapping
 
@@ -17,6 +18,8 @@ from ..structures.abstract_model import AbstractModel
 from . import vensim_utils as vu
 from .vensim_section import Section
 from .vensim_utils import supported_extensions
+
+logger = logging.getLogger("translation." + __name__)
 
 
 class VensimFile():

@@ -325,6 +325,8 @@ class SectionBuilder:
             _root, "%(model_name)s")
 
         component = Component()
+
+        set_runtime_logger(_root / 'runtime.log', logging.INFO)
         """ % {
             "params": f"\n        _params = {self.params}\n"
                       if self.params else "",
@@ -378,6 +380,9 @@ class SectionBuilder:
         }
 
         _root = Path(__file__).parent
+
+        set_runtime_logger(_root / 'runtime.log', logging.INFO)
+
         %(params)s
         %(subscript_dict)s
 

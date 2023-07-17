@@ -7,6 +7,7 @@ a separate file).
 """
 import time
 import warnings
+import logging
 import inspect
 import pickle
 from pathlib import Path
@@ -28,6 +29,7 @@ from .lookups import HardcodedLookups
 from .components import Components, Time
 from .output import ModelOutput
 
+logger = logging.getLogger("runtime." + __name__)
 
 class Macro(DynamicStateful):
     """
@@ -1958,6 +1960,7 @@ class Model(Macro):
             self._euler_step(self.time.time_step())
             self.time.update(self.time()+self.time.time_step())
             self.clean_caches()
+            logger.debug("integration step: %s", self.time())
             progressbar.update()
 
         # need to add one more time step, because we run only the state

@@ -3,6 +3,7 @@ Model components and time managing classes.
 """
 
 from warnings import warn
+import logging
 import os
 import random
 import inspect
@@ -11,6 +12,8 @@ import importlib.util
 import numpy as np
 
 from pysd._version import __version__
+
+logger = logging.getLogger("runtime." + __name__)
 
 
 class Component(object):

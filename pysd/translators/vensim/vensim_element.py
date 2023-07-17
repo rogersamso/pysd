@@ -21,6 +21,7 @@ element-like objects could be defined, which are only used for testing:
 import re
 from typing import Union, Tuple, List
 import warnings
+import logging
 
 import parsimonious
 import numpy as np
@@ -33,6 +34,7 @@ from ..structures.abstract_model import\
 from . import vensim_utils as vu
 from .vensim_structures import structures, parsing_ops
 
+logger = logging.getLogger("translation." + __name__)
 
 class Element():
     """

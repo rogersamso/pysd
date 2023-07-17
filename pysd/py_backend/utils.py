@@ -15,7 +15,19 @@ import progressbar
 import numpy as np
 import xarray as xr
 import pandas as pd
+import logging
 
+def set_runtime_logger(path, level=logging.INFO):
+
+    runtime_logger = logging.getLogger("runtime")
+    runtime_logger.setLevel(level)
+    f_handler = logging.FileHandler(path, mode="w")
+    f_handler.setLevel(level)
+    formatter = logging.Formatter(fmt='%(asctime)s — %(name)s — %(levelname)s — %(funcName)s:%(lineno)d — %(message)s')
+    f_handler.setFormatter(formatter)
+    runtime_logger.addHandler(f_handler)
+
+    return runtime_logger
 
 def xrsplit(array):
     """

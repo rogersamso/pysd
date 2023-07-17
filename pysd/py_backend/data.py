@@ -1,4 +1,5 @@
 import warnings
+import logging
 import re
 import random
 from pathlib import Path
@@ -8,6 +9,8 @@ import xarray as xr
 import pandas as pd
 
 from .utils import load_outputs
+
+logger = logging.getLogger("runtime." + __name__)
 
 
 class Columns():

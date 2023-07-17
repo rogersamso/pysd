@@ -5,12 +5,14 @@ between others. The Macro class and Model class are also Stateful type.
 However, they are defined appart as they are more complex.
 """
 import warnings
+import logging
 
 import numpy as np
 import xarray as xr
 
 from .functions import zidz, if_then_else
 
+logger = logging.getLogger("runtime." + __name__)
 
 SMALL_VENSIM = 1e-6  # What is considered zero according to Vensim Help
 
@@ -24,6 +26,7 @@ class Stateful(object):
         self._state = None
         self.shape_info = None
         self.py_name = ""
+        logger.info("logging stateful object")
 
     def __call__(self, *args, **kwargs):
         return self.state

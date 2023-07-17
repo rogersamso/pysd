@@ -7,6 +7,7 @@ functions may be similar to the original functions given by Vensim or
 Stella, but sometimes the number or order of arguments may change.
 """
 import warnings
+import logging
 from datetime import datetime
 
 import numpy as np
@@ -16,6 +17,7 @@ from . import utils
 
 SMALL_VENSIM = 1e-6  # What is considered zero according to Vensim Help
 
+logger = logging.getLogger("runtime." + __name__)
 
 def ramp(time, slope, start, finish=None):
     """

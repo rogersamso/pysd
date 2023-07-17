@@ -55,6 +55,7 @@ class ImportsManager():
         text =\
             f'"""\nPython model \'{outfile}\'\nTranslated using PySD\n"""\n\n'
 
+        text += "import logging\n"
         text += "from pathlib import Path\n"
 
         for module, shortname in self._external_libs.items():
@@ -68,6 +69,8 @@ class ImportsManager():
                     "submodules": ", ".join(getattr(self, f"_{module}"))}
 
         text += "\n"
+
+        text += "from pysd.py_backend.utils import set_runtime_logger\n"
 
         for module in self._internal_libs:
             if getattr(self, f"_{module}"):

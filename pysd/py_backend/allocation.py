@@ -22,12 +22,15 @@ have differences in the numerical error propagation.
 
 """
 import itertools
+import logging
 from math import erfc
 
 import numpy as np
 import xarray as xr
 from scipy.optimize import least_squares
 import portion as p
+
+logger = logging.getLogger("runtime." + __name__)
 
 
 class Priorities:

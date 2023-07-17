@@ -1,10 +1,13 @@
 import warnings
+import logging
 
 import pandas as pd
 import numpy as np
 import xarray as xr
 
 from . import utils
+
+logger = logging.getLogger("runtime." + __name__)
 
 
 class Lookups(object):

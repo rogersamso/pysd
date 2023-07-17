@@ -9,6 +9,7 @@ BuildAST will be returned for each visited argument from the lower
 lever to the top level, giving the final expression.
 """
 import warnings
+import logging
 from dataclasses import dataclass
 from typing import Union
 
@@ -27,6 +28,8 @@ from pysd.translators.structures.abstract_expressions import\
 
 from .python_functions import functionspace
 from .subscripts import SubscriptManager
+
+logger = logging.getLogger("translation." + __name__)
 
 
 @dataclass

@@ -1,5 +1,6 @@
 import re
 import warnings
+import logging
 import uuid
 
 import parsimonious
@@ -7,6 +8,7 @@ from typing import Dict
 from pathlib import Path
 from chardet import detect
 
+logger = logging.getLogger("translation." + __name__)
 
 supported_extensions = [".mdl"]
 

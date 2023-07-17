@@ -6,6 +6,7 @@ the Stateful objects by functions.Model.initialize.
 
 import re
 import warnings
+import logging
 import pandas as pd
 import numpy as np
 import xarray as xr
@@ -13,6 +14,8 @@ from openpyxl import load_workbook
 from . import utils
 from .data import Data
 from .lookups import Lookups
+
+logger = logging.getLogger("runtime." + __name__)
 
 
 class Excels():
