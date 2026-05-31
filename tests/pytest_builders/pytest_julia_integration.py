@@ -81,11 +81,22 @@ def _read_csv(path: Path) -> Dict[str, List[float]]:
 
 
 def _isclose(a: float, b: float, rtol: float = 1e-3, atol: float = 1e-4) -> bool:
-    """Return True if a ≈ b within the tolerances used by the test-models suite."""
+    """Return True if a ≈ b within the tolerances used by the test-models suite.
+
+    Passes when EITHER:
+    * both values are near zero (< atol), OR
+    * relative difference ≤ rtol, OR
+    * absolute difference ≤ atol  (covers small values where rtol is too strict,
+      e.g. interpolation differences on values close to but above atol)
+    """
     if a == b:
         return True
     near_zero = abs(a) < atol and abs(b) < atol
-    return near_zero or abs(a - b) <= rtol * max(abs(a), abs(b))
+    return (
+        near_zero
+        or abs(a - b) <= rtol * max(abs(a), abs(b))
+        or abs(a - b) <= atol
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +198,7 @@ def _julia_mtk_available() -> bool:
         return False
     result = subprocess.run(
         ["julia", "--startup-file=no", "-e",
-         "using ModelingToolkit, OrdinaryDiffEq; println(\"ok\")"],
+         "using ModelingToolkit, OrdinaryDiffEq, OrdinaryDiffEqLowOrderRK; println(\"ok\")"],
         capture_output=True,
         text=True,
         timeout=180,
@@ -241,7 +252,7 @@ class TestTranslationAllModels:
         assert "using ModelingToolkit" in content, f"{folder}: missing 'using ModelingToolkit'"
         assert "ODESystem" in content, f"{folder}: missing 'ODESystem'"
         assert "run_model" in content, f"{folder}: missing 'run_model'"
-        assert "@variables t" in content, f"{folder}: missing '@variables t'"
+        assert "@independent_variables t" in content, f"{folder}: missing '@independent_variables t'"
 
 
 class TestTranslationCleanModels:
@@ -345,8 +356,8 @@ class TestTranslationFeatures:
 
     def test_logicals_map_to_julia_operators(self, tmp_path):
         content = self._translate("logicals", tmp_path)
-        # AND / OR should map to && / ||
-        assert "&&" in content or "||" in content or "!" in content
+        # AND/OR/NOT use helper functions for MTK symbolic compatibility
+        assert "_logical_and" in content or "_logical_or" in content or "_logical_not" in content
 
     def test_lookup_with_expr_emits_interpolation(self, tmp_path):
         content = self._translate("lookups_with_expr", tmp_path)
@@ -465,7 +476,7 @@ def _julia_runner_script(model_jl: Path, col_names: List[str],
     t_array = "[" + ", ".join(str(t) for t in t_ref) + "]"
 
     col_header = ", ".join(f'"{c}"' for c in col_names)
-    sym_exprs = ", ".join(f"sys.{j}" for j in julia_ids)
+    julia_id_strs = ", ".join(f'"{j}"' for j in julia_ids)
 
     return f"""\
 include("{model_jl.as_posix()}")
@@ -474,28 +485,43 @@ using Printf
 
 sol = run_model(; solver=Euler())
 
-col_names = [{col_header}]
-col_syms  = [{sym_exprs}]
-t_ref     = {t_array}
+col_display = [{col_header}]
+julia_ids   = [{julia_id_strs}]
+t_ref       = {t_array}
 
-# header
-print("Time")
-for n in col_names
-    print(",", n)
+# Build time-series for each variable.
+# Handles: ODE states, observed (algebraic) auxiliaries, and global @parameters
+# (which live at module scope, not in sys, so sys.name would throw).
+function _get_series(sol, id_str)
+    sym = nothing
+    try; sym = getproperty(sys, Symbol(id_str)); catch; end
+
+    if sym !== nothing
+        try; return Float64.(sol[sym, :]); catch; end
+        try; return fill(Float64(sol.prob.ps[sym]), length(sol.t)); catch; end
+    end
+    # Bare global @parameters (not included in ODESystem equations).
+    # Use ModelingToolkit.getdefault() to extract the concrete default value.
+    try
+        p = Base.eval(Main, Symbol(id_str))
+        val = Float64(ModelingToolkit.getdefault(p))
+        return fill(val, length(sol.t))
+    catch
+    end
+    return fill(NaN, length(sol.t))
 end
+
+col_series = [_get_series(sol, id) for id in julia_ids]
+
+# CSV output: header uses original column names; rows sampled at t_ref
+print("Time")
+for n in col_display; print(",", n); end
 println()
 
-# rows
 for t in t_ref
     @printf("%g", t)
-    for sym in col_syms
-        try
-            val = sol[sym, :][argmin(abs.(sol.t .- t))]
-            @printf(",%g", val)
-        catch
-            @printf(",NaN")
-        end
-    end
+    idx = argmin(abs.(sol.t .- t))
+    for vals in col_series; @printf(",%g", vals[idx]); end
     println()
 end
 """

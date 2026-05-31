@@ -37,8 +37,10 @@ from pysd.translators.structures.abstract_expressions import (
     GetConstantsStructure,
     GetDataStructure,
     GetLookupsStructure,
+    InitialStructure,
     IntegStructure,
     LookupsStructure,
+    ReferenceStructure,
     SampleIfTrueStructure,
     SmoothNStructure,
     SmoothStructure,
@@ -141,6 +143,7 @@ class JuliaSectionBuilder:
         self.param_decls: List[str] = []
         self.lookup_const_decls: List[str] = []
         self.lookup_func_decls: List[str] = []
+        self.lookup_register_decls: List[str] = []
         self.u0_entries: List[str] = []
         self.control_vals: Dict[str, Optional[str]] = {
             "initial_time": None,
@@ -162,18 +165,30 @@ class JuliaSectionBuilder:
         for elem in self.abstract_elements:
             self.namespace.add_to_namespace(elem.name)
 
-        # Second pass: process each element
+        # Second pass: process non-INITIAL elements so u0_entries is populated
+        # before INITIAL() elements are resolved (they look up stock initial values).
+        initial_elems = []
         for elem in self.abstract_elements:
             identifier = self.namespace.namespace[elem.name]
             is_control = isinstance(elem, AbstractControlElement)
+            comp = elem.components[0] if elem.components else None
+            if comp is not None and isinstance(comp.ast, InitialStructure):
+                initial_elems.append((elem, identifier, is_control))
+                continue
+            eqs = self._process_element(elem, identifier, is_control)
+            self.built_elements[identifier] = (eqs, is_control)
+
+        # Third pass: INITIAL elements (u0_entries now complete)
+        for elem, identifier, is_control in initial_elems:
             eqs = self._process_element(elem, identifier, is_control)
             self.built_elements[identifier] = (eqs, is_control)
 
         # Register any inline lookups collected while visiting ASTs
         for lut_name, xs, ys, itp_type in self.inline_registry.entries:
-            const_decl, func_decl = lookup_interpolation_code(lut_name, xs, ys, itp_type)
+            const_decl, func_decl, reg_decl = lookup_interpolation_code(lut_name, xs, ys, itp_type)
             self.lookup_const_decls.append(const_decl)
             self.lookup_func_decls.append(func_decl)
+            self.lookup_register_decls.append(reg_decl)
 
         if self.split and self.views_dict:
             self._build_modular()
@@ -205,12 +220,31 @@ class JuliaSectionBuilder:
 
         # ---- Named lookup table ----------------------------------------
         if isinstance(comp, AbstractLookup) and isinstance(ast, LookupsStructure):
-            const_decl, func_decl = lookup_interpolation_code(
+            const_decl, func_decl, reg_decl = lookup_interpolation_code(
                 identifier, ast.x, ast.y, ast.type
             )
             self.lookup_const_decls.append(const_decl)
             self.lookup_func_decls.append(func_decl)
+            self.lookup_register_decls.append(reg_decl)
             return []
+
+        # ---- INITIAL() — freeze inner expression at t=0 ----------------
+        # Vensim's INITIAL(x) returns the value of x at t=0.  We implement
+        # this as a @parameters constant equal to x's initial condition.
+        if isinstance(ast, InitialStructure):
+            val = self._resolve_initial_value(ast.initial)
+            if val is not None:
+                if not is_control:
+                    self.param_decls.append(f"@parameters {identifier} = {val}")
+                return []
+            else:
+                warn(
+                    f"Cannot resolve INITIAL() for '{elem.name}' — "
+                    "falling back to auxiliary variable (may not be constant)."
+                )
+                rhs = visitor.visit(ast.initial)
+                self.aux_decls.append(f"@variables {identifier}(t)")
+                return [f"{identifier} ~ {rhs}"]
 
         # ---- Stock (INTEG) ---------------------------------------------
         if isinstance(ast, IntegStructure):
@@ -372,6 +406,61 @@ class JuliaSectionBuilder:
         eqs.append(f"{identifier} ~ {prev_outflow}")
         return eqs
 
+    def _resolve_initial_value(self, inner_ast) -> Optional[str]:
+        """Return the t=0 value of *inner_ast* as a Julia literal, or None.
+
+        Handles:
+        * Numeric literals
+        * References to stocks (in ``u0_entries``)
+        * References to parameters/constants
+        * References to auxiliaries whose own equation chains back to a stock
+          (one level of indirection, e.g. ``INITIAL(InflowA)`` where
+          ``InflowA ~ StockA`` and StockA has a known initial condition)
+        """
+        from pysd.builders.julia.julia_expressions_builder import format_number
+        if isinstance(inner_ast, (int, float)):
+            return format_number(inner_ast)
+        if isinstance(inner_ast, ReferenceStructure):
+            return self._resolve_ref_initial(inner_ast.reference, depth=2)
+        return None
+
+    def _resolve_ref_initial(self, ref: str, depth: int) -> Optional[str]:
+        """Recursively resolve the t=0 value of a variable reference."""
+        if depth < 0:
+            return None
+        julia_id = self.namespace.get(ref)
+        if julia_id is None:
+            return None
+        # Check u0_entries (stocks)
+        for entry in self.u0_entries:
+            parts = entry.split("=>", 1)
+            if len(parts) == 2 and parts[0].strip() == julia_id:
+                return parts[1].strip()
+        # Check param_decls (constants)
+        for decl in self.param_decls:
+            prefix = f"@parameters {julia_id} = "
+            if decl.startswith(prefix):
+                return decl[len(prefix):]
+        # Follow an auxiliary equation one level deeper
+        if depth > 0 and julia_id in self.built_elements:
+            eqs, _ = self.built_elements[julia_id]
+            for eq in eqs:
+                if "~" in eq:
+                    rhs = eq.split("~", 1)[1].strip()
+                    # Plain number
+                    try:
+                        float(rhs)
+                        return rhs
+                    except ValueError:
+                        pass
+                    # Plain identifier → recurse
+                    import re as _re
+                    if _re.match(r"^[a-z_][a-z0-9_]*$", rhs):
+                        result = self._resolve_ref_initial(rhs, depth - 1)
+                        if result:
+                            return result
+        return None
+
     # ------------------------------------------------------------------
     # Single-file build
     # ------------------------------------------------------------------
@@ -498,7 +587,8 @@ class JuliaSectionBuilder:
     # ------------------------------------------------------------------
 
     def _file_header(self, extra_packages: bool = False) -> str:
-        uses = ["ModelingToolkit", "OrdinaryDiffEq"]
+        # OrdinaryDiffEq v7 split Euler into OrdinaryDiffEqLowOrderRK
+        uses = ["ModelingToolkit", "OrdinaryDiffEq", "OrdinaryDiffEqLowOrderRK"]
         if self.lookup_const_decls or extra_packages:
             uses.append("DataInterpolations")
         return (
@@ -508,7 +598,8 @@ class JuliaSectionBuilder:
             f"# Model {self.model_name}\n"
             f"# Translated using PySD version {__version__}\n\n"
             f"using {', '.join(uses)}\n\n"
-            "@variables t\n"
+            # MTK v9+ requires @independent_variables for the time variable
+            "@independent_variables t\n"
             "D = Differential(t)\n\n"
         )
 
@@ -525,9 +616,15 @@ class JuliaSectionBuilder:
         if not self.lookup_const_decls:
             return ""
         lines = ["# Lookup tables"]
-        for const_decl, func_decl in zip(self.lookup_const_decls, self.lookup_func_decls):
+        for const_decl, func_decl, reg_decl in zip(
+            self.lookup_const_decls, self.lookup_func_decls, self.lookup_register_decls
+        ):
             lines.append(const_decl)
             lines.append(func_decl)
+            # @register_symbolic must come after the function definition and
+            # after `using ModelingToolkit` so MTK treats it as a symbolic
+            # primitive (called each timestep rather than constant-folded).
+            lines.append(reg_decl)
         return "\n".join(lines) + "\n\n"
 
     def _declarations_block(self) -> str:
@@ -572,7 +669,9 @@ class JuliaSectionBuilder:
         return textwrap.dedent(f"""\
             function run_model(; u0=u0, tspan=tspan, dt={ts}, solver=Euler())
                 prob = ODEProblem(sys, u0, tspan)
-                solve(prob, solver; dt=dt)
+                # saveat ensures solution is stored at every dt step,
+                # which is required for correct output of observed (auxiliary) variables.
+                solve(prob, solver; dt=dt, saveat=tspan[1]:dt:tspan[2])
             end
             """)
 

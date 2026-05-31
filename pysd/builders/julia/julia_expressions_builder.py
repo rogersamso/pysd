@@ -96,19 +96,23 @@ BUILTIN_FUNCTIONS: dict = {
     "WITH_LOOKUP": "_with_lookup",
 }
 
-# One-line Julia implementations for helper functions
+# One-line Julia implementations for helper functions.
+# All conditions use `ifelse` + `&`/`|` instead of `?:` / `&&` / `||` so
+# they remain valid when called with symbolic (Num) arguments inside MTK equations.
 HELPER_IMPLEMENTATIONS: dict = {
     "_log_base": "_log_base(x, base) = log(base, x)",
-    "_xidz": "_xidz(x, y, z) = iszero(y) ? z : x / y",
-    "_zidz": "_zidz(x, y) = iszero(y) ? 0.0 : x / y",
+    "_xidz": "_xidz(x, y, z) = ifelse(iszero(y), z, x / y)",
+    "_zidz": "_zidz(x, y) = ifelse(iszero(y), 0.0, x / y)",
     "_pulse": (
         "_pulse(t_now, start, width) = "
-        "(t_now >= start && t_now < start + width) ? 1.0 : 0.0"
+        "ifelse((t_now >= start) & (t_now < start + width), 1.0, 0.0)"
     ),
+    # NOTE: the Vensim parser reorders PULSE TRAIN(start, width, interval, end)
+    # to CallStructure arguments (start, interval, width, end).
     "_pulse_train": (
-        "_pulse_train(t_now, start, width, interval, end_time) = "
-        "(t_now >= start && t_now <= end_time && "
-        "mod(t_now - start, interval) < width) ? 1.0 : 0.0"
+        "_pulse_train(t_now, start, interval, width, end_time) = "
+        "ifelse((t_now >= start) & (t_now <= end_time) & "
+        "(mod(t_now - start, interval) < width), 1.0, 0.0)"
     ),
     "_ramp": (
         "_ramp(t_now, slope, start_time, end_time=Inf) = "
@@ -116,8 +120,14 @@ HELPER_IMPLEMENTATIONS: dict = {
     ),
     "_step": (
         "_step(t_now, height, step_time) = "
-        "t_now >= step_time ? float(height) : 0.0"
+        "ifelse(t_now >= step_time, float(height), 0.0)"
     ),
+    # Vensim logical operators — values are always 0.0 (false) or 1.0 (true).
+    # Return Symbolic{Bool} via comparisons so the result can be used as the
+    # condition of a symbolic `ifelse` in MTK equations.
+    "_logical_and": "_logical_and(a, b) = (a > 0.5) & (b > 0.5)",
+    "_logical_or": "_logical_or(a, b) = (a > 0.5) | (b > 0.5)",
+    "_logical_not": "_logical_not(a) = !(a > 0.5)",
 }
 
 # Helper functions that receive the current time *t* as their first argument
@@ -170,18 +180,23 @@ def format_vector(values: tuple) -> str:
 
 def lookup_interpolation_code(
     name: str, xs: tuple, ys: tuple, _itp_type: str
-) -> Tuple[str, str]:
-    """Return ``(const_decl, func_decl)`` for a named lookup table.
+) -> Tuple[str, str, str]:
+    """Return ``(const_decl, func_decl, register_decl)`` for a named lookup table.
 
     Uses ``DataInterpolations.LinearInterpolation(u, t)`` where ``u`` are the
     y-values and ``t`` the x-values (DataInterpolations convention).
+
+    ``@register_symbolic`` tells ModelingToolkit that this is an opaque
+    external function so it is called at every timestep rather than being
+    constant-folded during structural_simplify.
     """
     xs_vec = format_vector(xs)
     ys_vec = format_vector(ys)
     itp_name = f"{name}_itp"
     const_decl = f"const {itp_name} = LinearInterpolation({ys_vec}, {xs_vec})"
     func_decl = f"{name}(x) = {itp_name}(x)"
-    return const_decl, func_decl
+    register_decl = f"@register_symbolic {name}(x::Real)"
+    return const_decl, func_decl, register_decl
 
 
 # ---------------------------------------------------------------------------
@@ -289,15 +304,30 @@ class JuliaASTVisitor:
         args = [self.visit(a) for a in node.arguments]
         ops = node.operators
 
+        # AND / OR / NOT: use helper functions so the expression remains valid
+        # when called with symbolic (Num) arguments inside MTK equations.
+        # Julia's &&/|| require a concrete Bool; the helpers use ifelse instead.
         if len(args) == 1:
+            op_key = ops[0].upper().strip(":")
+            if op_key in ("NOT", ":NOT:"):
+                self.needed_helpers.add("_logical_not")
+                return f"_logical_not({args[0]})"
             op = LOGIC_OPS.get(ops[0], ops[0])
             return f"({op}{args[0]})"
 
-        parts = [args[0]]
+        result = args[0]
         for op, arg in zip(ops, args[1:]):
-            parts.append(LOGIC_OPS.get(op, op))
-            parts.append(arg)
-        return "(" + " ".join(parts) + ")"
+            op_key = op.upper().strip(":")
+            if op_key in ("AND", ":AND:"):
+                self.needed_helpers.add("_logical_and")
+                result = f"_logical_and({result}, {arg})"
+            elif op_key in ("OR", ":OR:"):
+                self.needed_helpers.add("_logical_or")
+                result = f"_logical_or({result}, {arg})"
+            else:
+                julia_op = LOGIC_OPS.get(op, op)
+                result = f"({result} {julia_op} {arg})"
+        return result
 
     def _reference(self, node: ReferenceStructure) -> str:
         julia_name = self.namespace.get(node.reference)

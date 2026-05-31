@@ -266,7 +266,7 @@ class TestInlineLookupRegistry:
 class TestLookupInterpolationCode:
 
     def test_basic_output(self):
-        const_decl, func_decl = lookup_interpolation_code(
+        const_decl, func_decl, reg_decl = lookup_interpolation_code(
             "my_lut", (0.0, 1.0, 2.0), (0.0, 5.0, 10.0), "interpolate"
         )
         assert "LinearInterpolation" in const_decl
@@ -275,9 +275,11 @@ class TestLookupInterpolationCode:
         assert "[0.0, 5.0, 10.0]" in const_decl   # ys
         assert "[0.0, 1.0, 2.0]" in const_decl    # xs
         assert func_decl == "my_lut(x) = my_lut_itp(x)"
+        assert "@register_symbolic" in reg_decl
+        assert "my_lut" in reg_decl
 
     def test_const_keyword_present(self):
-        const_decl, _ = lookup_interpolation_code("lut", (1.0,), (2.0,), "extrapolate")
+        const_decl, _, _ = lookup_interpolation_code("lut", (1.0,), (2.0,), "extrapolate")
         assert const_decl.startswith("const ")
 
 
@@ -339,19 +341,35 @@ class TestJuliaASTVisitor:
         (">", ">"),
         ("<=", "<="),
         (">=", ">="),
-        (":AND:", "&&"),
-        (":OR:", "||"),
     ])
-    def test_logic_operators(self, vensim_op, julia_op):
+    def test_comparison_operators(self, vensim_op, julia_op):
         v, *_ = _visitor_with_namespace()
         node = LogicStructure(operators=[vensim_op], arguments=[1.0, 0.0])
         assert julia_op in v.visit(node)
 
-    def test_unary_not(self):
-        v, *_ = _visitor_with_namespace()
+    def test_and_uses_helper_function(self):
+        """AND maps to _logical_and helper (not &&) for symbolic MTK compatibility."""
+        v, _, _, needed = _visitor_with_namespace()
+        node = LogicStructure(operators=[":AND:"], arguments=[1.0, 0.0])
+        result = v.visit(node)
+        assert "_logical_and(" in result
+        assert "_logical_and" in needed
+
+    def test_or_uses_helper_function(self):
+        """OR maps to _logical_or helper (not ||) for symbolic MTK compatibility."""
+        v, _, _, needed = _visitor_with_namespace()
+        node = LogicStructure(operators=[":OR:"], arguments=[1.0, 0.0])
+        result = v.visit(node)
+        assert "_logical_or(" in result
+        assert "_logical_or" in needed
+
+    def test_unary_not_uses_helper_function(self):
+        """NOT maps to _logical_not helper for symbolic MTK compatibility."""
+        v, _, _, needed = _visitor_with_namespace()
         node = LogicStructure(operators=[":NOT:"], arguments=[1.0])
         result = v.visit(node)
-        assert "!" in result
+        assert "_logical_not(" in result
+        assert "_logical_not" in needed
 
     # --- references ---------------------------------------------------------
 
