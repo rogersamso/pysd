@@ -484,10 +484,8 @@ class JuliaSectionBuilder:
         display = ".".join(list(module_path.parts)[1:])
         eq_lines = ",\n    ".join(equations) if equations else ""
         text = textwrap.dedent(f"""\
-            \"\"\"
-            Module {display}
-            Translated using PySD version {__version__}
-            \"\"\"
+            # Module {display}
+            # Translated using PySD version {__version__}
 
             {eq_var} = Equation[
                 {eq_lines}
@@ -504,9 +502,11 @@ class JuliaSectionBuilder:
         if self.lookup_const_decls or extra_packages:
             uses.append("DataInterpolations")
         return (
-            f'"""\nModel {self.model_name}\n'
-            f"Translated using PySD version {__version__}\n"
-            f'"""\n'
+            # Use # comments, not a Julia docstring: a triple-quoted string
+            # immediately before `using` is parsed as "document the using
+            # statement" which is a syntax error.
+            f"# Model {self.model_name}\n"
+            f"# Translated using PySD version {__version__}\n\n"
             f"using {', '.join(uses)}\n\n"
             "@variables t\n"
             "D = Differential(t)\n\n"

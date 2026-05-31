@@ -398,13 +398,27 @@ class TestJuliaASTVisitor:
         )
         assert julia_name in v.visit(node)
 
-    def test_if_then_else(self):
+    @pytest.mark.parametrize("func_ref", ["IF THEN ELSE", "if_then_else"])
+    def test_if_then_else(self, func_ref):
+        """Both the space form and the underscore form (as stored by the parser) work."""
         v, *_ = _visitor_with_namespace()
         node = CallStructure(
-            function=ReferenceStructure(reference="IF THEN ELSE"),
+            function=ReferenceStructure(reference=func_ref),
             arguments=(1.0, 2.0, 3.0),
         )
         assert "ifelse" in v.visit(node)
+
+    @pytest.mark.parametrize("func_ref", ["PULSE TRAIN", "pulse_train"])
+    def test_pulse_train_both_forms(self, func_ref):
+        """Both the space form and the underscore form (as stored by the parser) work."""
+        v, _, _, needed = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference=func_ref),
+            arguments=(10.0, 1.0, 5.0, 100.0),
+        )
+        result = v.visit(node)
+        assert "_pulse_train" in result
+        assert "_pulse_train" in needed
 
     def test_unknown_function_warns(self):
         v, *_ = _visitor_with_namespace()

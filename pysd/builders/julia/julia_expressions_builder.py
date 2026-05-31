@@ -61,6 +61,8 @@ LOGIC_OPS: dict = {
 }
 
 # Vensim built-in function name  →  Julia function name
+# Keys are matched after .upper(), so include both "SPACE FORM" and "UNDERSCORE_FORM"
+# because the Vensim parser may store names either way.
 BUILTIN_FUNCTIONS: dict = {
     # Basic math
     "ABS": "abs",
@@ -78,16 +80,20 @@ BUILTIN_FUNCTIONS: dict = {
     "MIN": "min",
     "MAX": "max",
     "MODULO": "mod",
-    # Control flow
+    # Control flow — parser stores as "if_then_else" (underscores)
     "IF THEN ELSE": "ifelse",
+    "IF_THEN_ELSE": "ifelse",
     # SD helpers emitted into the generated file
     "LOG": "_log_base",
     "XIDZ": "_xidz",
     "ZIDZ": "_zidz",
     "PULSE": "_pulse",
     "PULSE TRAIN": "_pulse_train",
+    "PULSE_TRAIN": "_pulse_train",
     "RAMP": "_ramp",
     "STEP": "_step",
+    "WITH LOOKUP": "_with_lookup",
+    "WITH_LOOKUP": "_with_lookup",
 }
 
 # One-line Julia implementations for helper functions
