@@ -27,9 +27,9 @@ See the [project documentation](http://pysd.readthedocs.org/) for information ab
 
 For standard methods for data analysis with SD models, see the  [PySD Cookbook](https://github.com/SDXorg/PySD-Cookbook), containing (for example):
 
-- [Model Fitting](http://nbviewer.ipython.org/github/SDXorg/PySD-Cookbook/blob/master/source/analyses/fitting/Fitting_with_Optimization.ipynb)
-- [Surrogating model components with machine learning regressions](http://nbviewer.ipython.org/github/SDXorg/PySD-Cookbook/blob/master/source/analyses/surrogating_functions/Surrogating_with_regression.ipynb)
-- [Multi-Scale geographic comparison of model predictions](http://nbviewer.ipython.org/github/SDXorg/PySD-Cookbook/blob/master/source/analyses/geo/Exploring_models_across_geographic_scales.ipynb)
+- [Model Fitting](https://nbviewer.jupyter.org/github/SDXorg/PySD-Cookbook/blob/master/source/analyses/fitting/Fitting_with_Optimization.ipynb)
+- [Surrogating model components with machine learning regressions](https://nbviewer.jupyter.org/github/SDXorg/PySD-Cookbook/blob/master/source/analyses/surrogating_functions/Surrogating_with_regression.ipynb)
+- [Multi-Scale geographic comparison of model predictions](https://nbviewer.jupyter.org/github/SDXorg/PySD-Cookbook/blob/master/source/analyses/geo/Exploring_models_across_geographic_scales.ipynb)
 
 ## Why create a new SD simulation engine?
 
