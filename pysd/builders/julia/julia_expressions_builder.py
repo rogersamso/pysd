@@ -4,7 +4,7 @@ Converts AMR Abstract Syntax Tree nodes to Julia expression strings.
 from __future__ import annotations
 
 import re
-from typing import Any, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from warnings import warn
 
 from pysd.translators.structures.abstract_expressions import (
@@ -223,10 +223,16 @@ class JuliaASTVisitor:
         namespace,
         inline_registry: InlineLookupRegistry,
         needed_helpers: Set[str],
+        active_subs: Optional[Dict[str, str]] = None,
+        var_dims: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self.namespace = namespace
         self.registry = inline_registry
         self.needed_helpers = needed_helpers
+        # active_subs: dim_name -> julia index variable (e.g. {"sector": "_i"})
+        self.active_subs = active_subs or {}
+        # var_dims: julia identifier -> list of dim names it is subscripted over
+        self.var_dims = var_dims or {}
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -337,6 +343,12 @@ class JuliaASTVisitor:
                 "using a sanitised fallback identifier."
             )
             julia_name = re.sub(r"[^a-z0-9_]", "_", node.reference.lower())
+        # Append subscript indices when in an active 2D (or higher) subscript context
+        if self.active_subs and self.var_dims:
+            dims = self.var_dims.get(julia_name, [])
+            indices = [self.active_subs[d] for d in dims if d in self.active_subs]
+            if indices:
+                julia_name = julia_name + "[" + ", ".join(indices) + "]"
         return julia_name
 
     def _call(self, node: CallStructure) -> str:

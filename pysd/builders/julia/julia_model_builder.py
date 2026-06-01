@@ -9,6 +9,7 @@ Entry point::
 """
 from __future__ import annotations
 
+import itertools
 import re
 import textwrap
 from pathlib import Path
@@ -76,7 +77,6 @@ _UNSUPPORTED_STRUCTURES = (
     TrendStructure,
     ForecastStructure,
     SampleIfTrueStructure,
-    GetConstantsStructure,
     GetDataStructure,
     GetLookupsStructure,
     AllocateAvailableStructure,
@@ -132,19 +132,39 @@ class JuliaSectionBuilder:
         self.split: bool = abstract_section.split
         self.views_dict: Optional[dict] = abstract_section.views_dict
         self.abstract_elements: List[AbstractElement] = list(abstract_section.elements)
+        self._abstract_subscripts = abstract_section.subscripts
 
         self.namespace = JuliaNamespaceManager()
         self.inline_registry = InlineLookupRegistry()
         self.needed_helpers: Set[str] = set()
 
+        # Map subscript range name → number of elements
+        self._subs_sizes: Dict[str, int] = {}
+        for sr in self._abstract_subscripts:
+            if isinstance(sr.subscripts, list):
+                self._subs_sizes[sr.name] = len(sr.subscripts)
+            elif isinstance(sr.subscripts, str):
+                # copy alias — resolve later if needed, default to 0
+                self._subs_sizes[sr.name] = 0
+
+        # Map subscript range name → ordered list of element labels
+        self._subs_elems: Dict[str, List[str]] = {}
+        for sr in self._abstract_subscripts:
+            if isinstance(sr.subscripts, list):
+                self._subs_elems[sr.name] = list(sr.subscripts)
+
         # Accumulated declarations
         self.stock_decls: List[str] = []
         self.aux_decls: List[str] = []
         self.param_decls: List[str] = []
+        self.ext_const_decls: List[str] = []
         self.lookup_const_decls: List[str] = []
         self.lookup_func_decls: List[str] = []
         self.lookup_register_decls: List[str] = []
+        self.subs_const_decls: List[str] = []
         self.u0_entries: List[str] = []
+        # Map julia identifier -> list of dim names (for subscripted vars)
+        self._var_dims: Dict[str, List[str]] = {}
         self.control_vals: Dict[str, Optional[str]] = {
             "initial_time": None,
             "final_time": None,
@@ -164,6 +184,12 @@ class JuliaSectionBuilder:
         # First pass: populate the namespace with all element names
         for elem in self.abstract_elements:
             self.namespace.add_to_namespace(elem.name)
+
+        # Emit subscript size constants (const N_DIMNAME = n)
+        for name, size in sorted(self._subs_sizes.items()):
+            if size > 0:
+                jl_name = "N_" + re.sub(r"[^a-z0-9]", "_", name.lower()).upper()
+                self.subs_const_decls.append(f"const {jl_name} = {size}")
 
         # Second pass: process non-INITIAL elements so u0_entries is populated
         # before INITIAL() elements are resolved (they look up stock initial values).
@@ -196,6 +222,63 @@ class JuliaSectionBuilder:
             self._build()
 
     # ------------------------------------------------------------------
+    # Subscript helpers
+    # ------------------------------------------------------------------
+
+    def _element_dims(self, elem: "AbstractElement") -> List[Tuple[str, int]]:
+        """Return ``[(dim_name, dim_size), ...]`` for *elem*'s defining subscripts.
+
+        Uses the first component's first subscript list.  Dims with size == 0
+        (unresolved aliases) are filtered out.
+        """
+        if not elem.components:
+            return []
+        comp = elem.components[0]
+        if not comp.subscripts or not comp.subscripts[0]:
+            return []
+        dims = []
+        for dim_name in comp.subscripts[0]:
+            size = self._subs_sizes.get(dim_name, 0)
+            if size > 0:
+                dims.append((dim_name, size))
+        return dims
+
+    def _jl_n(self, dim_name: str) -> str:
+        """Julia constant name for the size of a subscript dimension."""
+        return "N_" + re.sub(r"[^a-z0-9]", "_", dim_name.lower()).upper()
+
+    def _range_str(self, dims: List[Tuple[str, int]]) -> str:
+        """Build ``'1:N_D0, 1:N_D1, ...'`` for array declarations."""
+        return ", ".join(f"1:{self._jl_n(d)}" for d, _ in dims)
+
+    def _idx_vars(self, ndim: int) -> List[str]:
+        """Generate index variable names ``_i0, _i1, ...`` for comprehensions."""
+        return [f"_i{k}" for k in range(ndim)]
+
+    def _for_clause(self, dims: List[Tuple[str, int]], idx_vars: List[str]) -> str:
+        """Build ``'_i0 in 1:N_D0, _i1 in 1:N_D1, ...'`` for comprehensions."""
+        return ", ".join(
+            f"{iv} in 1:{self._jl_n(d)}" for (d, _), iv in zip(dims, idx_vars)
+        )
+
+    def _nd_visitor(self, dims: List[Tuple[str, int]], idx_vars: List[str]) -> "JuliaASTVisitor":
+        """Return a visitor with active subscript index context for N dims."""
+        active_subs = {d: iv for (d, _), iv in zip(dims, idx_vars)}
+        return JuliaASTVisitor(
+            self.namespace, self.inline_registry, self.needed_helpers,
+            active_subs=active_subs, var_dims=self._var_dims,
+        )
+
+    def _nd_u0_entries(
+        self, identifier: str, dims: List[Tuple[str, int]], init_expr: str
+    ) -> None:
+        """Append per-element u0 entries for an N-dimensional stock."""
+        ranges = [range(1, size + 1) for _, size in dims]
+        for idx_combo in itertools.product(*ranges):
+            idx_str = ", ".join(str(i) for i in idx_combo)
+            self.u0_entries.append(f"{identifier}[{idx_str}] => {init_expr}")
+
+    # ------------------------------------------------------------------
     # Element processing
     # ------------------------------------------------------------------
 
@@ -216,6 +299,15 @@ class JuliaSectionBuilder:
         comp = elem.components[0]
         ast = comp.ast
 
+        # Determine subscript dimensionality for this element
+        dims = self._element_dims(elem)
+        ndim = len(dims)
+
+        # Register var dims for use by visitors in 2D contexts
+        if ndim > 0 and not is_control:
+            self._var_dims[identifier] = [d for d, _ in dims]
+
+        # Scalar visitor (no active subscript context)
         visitor = JuliaASTVisitor(self.namespace, self.inline_registry, self.needed_helpers)
 
         # ---- Named lookup table ----------------------------------------
@@ -250,9 +342,30 @@ class JuliaSectionBuilder:
         if isinstance(ast, IntegStructure):
             flow_expr = visitor.visit(ast.flow)
             initial_expr = visitor.visit(ast.initial)
-            self.stock_decls.append(f"@variables {identifier}(t)")
-            self.u0_entries.append(f"{identifier} => {initial_expr}")
-            return [f"D({identifier}) ~ {flow_expr}"]
+            if ndim == 0:
+                self.stock_decls.append(f"@variables {identifier}(t)")
+                self.u0_entries.append(f"{identifier} => {initial_expr}")
+                return [f"D({identifier}) ~ {flow_expr}"]
+            elif ndim == 1:
+                self.stock_decls.append(
+                    f"@variables {identifier}(t)[{self._range_str(dims)}]"
+                )
+                self._nd_u0_entries(identifier, dims, initial_expr)
+                return [f"Symbolics.scalarize(D.({identifier}) .~ {flow_expr})..."]
+            else:
+                # N≥2 dims: comprehension with N index variables
+                idx_vars = self._idx_vars(ndim)
+                vnd = self._nd_visitor(dims, idx_vars)
+                flow_nd = vnd.visit(ast.flow)
+                idx_str = ", ".join(idx_vars)
+                self.stock_decls.append(
+                    f"@variables {identifier}(t)[{self._range_str(dims)}]"
+                )
+                self._nd_u0_entries(identifier, dims, initial_expr)
+                return [
+                    f"[D({identifier}[{idx_str}]) ~ {flow_nd} "
+                    f"for {self._for_clause(dims, idx_vars)}]..."
+                ]
 
         # ---- First-order Smooth ----------------------------------------
         if isinstance(ast, SmoothStructure) and ast.order == 1:
@@ -289,6 +402,21 @@ class JuliaSectionBuilder:
             self.aux_decls.append(f"@variables {identifier}(t)")
             return [f"{identifier} ~ {visitor.visit(ast.input)}"]
 
+        # ---- External constant (GET XLS/DIRECT CONSTANTS) ----------------
+        if all(isinstance(c.ast, GetConstantsStructure) for c in elem.components):
+            julia_val = self._read_get_constants(elem, identifier)
+            if julia_val is not None:
+                if is_control:
+                    if identifier in self.control_vals:
+                        self.control_vals[identifier] = julia_val
+                    return []
+                if julia_val.startswith("["):
+                    self.ext_const_decls.append(f"const {identifier} = {julia_val}")
+                else:
+                    self.param_decls.append(f"@parameters {identifier} = {julia_val}")
+                return []
+            # fall through to unsupported handler if reading failed
+
         # ---- Unsupported structures ------------------------------------
         if isinstance(ast, _UNSUPPORTED_STRUCTURES):
             warn(
@@ -305,7 +433,12 @@ class JuliaSectionBuilder:
                 if identifier in self.control_vals:
                     self.control_vals[identifier] = value_expr
                 return []
-            self.param_decls.append(f"@parameters {identifier} = {value_expr}")
+            if ndim == 0:
+                self.param_decls.append(f"@parameters {identifier} = {value_expr}")
+            else:
+                self.param_decls.append(
+                    f"@parameters {identifier}[{self._range_str(dims)}] = {value_expr}"
+                )
             return []
 
         # ---- Data component (external time-series) ---------------------
@@ -318,13 +451,41 @@ class JuliaSectionBuilder:
             return [f"# DATA: {identifier} ~ 0.0"]
 
         # ---- Auxiliary variable (algebraic) ----------------------------
-        rhs_expr = visitor.visit(ast)
-        if is_control:
-            if identifier in self.control_vals:
-                self.control_vals[identifier] = rhs_expr
-            return []
-        self.aux_decls.append(f"@variables {identifier}(t)")
-        return [f"{identifier} ~ {rhs_expr}"]
+        if ndim == 0:
+            rhs_expr = visitor.visit(ast)
+            if is_control:
+                if identifier in self.control_vals:
+                    self.control_vals[identifier] = rhs_expr
+                return []
+            self.aux_decls.append(f"@variables {identifier}(t)")
+            return [f"{identifier} ~ {rhs_expr}"]
+        elif ndim == 1:
+            rhs_expr = visitor.visit(ast)
+            if is_control:
+                if identifier in self.control_vals:
+                    self.control_vals[identifier] = rhs_expr
+                return []
+            self.aux_decls.append(
+                f"@variables {identifier}(t)[{self._range_str(dims)}]"
+            )
+            return [f"Symbolics.scalarize({identifier} .~ {rhs_expr})..."]
+        else:
+            # N≥2 dims: comprehension with N index variables
+            idx_vars = self._idx_vars(ndim)
+            vnd = self._nd_visitor(dims, idx_vars)
+            rhs_nd = vnd.visit(ast)
+            if is_control:
+                if identifier in self.control_vals:
+                    self.control_vals[identifier] = rhs_nd
+                return []
+            idx_str = ", ".join(idx_vars)
+            self.aux_decls.append(
+                f"@variables {identifier}(t)[{self._range_str(dims)}]"
+            )
+            return [
+                f"[{identifier}[{idx_str}] ~ {rhs_nd} "
+                f"for {self._for_clause(dims, idx_vars)}]..."
+            ]
 
     # ------------------------------------------------------------------
     # Smooth expansion
@@ -462,6 +623,70 @@ class JuliaSectionBuilder:
         return None
 
     # ------------------------------------------------------------------
+    # External constants reader
+    # ------------------------------------------------------------------
+
+    def _read_get_constants(
+        self, elem: AbstractElement, identifier: str
+    ) -> Optional[str]:
+        """Read all GetConstantsStructure components for *elem* using ExtConstant.
+
+        Returns a Julia literal string (scalar or array) on success, or None
+        if the file cannot be read, in which case the caller falls through to
+        the unsupported-structure handler.
+        """
+        try:
+            from pysd.py_backend.external import ExtConstant
+
+            # Build a map from subscript range name → list of elements
+            subs_map: Dict[str, list] = {}
+            for sr in self._abstract_subscripts:
+                if isinstance(sr.subscripts, list):
+                    subs_map[sr.name] = sr.subscripts
+
+            def _coords(comp) -> dict:
+                def_subs = comp.subscripts[0] if comp.subscripts else []
+                return {s: subs_map.get(s, []) for s in def_subs} if def_subs else {}
+
+            comp0 = elem.components[0]
+            coords0 = _coords(comp0)
+            ast0 = comp0.ast
+
+            # For multi-component elements, final_coords covers all dims
+            if len(elem.components) > 1:
+                final_coords: Dict[str, list] = {}
+                for comp in elem.components:
+                    for s, v in _coords(comp).items():
+                        if s not in final_coords:
+                            final_coords[s] = v
+            else:
+                final_coords = coords0
+
+            ext = ExtConstant(
+                file_name=ast0.file,
+                tab=ast0.tab,
+                cell=ast0.cell,
+                coords=coords0,
+                root=self.root,
+                final_coords=final_coords,
+                py_name=identifier,
+            )
+
+            for comp in elem.components[1:]:
+                ast_i = comp.ast
+                ext.add(ast_i.file, ast_i.tab, ast_i.cell, _coords(comp))
+
+            ext.initialize()
+            return _format_julia_value(ext.data)
+
+        except Exception as exc:
+            warn(
+                f"Could not read external constant for '{elem.name}': {exc} "
+                "— emitting placeholder."
+            )
+            return None
+
+    # ------------------------------------------------------------------
     # Single-file build
     # ------------------------------------------------------------------
 
@@ -588,7 +813,7 @@ class JuliaSectionBuilder:
 
     def _file_header(self, extra_packages: bool = False) -> str:
         # OrdinaryDiffEq v7 split Euler into OrdinaryDiffEqLowOrderRK
-        uses = ["ModelingToolkit", "OrdinaryDiffEq", "OrdinaryDiffEqLowOrderRK"]
+        uses = ["ModelingToolkit", "Symbolics", "OrdinaryDiffEq", "OrdinaryDiffEqLowOrderRK"]
         if self.lookup_const_decls or extra_packages:
             uses.append("DataInterpolations")
         return (
@@ -629,6 +854,10 @@ class JuliaSectionBuilder:
 
     def _declarations_block(self) -> str:
         lines: List[str] = []
+        if self.subs_const_decls:
+            lines.append("# Subscript dimension sizes")
+            lines.extend(self.subs_const_decls)
+            lines.append("")
         if self.stock_decls:
             lines.append("# Stocks (state variables)")
             lines.extend(self.stock_decls)
@@ -638,6 +867,9 @@ class JuliaSectionBuilder:
         if self.param_decls:
             lines.append("\n# Parameters")
             lines.extend(self.param_decls)
+        if self.ext_const_decls:
+            lines.append("\n# External constants")
+            lines.extend(self.ext_const_decls)
         return "\n".join(lines) + "\n"
 
     def _equations_block(self, equations: List[str]) -> str:
@@ -754,3 +986,40 @@ def _path_to_eq_var(path: Path) -> str:
     name = re.sub(r"[^a-z0-9_]", "_", name.lower())
     name = re.sub(r"_+", "_", name).strip("_")
     return f"{name}_eqs"
+
+
+def _format_julia_value(data) -> str:
+    """Format a Python/numpy/xarray value as a Julia literal.
+
+    Scalars become plain number strings.
+    1-D arrays become ``[v1, v2, ...]``.
+    2-D arrays become ``[r1c1 r1c2; r2c1 r2c2]`` (Julia matrix literal).
+    Higher-dimensional arrays are flattened to 1-D.
+    """
+    import numpy as np
+
+    # xarray DataArray → plain numpy array
+    if hasattr(data, "values"):
+        data = data.values
+
+    if isinstance(data, (int, float)):
+        return format_number(float(data))
+
+    arr = np.asarray(data, dtype=float)
+
+    if arr.ndim == 0:
+        return format_number(float(arr))
+
+    if arr.ndim == 1:
+        vals = ", ".join(format_number(float(v)) for v in arr)
+        return f"[{vals}]"
+
+    if arr.ndim == 2:
+        rows = "; ".join(
+            " ".join(format_number(float(v)) for v in row) for row in arr
+        )
+        return f"[{rows}]"
+
+    # Higher dims: flatten
+    vals = ", ".join(format_number(float(v)) for v in arr.flat)
+    return f"[{vals}]"
