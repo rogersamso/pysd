@@ -74,13 +74,6 @@ _STATEFUL_STRUCTURES = (
 
 # Structures not yet supported — emit a warning and a placeholder equation
 _UNSUPPORTED_STRUCTURES = (
-    TrendStructure,
-    ForecastStructure,
-    SampleIfTrueStructure,
-    GetDataStructure,
-    GetLookupsStructure,
-    AllocateAvailableStructure,
-    AllocateByPriorityStructure,
     DataStructure,
 )
 
@@ -191,20 +184,28 @@ class JuliaSectionBuilder:
                 jl_name = "N_" + re.sub(r"[^a-z0-9]", "_", name.lower()).upper()
                 self.subs_const_decls.append(f"const {jl_name} = {size}")
 
-        # Second pass: process non-INITIAL elements so u0_entries is populated
-        # before INITIAL() elements are resolved (they look up stock initial values).
+        # Second pass: process control elements first so that control_vals
+        # (especially time_step) are available for constructs like SAMPLE IF TRUE.
+        non_control_elems = []
         initial_elems = []
         for elem in self.abstract_elements:
             identifier = self.namespace.namespace[elem.name]
             is_control = isinstance(elem, AbstractControlElement)
             comp = elem.components[0] if elem.components else None
-            if comp is not None and isinstance(comp.ast, InitialStructure):
+            if is_control:
+                eqs = self._process_element(elem, identifier, is_control)
+                self.built_elements[identifier] = (eqs, is_control)
+            elif comp is not None and isinstance(comp.ast, InitialStructure):
                 initial_elems.append((elem, identifier, is_control))
-                continue
+            else:
+                non_control_elems.append((elem, identifier, is_control))
+
+        # Third pass: process non-control, non-INITIAL elements
+        for elem, identifier, is_control in non_control_elems:
             eqs = self._process_element(elem, identifier, is_control)
             self.built_elements[identifier] = (eqs, is_control)
 
-        # Third pass: INITIAL elements (u0_entries now complete)
+        # Fourth pass: INITIAL elements (u0_entries now complete)
         for elem, identifier, is_control in initial_elems:
             eqs = self._process_element(elem, identifier, is_control)
             self.built_elements[identifier] = (eqs, is_control)
@@ -267,6 +268,7 @@ class JuliaSectionBuilder:
         return JuliaASTVisitor(
             self.namespace, self.inline_registry, self.needed_helpers,
             active_subs=active_subs, var_dims=self._var_dims,
+            subs_sizes=self._subs_sizes, root=self.root,
         )
 
     def _nd_u0_entries(
@@ -308,7 +310,10 @@ class JuliaSectionBuilder:
             self._var_dims[identifier] = [d for d, _ in dims]
 
         # Scalar visitor (no active subscript context)
-        visitor = JuliaASTVisitor(self.namespace, self.inline_registry, self.needed_helpers)
+        visitor = JuliaASTVisitor(
+            self.namespace, self.inline_registry, self.needed_helpers,
+            subs_sizes=self._subs_sizes, root=self.root,
+        )
 
         # ---- Named lookup table ----------------------------------------
         if isinstance(comp, AbstractLookup) and isinstance(ast, LookupsStructure):
@@ -393,14 +398,13 @@ class JuliaSectionBuilder:
                 order = 3
             return self._expand_delay(identifier, ast, visitor, order=order)
 
-        # ---- DELAY FIXED (not supported) --------------------------------
+        # ---- DELAY FIXED ------------------------------------------------
+        # Approximate DELAY FIXED as a first-order ODE delay (same formula
+        # as DELAY1 with order=1).  True fixed delays need a DDE solver
+        # that ModelingToolkit/OrdinaryDiffEq does not support, so this is
+        # the best we can do in the MTK ODE framework.
         if isinstance(ast, DelayFixedStructure):
-            warn(
-                f"DELAY FIXED for '{elem.name}' is not supported in the Julia builder. "
-                "Falling back to identity (output = input)."
-            )
-            self.aux_decls.append(f"@variables {identifier}(t)")
-            return [f"{identifier} ~ {visitor.visit(ast.input)}"]
+            return self._expand_delay_fixed(identifier, ast, visitor)
 
         # ---- External constant (GET XLS/DIRECT CONSTANTS) ----------------
         if all(isinstance(c.ast, GetConstantsStructure) for c in elem.components):
@@ -417,7 +421,31 @@ class JuliaSectionBuilder:
                 return []
             # fall through to unsupported handler if reading failed
 
-        # ---- Unsupported structures ------------------------------------
+        # ---- GET XLS/DIRECT LOOKUPS -------------------------------------
+        if all(isinstance(c.ast, GetLookupsStructure) for c in elem.components):
+            return self._process_get_lookups(elem, identifier)
+
+        # ---- GET XLS/DIRECT DATA ----------------------------------------
+        if isinstance(ast, GetDataStructure) or isinstance(comp, AbstractData):
+            return self._process_get_data(elem, identifier, comp)
+
+        # ---- TREND ------------------------------------------------------
+        if isinstance(ast, TrendStructure):
+            return self._expand_trend(identifier, ast, visitor)
+
+        # ---- FORECAST ---------------------------------------------------
+        if isinstance(ast, ForecastStructure):
+            return self._expand_forecast(identifier, ast, visitor)
+
+        # ---- SAMPLE IF TRUE ---------------------------------------------
+        if isinstance(ast, SampleIfTrueStructure):
+            return self._expand_sample_if_true(identifier, ast, visitor)
+
+        # ---- ALLOCATE AVAILABLE / ALLOCATE BY PRIORITY ------------------
+        if isinstance(ast, (AllocateAvailableStructure, AllocateByPriorityStructure)):
+            return self._expand_allocate(identifier, ast, visitor)
+
+        # ---- Remaining unsupported structures ---------------------------
         if isinstance(ast, _UNSUPPORTED_STRUCTURES):
             warn(
                 f"'{type(ast).__name__}' for '{elem.name}' is not supported in the "
@@ -441,7 +469,7 @@ class JuliaSectionBuilder:
                 )
             return []
 
-        # ---- Data component (external time-series) ---------------------
+        # ---- Data component (external time-series) — fallback -----------
         if isinstance(comp, AbstractData):
             warn(
                 f"Data component '{elem.name}' references external data, which is "
@@ -567,22 +595,531 @@ class JuliaSectionBuilder:
         eqs.append(f"{identifier} ~ {prev_outflow}")
         return eqs
 
+    # ------------------------------------------------------------------
+    # DELAY FIXED expansion
+    # ------------------------------------------------------------------
+
+    def _expand_delay_fixed(
+        self,
+        identifier: str,
+        ast,
+        visitor: "JuliaASTVisitor",
+    ) -> List[str]:
+        """Approximate DELAY FIXED as a first-order ODE delay.
+
+        The true DELAY FIXED is a pure transport delay (DDE), which
+        ModelingToolkit/OrdinaryDiffEq cannot solve.  We approximate it
+        with a first-order exponential delay (DELAY1):
+
+            D(output) ~ (input - output) / delay_time
+
+        with initial condition ``output(0) = initial``.
+        """
+        input_expr = visitor.visit(ast.input)
+        delay_time_expr = visitor.visit(ast.delay_time)
+        initial_expr = visitor.visit(ast.initial)
+
+        lv_name = f"_df_{identifier}"
+        self.namespace.namespace[f"__internal_df_{identifier}"] = lv_name
+        self.stock_decls.append(f"@variables {lv_name}(t)")
+        self.u0_entries.append(f"{lv_name} => {initial_expr}")
+
+        self.aux_decls.append(f"@variables {identifier}(t)")
+        return [
+            f"D({lv_name}) ~ ({input_expr} - {lv_name}) / {delay_time_expr}",
+            f"{identifier} ~ {lv_name}",
+        ]
+
+    # ------------------------------------------------------------------
+    # Trend expansion
+    # ------------------------------------------------------------------
+
+    def _expand_trend(
+        self,
+        identifier: str,
+        ast,
+        visitor: "JuliaASTVisitor",
+    ) -> List[str]:
+        """Expand TREND(input, average_time, initial_trend) into an ODE.
+
+        Introduces a smooth level ``_sm_{identifier}`` that tracks the
+        exponential moving average of the input:
+
+            D(_sm) ~ (input - _sm) / average_time
+
+        Then the trend (fractional growth rate) is:
+
+            output ~ (input - _sm) / (average_time * _sm)
+
+        The smooth level is initialised so that at t=0 the output equals
+        ``initial_trend``:
+
+            _sm(0) = input(0) / (1 + initial_trend * average_time)
+
+        We use the simpler ``input(0)`` approximation (same as PySD's
+        Trend stateful initialisation) and rely on the model's initial
+        conditions to provide a consistent starting point.
+        """
+        input_expr = visitor.visit(ast.input)
+        avg_time_expr = visitor.visit(ast.average_time)
+        initial_trend_expr = visitor.visit(ast.initial_trend)
+
+        sm_name = f"_sm_{identifier}"
+        self.namespace.namespace[f"__internal_sm_{identifier}"] = sm_name
+        self.stock_decls.append(f"@variables {sm_name}(t)")
+        # u0: _sm = input / (1 + initial_trend * average_time)
+        # We approximate the initial input as the initial_trend expression;
+        # a better approximation requires evaluating the input at t0.
+        # Use the same formula as PySD: sm0 = input0 (the Trend stateful
+        # initialises its smooth to input/1 when initial_trend is given).
+        # We store the initial as a formula that Julia will evaluate at t=0.
+        self.u0_entries.append(
+            f"{sm_name} => {input_expr} / (1.0 + ({initial_trend_expr}) * ({avg_time_expr}))"
+        )
+
+        self.aux_decls.append(f"@variables {identifier}(t)")
+        return [
+            f"D({sm_name}) ~ ({input_expr} - {sm_name}) / ({avg_time_expr})",
+            (
+                f"{identifier} ~ ifelse(iszero({sm_name}), {initial_trend_expr}, "
+                f"({input_expr} - {sm_name}) / (({avg_time_expr}) * {sm_name}))"
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # Forecast expansion
+    # ------------------------------------------------------------------
+
+    def _expand_forecast(
+        self,
+        identifier: str,
+        ast,
+        visitor: "JuliaASTVisitor",
+    ) -> List[str]:
+        """Expand FORECAST(input, average_time, horizon) = input*(1 + TREND*horizon).
+
+        FORECAST internally computes a TREND and projects it forward by
+        *horizon*.  We expand it inline, introducing the same internal
+        smooth level as ``_expand_trend``.
+        """
+        input_expr = visitor.visit(ast.input)
+        avg_time_expr = visitor.visit(ast.average_time)
+        horizon_expr = visitor.visit(ast.horizon)
+        initial_trend_expr = visitor.visit(ast.initial_trend)
+
+        sm_name = f"_sm_{identifier}"
+        self.namespace.namespace[f"__internal_sm_{identifier}"] = sm_name
+        self.stock_decls.append(f"@variables {sm_name}(t)")
+        self.u0_entries.append(
+            f"{sm_name} => {input_expr} / (1.0 + ({initial_trend_expr}) * ({avg_time_expr}))"
+        )
+
+        # trend = (input - sm) / (avg_time * sm)
+        # forecast = input * (1 + trend * horizon)
+        self.aux_decls.append(f"@variables {identifier}(t)")
+        return [
+            f"D({sm_name}) ~ ({input_expr} - {sm_name}) / ({avg_time_expr})",
+            (
+                f"{identifier} ~ {input_expr} * (1.0 + "
+                f"ifelse(iszero({sm_name}), {initial_trend_expr}, "
+                f"({input_expr} - {sm_name}) / (({avg_time_expr}) * {sm_name})) "
+                f"* ({horizon_expr}))"
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # SAMPLE IF TRUE expansion
+    # ------------------------------------------------------------------
+
+    def _expand_sample_if_true(
+        self,
+        identifier: str,
+        ast,
+        visitor: "JuliaASTVisitor",
+    ) -> List[str]:
+        """Expand SAMPLE IF TRUE(condition, input, initial).
+
+        SAMPLE IF TRUE is a discrete sample-and-hold: whenever the condition
+        is true the output is updated to the input; otherwise the output holds
+        its previous value.
+
+        We approximate this as an INTEG with a conditional flow whose rate is
+        tied to the simulation time step so that the Euler solver updates the
+        state to ``input`` within one time step when the condition is true:
+
+            D(output) ~ ifelse(condition > 0.5,
+                               (input - output) / time_step,
+                               0.0)
+
+        Here ``time_step`` refers to the Julia variable defined in the
+        generated file.  With Euler integration the next step will be:
+
+            output_new = output + dt * (input - output) / dt = input
+
+        which is exact (one-step snap to input).
+        """
+        condition_expr = visitor.visit(ast.condition)
+        input_expr = visitor.visit(ast.input)
+        initial_expr = visitor.visit(ast.initial)
+
+        st_name = f"_sit_{identifier}"
+        self.namespace.namespace[f"__internal_sit_{identifier}"] = st_name
+        self.stock_decls.append(f"@variables {st_name}(t)")
+        self.u0_entries.append(f"{st_name} => {initial_expr}")
+
+        # Use the simulation time_step as the relaxation divisor.
+        # With Euler integration: output_new = output + dt*(input-output)/dt = input.
+        # We look up time_step from control_vals; fall back to a symbolic reference.
+        ts_val = self.control_vals.get("time_step")
+        ts_expr = ts_val if ts_val is not None else "time_step"
+
+        self.aux_decls.append(f"@variables {identifier}(t)")
+        return [
+            f"D({st_name}) ~ ifelse({condition_expr} > 0.5, "
+            f"({input_expr} - {st_name}) / ({ts_expr}), 0.0)",
+            f"{identifier} ~ {st_name}",
+        ]
+
+    # ------------------------------------------------------------------
+    # ALLOCATE AVAILABLE / ALLOCATE BY PRIORITY
+    # ------------------------------------------------------------------
+
+    def _expand_allocate(
+        self,
+        identifier: str,
+        ast,
+        visitor: "JuliaASTVisitor",
+    ) -> List[str]:
+        """Emit a simple proportional allocation approximation.
+
+        Full Vensim priority allocation requires complex logic that is
+        difficult to express as a MTK algebraic equation.  We emit a
+        proportional-share approximation:
+
+            allocate_available  →  request / sum(request) * avail
+            allocate_by_priority →  request / sum(request) * supply
+
+        This is a structural approximation only.  A comment is included
+        in the generated file to flag the limitation.
+        """
+        warn(
+            f"AllocateStructure for '{identifier}' is approximated as proportional "
+            "allocation — results may differ from the Vensim priority-based algorithm."
+        )
+        if isinstance(ast, AllocateAvailableStructure):
+            request_expr = visitor.visit(ast.request)
+            avail_expr = visitor.visit(ast.avail)
+            rhs = (
+                f"ifelse(iszero(sum({request_expr})), 0.0, "
+                f"{request_expr} ./ sum({request_expr}) .* ({avail_expr}))"
+            )
+        else:
+            # AllocateByPriorityStructure
+            request_expr = visitor.visit(ast.request)
+            supply_expr = visitor.visit(ast.supply)
+            rhs = (
+                f"ifelse(iszero(sum({request_expr})), 0.0, "
+                f"{request_expr} ./ sum({request_expr}) .* ({supply_expr}))"
+            )
+
+        self.aux_decls.append(f"@variables {identifier}(t)")
+        return [
+            f"# ALLOCATE (proportional approximation): {identifier}",
+            f"{identifier} ~ {rhs}",
+        ]
+
+    # ------------------------------------------------------------------
+    # GET LOOKUPS processing
+    # ------------------------------------------------------------------
+
+    def _process_get_lookups(
+        self, elem: "AbstractElement", identifier: str
+    ) -> List[str]:
+        """Read external lookup data and emit a named interpolation function.
+
+        Uses ``ExtLookup`` to load the table at translation time, then
+        emits the same ``LinearInterpolation`` pattern as inline lookups.
+        """
+        try:
+            from pysd.py_backend.external import ExtLookup
+
+            subs_map: Dict[str, list] = {}
+            for sr in self._abstract_subscripts:
+                if isinstance(sr.subscripts, list):
+                    subs_map[sr.name] = sr.subscripts
+
+            def _coords(comp) -> dict:
+                def_subs = comp.subscripts[0] if comp.subscripts else []
+                return {s: subs_map.get(s, []) for s in def_subs} if def_subs else {}
+
+            comp0 = elem.components[0]
+            ast0 = comp0.ast
+            coords0 = _coords(comp0)
+
+            if len(elem.components) > 1:
+                final_coords: Dict[str, list] = {}
+                for comp in elem.components:
+                    for s, v in _coords(comp).items():
+                        if s not in final_coords:
+                            final_coords[s] = v
+            else:
+                final_coords = coords0
+
+            ext = ExtLookup(
+                file_name=ast0.file,
+                tab=ast0.tab,
+                x_row_or_col=ast0.x_row_or_col,
+                cell=ast0.cell,
+                coords=coords0,
+                root=self.root,
+                final_coords=final_coords,
+                py_name=identifier,
+            )
+
+            for comp in elem.components[1:]:
+                ast_i = comp.ast
+                ext.add(ast_i.file, ast_i.tab, ast_i.x_row_or_col, ast_i.cell, _coords(comp))
+
+            ext.initialize()
+
+            # ext.data is an xarray DataArray with dim "lookup_dim"
+            import numpy as np
+            data = ext.data
+            if hasattr(data, "values"):
+                arr = data.values
+            else:
+                arr = np.asarray(data)
+
+            xs = tuple(float(x) for x in data.coords["lookup_dim"].values)
+
+            # For scalar lookups, data has shape (n_points,)
+            if arr.ndim == 1:
+                ys = tuple(float(y) for y in arr)
+                const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                    identifier, xs, ys, "interpolate"
+                )
+                self.lookup_const_decls.append(const_decl)
+                self.lookup_func_decls.append(func_decl)
+                self.lookup_register_decls.append(reg_decl)
+                return []
+            elif arr.ndim == 2:
+                # 2D: shape (n_points, n_subs).
+                # Emit one lookup function per subscript element:
+                #   identifier_1(x), identifier_2(x), ...
+                # and a dispatch function identifier(i, x) that selects by index.
+                n_subs = arr.shape[1]
+                sub_func_names = []
+                for k in range(n_subs):
+                    col_ys = tuple(float(y) for y in arr[:, k])
+                    sub_name = f"{identifier}_{k + 1}"
+                    const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                        sub_name, xs, col_ys, "interpolate"
+                    )
+                    self.lookup_const_decls.append(const_decl)
+                    self.lookup_func_decls.append(func_decl)
+                    self.lookup_register_decls.append(reg_decl)
+                    sub_func_names.append(sub_name)
+
+                # Build a dispatch array and wrapper:
+                # const identifier_fns = [identifier_1, identifier_2, ...]
+                # identifier(i, x) = identifier_fns[i](x)
+                fn_list = ", ".join(sub_func_names)
+                self.lookup_const_decls.append(
+                    f"const {identifier}_fns = [{fn_list}]"
+                )
+                self.lookup_func_decls.append(
+                    f"{identifier}(i, x) = {identifier}_fns[i](x)"
+                )
+                self.lookup_register_decls.append(
+                    f"@register_symbolic {identifier}(i::Integer, x::Real)"
+                )
+                return []
+            else:
+                warn(
+                    f"Subscripted GET LOOKUPS '{elem.name}' has {arr.ndim - 1} "
+                    "subscript dimensions (> 1D subs) — only 1D subscripted lookups "
+                    "are supported. Emitting flattened first-column lookup as approximation."
+                )
+                ys = tuple(float(y) for y in arr.reshape(arr.shape[0], -1)[:, 0])
+                const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                    identifier, xs, ys, "interpolate"
+                )
+                self.lookup_const_decls.append(const_decl)
+                self.lookup_func_decls.append(func_decl)
+                self.lookup_register_decls.append(reg_decl)
+                return []
+
+        except Exception as exc:
+            warn(
+                f"Could not read GET LOOKUPS for '{elem.name}': {exc} "
+                "— emitting placeholder auxiliary."
+            )
+            self.aux_decls.append(f"@variables {identifier}(t)")
+            return [f"# GET_LOOKUPS_FAILED: {identifier} ~ 0.0"]
+
+    # ------------------------------------------------------------------
+    # GET DATA processing
+    # ------------------------------------------------------------------
+
+    def _process_get_data(
+        self,
+        elem: "AbstractElement",
+        identifier: str,
+        comp: "AbstractComponent",
+    ) -> List[str]:
+        """Read external time-series data and emit a time-indexed interpolation.
+
+        Uses ``ExtData`` to load the series at translation time, then
+        emits a ``LinearInterpolation`` over (time, value) pairs just
+        like a lookup, but with ``t`` as the argument.
+        """
+        try:
+            from pysd.py_backend.external import ExtData
+
+            subs_map: Dict[str, list] = {}
+            for sr in self._abstract_subscripts:
+                if isinstance(sr.subscripts, list):
+                    subs_map[sr.name] = sr.subscripts
+
+            def _coords(c) -> dict:
+                def_subs = c.subscripts[0] if c.subscripts else []
+                return {s: subs_map.get(s, []) for s in def_subs} if def_subs else {}
+
+            # Collect AST from first component that has a GetDataStructure
+            comp0 = None
+            for c in elem.components:
+                if isinstance(c.ast, GetDataStructure):
+                    comp0 = c
+                    break
+            if comp0 is None:
+                raise ValueError("No GetDataStructure component found")
+
+            ast0 = comp0.ast
+            coords0 = _coords(comp0)
+
+            if len(elem.components) > 1:
+                final_coords: Dict[str, list] = {}
+                for c in elem.components:
+                    for s, v in _coords(c).items():
+                        if s not in final_coords:
+                            final_coords[s] = v
+            else:
+                final_coords = coords0
+
+            ext = ExtData(
+                file_name=ast0.file,
+                tab=ast0.tab,
+                time_row_or_col=ast0.time_row_or_col,
+                cell=ast0.cell,
+                interp="interpolate",
+                coords=coords0,
+                root=self.root,
+                final_coords=final_coords,
+                py_name=identifier,
+            )
+
+            for c in elem.components[1:]:
+                if isinstance(c.ast, GetDataStructure):
+                    ai = c.ast
+                    ext.add(ai.file, ai.tab, ai.time_row_or_col, ai.cell,
+                            "interpolate", _coords(c))
+
+            ext.initialize()
+
+            import numpy as np
+            data = ext.data
+            if hasattr(data, "values"):
+                arr = data.values
+                time_vals = data.coords["time"].values
+            else:
+                arr = np.asarray(data)
+                time_vals = None
+
+            if time_vals is None:
+                raise ValueError(f"No time dimension in data (shape={arr.shape})")
+
+            xs = tuple(float(t) for t in time_vals)
+
+            if arr.ndim == 1:
+                ys = tuple(float(y) for y in arr)
+                const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                    identifier, xs, ys, "interpolate"
+                )
+                self.lookup_const_decls.append(const_decl)
+                self.lookup_func_decls.append(func_decl)
+                self.lookup_register_decls.append(reg_decl)
+                return []
+            elif arr.ndim == 2:
+                # Subscripted time-series: shape (n_time, n_subs)
+                n_subs = arr.shape[1]
+                sub_func_names = []
+                for k in range(n_subs):
+                    col_ys = tuple(float(y) for y in arr[:, k])
+                    sub_name = f"{identifier}_{k + 1}"
+                    const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                        sub_name, xs, col_ys, "interpolate"
+                    )
+                    self.lookup_const_decls.append(const_decl)
+                    self.lookup_func_decls.append(func_decl)
+                    self.lookup_register_decls.append(reg_decl)
+                    sub_func_names.append(sub_name)
+
+                fn_list = ", ".join(sub_func_names)
+                self.lookup_const_decls.append(
+                    f"const {identifier}_fns = [{fn_list}]"
+                )
+                self.lookup_func_decls.append(
+                    f"{identifier}(i, x) = {identifier}_fns[i](x)"
+                )
+                self.lookup_register_decls.append(
+                    f"@register_symbolic {identifier}(i::Integer, x::Real)"
+                )
+                return []
+            else:
+                raise ValueError(f"Unexpected data dimensions: {arr.ndim} (shape={arr.shape})")
+
+        except Exception as exc:
+            warn(
+                f"Could not read GET DATA for '{elem.name}': {exc} "
+                "— emitting placeholder auxiliary."
+            )
+            self.aux_decls.append(f"@variables {identifier}(t)")
+            return [f"# GET_DATA_FAILED: {identifier} ~ 0.0"]
+
     def _resolve_initial_value(self, inner_ast) -> Optional[str]:
         """Return the t=0 value of *inner_ast* as a Julia literal, or None.
 
         Handles:
         * Numeric literals
         * References to stocks (in ``u0_entries``)
-        * References to parameters/constants
+        * References to parameters/constants (including GetConstantsStructure)
         * References to auxiliaries whose own equation chains back to a stock
           (one level of indirection, e.g. ``INITIAL(InflowA)`` where
           ``InflowA ~ StockA`` and StockA has a known initial condition)
+        * GetConstantsStructure directly embedded in the INITIAL() argument
         """
         from pysd.builders.julia.julia_expressions_builder import format_number
         if isinstance(inner_ast, (int, float)):
             return format_number(inner_ast)
         if isinstance(inner_ast, ReferenceStructure):
-            return self._resolve_ref_initial(inner_ast.reference, depth=2)
+            return self._resolve_ref_initial(inner_ast.reference, depth=3)
+        if isinstance(inner_ast, GetConstantsStructure):
+            # Try to read the constant directly
+            try:
+                from pysd.py_backend.external import ExtConstant
+                ext = ExtConstant(
+                    file_name=inner_ast.file,
+                    tab=inner_ast.tab,
+                    cell=inner_ast.cell,
+                    coords={},
+                    root=self.root,
+                    final_coords={},
+                    py_name="_initial_resolve",
+                )
+                ext.initialize()
+                return _format_julia_value(ext.data)
+            except Exception:
+                pass
         return None
 
     def _resolve_ref_initial(self, ref: str, depth: int) -> Optional[str]:

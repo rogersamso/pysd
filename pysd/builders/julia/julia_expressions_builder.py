@@ -26,6 +26,7 @@ from pysd.translators.structures.abstract_expressions import (
     LookupsStructure,
     ReferenceStructure,
     SampleIfTrueStructure,
+    SubscriptsReferenceStructure,
     TrendStructure,
 )
 
@@ -83,6 +84,18 @@ BUILTIN_FUNCTIONS: dict = {
     # Control flow — parser stores as "if_then_else" (underscores)
     "IF THEN ELSE": "ifelse",
     "IF_THEN_ELSE": "ifelse",
+    # Array operations
+    "SUM": "sum",
+    "PROD": "prod",
+    "VMAX": "maximum",
+    "VMIN": "minimum",
+    "ELMCOUNT": "_elmcount",   # resolved to literal size by caller
+    "INVERT MATRIX": "inv",
+    "INVERT_MATRIX": "inv",
+    "TRANSPOSE": "transpose",
+    # ACTIVE INITIAL(expr, initial) — for ODE simulation just return expr
+    "ACTIVE INITIAL": "_active_initial",
+    "ACTIVE_INITIAL": "_active_initial",
     # SD helpers emitted into the generated file
     "LOG": "_log_base",
     "XIDZ": "_xidz",
@@ -128,6 +141,9 @@ HELPER_IMPLEMENTATIONS: dict = {
     "_logical_and": "_logical_and(a, b) = (a > 0.5) & (b > 0.5)",
     "_logical_or": "_logical_or(a, b) = (a > 0.5) | (b > 0.5)",
     "_logical_not": "_logical_not(a) = !(a > 0.5)",
+    # ACTIVE INITIAL(expr, initial) — in ODE mode expr is always live;
+    # we just return expr (the first argument).
+    "_active_initial": "_active_initial(expr, initial) = expr",
 }
 
 # Helper functions that receive the current time *t* as their first argument
@@ -225,6 +241,8 @@ class JuliaASTVisitor:
         needed_helpers: Set[str],
         active_subs: Optional[Dict[str, str]] = None,
         var_dims: Optional[Dict[str, List[str]]] = None,
+        subs_sizes: Optional[Dict[str, int]] = None,
+        root=None,
     ) -> None:
         self.namespace = namespace
         self.registry = inline_registry
@@ -233,6 +251,10 @@ class JuliaASTVisitor:
         self.active_subs = active_subs or {}
         # var_dims: julia identifier -> list of dim names it is subscripted over
         self.var_dims = var_dims or {}
+        # subs_sizes: subscript range name -> integer size (for ELMCOUNT)
+        self.subs_sizes = subs_sizes or {}
+        # root: Path to the model directory (for reading external files)
+        self._root = root
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -256,6 +278,21 @@ class JuliaASTVisitor:
             except ValueError:
                 return repr(node)
 
+        # numpy arrays (e.g. from GetConstantsStructure values embedded inline)
+        try:
+            import numpy as np
+            if isinstance(node, np.ndarray):
+                if node.ndim == 0:
+                    return format_number(float(node))
+                if node.ndim == 1:
+                    vals = ", ".join(format_number(float(v)) for v in node)
+                    return f"[{vals}]"
+                # Higher dims: flatten
+                vals = ", ".join(format_number(float(v)) for v in node.flat)
+                return f"[{vals}]"
+        except ImportError:
+            pass
+
         if isinstance(node, ArithmeticStructure):
             return self._arithmetic(node)
 
@@ -278,6 +315,37 @@ class JuliaASTVisitor:
         if isinstance(node, GameStructure):
             # GAME passes through in simulation (non-interactive) mode
             return self.visit(node.expression)
+
+        if isinstance(node, GetConstantsStructure):
+            # GetConstantsStructure nested inside an expression — read the
+            # external value at translation time and emit it as a Julia literal.
+            try:
+                from pysd.py_backend.external import ExtConstant
+                from pysd.builders.julia.julia_model_builder import _format_julia_value
+                import pathlib as _pathlib
+                root = self._root or _pathlib.Path(".")
+                ext = ExtConstant(
+                    file_name=node.file,
+                    tab=node.tab,
+                    cell=node.cell,
+                    coords={},
+                    root=root,
+                    final_coords={},
+                    py_name="_inline_const",
+                )
+                ext.initialize()
+                return _format_julia_value(ext.data)
+            except Exception as exc:
+                warn(
+                    f"GetConstantsStructure inside expression could not be read "
+                    f"({exc}); emitting placeholder 0.0."
+                )
+                return "0.0"
+
+        if isinstance(node, SubscriptsReferenceStructure):
+            # A subscript reference used as a value — emit the reference name
+            # (used e.g. in ELMCOUNT and similar)
+            return self.namespace.get(node.reference) or repr(node.reference)
 
         # Structures that are handled at the element level should not appear
         # inside other expressions; warn and emit a placeholder.
@@ -356,8 +424,30 @@ class JuliaASTVisitor:
         julia_func = BUILTIN_FUNCTIONS.get(func_upper)
 
         if julia_func is None:
+            # Check whether the function name is a model variable (lookup table).
+            # Vensim allows calling a lookup variable as a function:
+            #   result = my_lookup_table(input_value)
+            # We check the namespace and emit the variable name directly
+            # (which will be a Julia interpolation function if loaded correctly).
+            julia_id = self.namespace.get(node.function.reference)
+            if julia_id is not None:
+                # This is a model-variable lookup call — emit as-is
+                args = [self.visit(a) for a in node.arguments]
+                return f"{julia_id}({', '.join(args)})"
             warn(f"Unknown Vensim function '{node.function.reference}'; using lowercase name.")
             julia_func = re.sub(r"[^a-z0-9_]", "_", node.function.reference.lower())
+
+        # ELMCOUNT(SubscriptRange) → emit the integer literal size
+        if julia_func == "_elmcount":
+            if node.arguments:
+                arg = node.arguments[0]
+                if isinstance(arg, ReferenceStructure):
+                    size = self.subs_sizes.get(arg.reference)
+                    if size is not None:
+                        return str(size)
+                # Fall back: try to visit the argument and return it
+                return self.visit(arg)
+            return "0"
 
         if julia_func in HELPER_IMPLEMENTATIONS:
             self.needed_helpers.add(julia_func)
