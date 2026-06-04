@@ -195,12 +195,15 @@ def format_vector(values: tuple) -> str:
 
 
 def lookup_interpolation_code(
-    name: str, xs: tuple, ys: tuple, _itp_type: str
+    name: str, xs: tuple, ys: tuple, itp_type: str
 ) -> Tuple[str, str, str]:
     """Return ``(const_decl, func_decl, register_decl)`` for a named lookup table.
 
-    Uses ``DataInterpolations.LinearInterpolation(u, t)`` where ``u`` are the
-    y-values and ``t`` the x-values (DataInterpolations convention).
+    ``itp_type`` controls the DataInterpolations constructor:
+
+    * ``"interpolate"`` / ``"extrapolate"`` → ``LinearInterpolation`` (default)
+    * ``"hold_forward"``  → ``ConstantInterpolation`` (previous-value hold)
+    * ``"hold_backward"`` → ``ConstantInterpolation(...; dir=:right)`` (next-value hold)
 
     ``@register_symbolic`` tells ModelingToolkit that this is an opaque
     external function so it is called at every timestep rather than being
@@ -209,7 +212,17 @@ def lookup_interpolation_code(
     xs_vec = format_vector(xs)
     ys_vec = format_vector(ys)
     itp_name = f"{name}_itp"
-    const_decl = f"const {itp_name} = LinearInterpolation({ys_vec}, {xs_vec})"
+
+    if itp_type == "hold_forward":
+        const_decl = f"const {itp_name} = ConstantInterpolation({ys_vec}, {xs_vec})"
+    elif itp_type == "hold_backward":
+        const_decl = (
+            f"const {itp_name} = ConstantInterpolation({ys_vec}, {xs_vec}; dir=:right)"
+        )
+    else:
+        # "interpolate", "extrapolate", or any unrecognised type → linear
+        const_decl = f"const {itp_name} = LinearInterpolation({ys_vec}, {xs_vec})"
+
     func_decl = f"{name}(x) = {itp_name}(x)"
     register_decl = f"@register_symbolic {name}(x::Real)"
     return const_decl, func_decl, register_decl
@@ -249,10 +262,21 @@ class JuliaASTVisitor:
         self.needed_helpers = needed_helpers
         # active_subs: dim_name -> julia index variable (e.g. {"sector": "_i"})
         self.active_subs = active_subs or {}
+        # _clean_active_subs: normalised-dim-name -> julia index variable, for
+        # case-insensitive lookup when subscript names appear as bare references.
+        self._clean_active_subs = {
+            re.sub(r"[^a-z0-9_]", "_", k.lower()): v
+            for k, v in self.active_subs.items()
+        }
         # var_dims: julia identifier -> list of dim names it is subscripted over
         self.var_dims = var_dims or {}
         # subs_sizes: subscript range name -> integer size (for ELMCOUNT)
         self.subs_sizes = subs_sizes or {}
+        # _clean_subs_sizes: normalised name -> size, for case-insensitive ELMCOUNT lookup
+        self._clean_subs_sizes = {
+            re.sub(r"[^a-z0-9_]", "_", k.lower()): v
+            for k, v in self.subs_sizes.items()
+        }
         # root: Path to the model directory (for reading external files)
         self._root = root
 
@@ -343,9 +367,13 @@ class JuliaASTVisitor:
                 return "0.0"
 
         if isinstance(node, SubscriptsReferenceStructure):
-            # A subscript reference used as a value — emit the reference name
-            # (used e.g. in ELMCOUNT and similar)
-            return self.namespace.get(node.reference) or repr(node.reference)
+            # A subscript reference used as a value — emit the first subscript name.
+            # This handles cases like ELMCOUNT(SECTORS) where the parser produces
+            # a bare SubscriptsReferenceStructure for the subscript range name.
+            if node.subscripts:
+                ref = node.subscripts[0]
+                return self.namespace.get(ref) or repr(ref)
+            return "0.0"
 
         # Structures that are handled at the element level should not appear
         # inside other expressions; warn and emit a placeholder.
@@ -404,6 +432,15 @@ class JuliaASTVisitor:
         return result
 
     def _reference(self, node: ReferenceStructure) -> str:
+        # Subscript dimension names appear as bare references in equations like
+        # I_Matrix[s, s1] = IF_THEN_ELSE(s = s1, 1, 0).  When inside an active
+        # subscript loop, emit the corresponding loop-index variable directly.
+        if self._clean_active_subs:
+            clean_ref = re.sub(r"[^a-z0-9_]", "_", node.reference.lower())
+            idx_var = self._clean_active_subs.get(clean_ref)
+            if idx_var is not None:
+                return idx_var
+
         julia_name = self.namespace.get(node.reference)
         if julia_name is None:
             warn(
@@ -443,6 +480,11 @@ class JuliaASTVisitor:
                 arg = node.arguments[0]
                 if isinstance(arg, ReferenceStructure):
                     size = self.subs_sizes.get(arg.reference)
+                    if size is None:
+                        # Case-insensitive fallback (abstract model may use different
+                        # casing from the expression parser)
+                        clean = re.sub(r"[^a-z0-9_]", "_", arg.reference.lower())
+                        size = self._clean_subs_sizes.get(clean)
                     if size is not None:
                         return str(size)
                 # Fall back: try to visit the argument and return it
