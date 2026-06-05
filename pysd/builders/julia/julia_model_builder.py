@@ -2474,6 +2474,7 @@ class JuliaSectionBuilder:
             uses.append("DataInterpolations")
         if self.data_format == "json":
             uses.append("JSON3")
+        uses.append("NCDatasets")
         header = (
             # Use # comments, not a Julia docstring: a triple-quoted string
             # immediately before `using` is parsed as "document the using
@@ -2615,6 +2616,132 @@ class JuliaSectionBuilder:
             end
             """)
 
+    def _save_results_function(self) -> str:
+        """Generate a save_results(sol, path) function that writes model output to NetCDF4."""
+        decl_pat = re.compile(r"@variables\s+(\w+)\(t\)(?:\[([^\]]+)\])?")
+
+        # Build reverse map: N_CONST_STR → (nc_dim_name, [element_labels])
+        n_const_to_dim: Dict[str, Tuple[str, List[str]]] = {}
+        for dim_name, size in self._subs_sizes.items():
+            if size <= 0:
+                continue
+            nc = self._jl_n(dim_name)
+            labels = self._subs_elems.get(dim_name, [str(i + 1) for i in range(size)])
+            nc_dim = re.sub(r"[^a-z0-9]+", "_", dim_name.lower()).strip("_")
+            n_const_to_dim[nc] = (nc_dim, labels)
+
+        # Parse @variables declarations → [(var_name, [N_CONST, ...])]
+        var_list: List[Tuple[str, List[str]]] = []
+        seen: set = set()
+        for decl in self.stock_decls + self.aux_decls:
+            m = decl_pat.search(decl)
+            if not m:
+                continue
+            vname = m.group(1)
+            if vname in seen or vname.startswith("_"):
+                continue
+            seen.add(vname)
+            dims_str = m.group(2)
+            if dims_str:
+                n_consts = [
+                    part.strip().split(":")[-1].strip()
+                    for part in dims_str.split(",")
+                ]
+            else:
+                n_consts = []
+            var_list.append((vname, n_consts))
+
+        if not var_list:
+            return ""
+
+        # Collect used N_CONST names in order of first appearance
+        used_n_consts: List[str] = []
+        for _, n_consts in var_list:
+            for nc in n_consts:
+                if nc not in used_n_consts:
+                    used_n_consts.append(nc)
+
+        lines: List[str] = []
+        lines.append("function save_results(sol, path::String)")
+        lines.append("    ds = NCDataset(path, \"c\")")
+        lines.append("    defDim(ds, \"time\", length(sol.t))")
+        lines.append("    let v = defVar(ds, \"time\", Float64, (\"time\",)); v[:] = sol.t; end")
+
+        # Subscript dimension declarations + label coordinates
+        for nc in used_n_consts:
+            if nc in n_const_to_dim:
+                nc_dim, labels = n_const_to_dim[nc]
+                labels_jl = ", ".join(f'"{lbl}"' for lbl in labels)
+                lines.append(f"    defDim(ds, \"{nc_dim}\", {nc})")
+                lines.append(
+                    f"    let v = defVar(ds, \"{nc_dim}_labels\", String, (\"{nc_dim}\",));"
+                    f" v[:] = [{labels_jl}]; end"
+                )
+            else:
+                nc_dim = re.sub(r"[^a-z0-9]+", "_", nc.lower()).strip("_")
+                nc_dim = nc_dim[2:] if nc_dim.startswith("n_") else nc_dim
+                lines.append(f"    defDim(ds, \"{nc_dim}\", {nc})")
+
+        lines.append("")
+        lines.append("    # --- model variables ---")
+
+        for vname, n_consts in var_list:
+            if not n_consts:
+                lines.append(
+                    f"    try; let v = defVar(ds, \"{vname}\", Float64, (\"time\",));"
+                    f" v[:] = sol[sys.{vname}, :]; end; catch; end"
+                )
+            elif len(n_consts) == 1:
+                nc = n_consts[0]
+                nc_dim = n_const_to_dim[nc][0] if nc in n_const_to_dim else (
+                    nc[2:].lower() if nc.upper().startswith("N_") else nc.lower()
+                )
+                lines.append(f"    try")
+                lines.append(
+                    f"        let v = defVar(ds, \"{vname}\", Float64, (\"{nc_dim}\", \"time\"))"
+                )
+                lines.append(f"            for _i in 1:{nc}")
+                lines.append(f"                v[_i, :] = sol[sys.{vname}[_i], :]")
+                lines.append(f"            end")
+                lines.append(f"        end")
+                lines.append(f"    catch; end")
+            elif len(n_consts) == 2:
+                nc1, nc2 = n_consts
+                d1 = n_const_to_dim[nc1][0] if nc1 in n_const_to_dim else nc1.lower()
+                d2 = n_const_to_dim[nc2][0] if nc2 in n_const_to_dim else nc2.lower()
+                lines.append(f"    try")
+                lines.append(
+                    f"        let v = defVar(ds, \"{vname}\", Float64, (\"{d1}\", \"{d2}\", \"time\"))"
+                )
+                lines.append(f"            for _i in 1:{nc1}, _j in 1:{nc2}")
+                lines.append(f"                v[_i, _j, :] = sol[sys.{vname}[_i, _j], :]")
+                lines.append(f"            end")
+                lines.append(f"        end")
+                lines.append(f"    catch; end")
+            else:
+                # ≥3 dimensions
+                dim_names_jl = ", ".join(
+                    f'"{n_const_to_dim[nc][0] if nc in n_const_to_dim else nc.lower()}"'
+                    for nc in n_consts
+                )
+                size_tuple = "(" + ", ".join(nc for nc in n_consts) + ",)"
+                idx_parts = ", ".join(f"_idx[{i + 1}]" for i in range(len(n_consts)))
+                lines.append(f"    try")
+                lines.append(
+                    f"        let v = defVar(ds, \"{vname}\", Float64, ({dim_names_jl}, \"time\"))"
+                )
+                lines.append(f"            for _idx in CartesianIndices{size_tuple}")
+                lines.append(f"                v[Tuple(_idx)..., :] = sol[sys.{vname}[{idx_parts}], :]")
+                lines.append(f"            end")
+                lines.append(f"        end")
+                lines.append(f"    catch; end")
+
+        lines.append("")
+        lines.append("    close(ds)")
+        lines.append("end")
+        lines.append("")
+        return "\n".join(lines) + "\n"
+
     def _system_block(self) -> str:
         sym = re.sub(r"[^a-zA-Z0-9_]", "_", self.model_name)
         return (
@@ -2639,6 +2766,7 @@ class JuliaSectionBuilder:
             self._system_block(),
             "\n",
             self._run_function(),
+            self._save_results_function(),
         ])
 
     def _modular_main_content(
@@ -2681,6 +2809,7 @@ class JuliaSectionBuilder:
             self._system_block(),
             "\n",
             self._run_function(),
+            self._save_results_function(),
         ])
 
 
