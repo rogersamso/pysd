@@ -607,6 +607,53 @@ class JuliaASTVisitor:
             julia_id = self.namespace.get(node.function.reference)
             if julia_id is not None:
                 args = [self.visit(a) for a in node.arguments]
+
+                # Handle aggregation subscripts on the function reference itself,
+                # e.g. f[dim1!, dim2](t) → [f(_ii0, _i0, t) for _ii0 in 1:N_DIM1]
+                func_node_subs = (
+                    node.function.subscripts.subscripts
+                    if node.function.subscripts is not None
+                    and hasattr(node.function.subscripts, "subscripts")
+                    else []
+                )
+                if func_node_subs and any(s.endswith("!") for s in func_node_subs):
+                    var_dims_list = self.var_dims.get(julia_id, [])
+                    bang_ranges_c: List[str] = []
+                    ii_count_c = 0
+                    dim_to_idx_c: Dict[str, str] = {}
+                    for sub in func_node_subs:
+                        clean_sub = re.sub(r"[^a-z0-9_]", "_", sub.lower())
+                        if sub.endswith("!"):
+                            bare = sub[:-1]
+                            clean_bare = re.sub(r"[^a-z0-9_]", "_", bare.lower())
+                            dim_name = next(
+                                (d for d in var_dims_list
+                                 if re.sub(r"[^a-z0-9_]", "_", d.lower()) == clean_bare),
+                                bare,
+                            )
+                            iv = f"_ii{ii_count_c}"
+                            ii_count_c += 1
+                            dim_to_idx_c[re.sub(r"[^a-z0-9_]", "_", dim_name.lower())] = iv
+                            bang_ranges_c.append(f"{iv} in 1:{self._jl_n(dim_name)}")
+                        elif sub in self.active_subs:
+                            dim_to_idx_c[clean_sub] = self.active_subs[sub]
+                        elif sub in self.subs_elems:
+                            idx_var = self.active_subs.get(sub)
+                            if idx_var:
+                                dim_to_idx_c[clean_sub] = idx_var
+                        else:
+                            if sub in self._elem_index:
+                                idx_val = next(iter(self._elem_index[sub].values()))
+                                dim_to_idx_c[clean_sub] = str(idx_val)
+                    call_indices = [
+                        dim_to_idx_c[re.sub(r"[^a-z0-9_]", "_", d.lower())]
+                        for d in var_dims_list
+                        if re.sub(r"[^a-z0-9_]", "_", d.lower()) in dim_to_idx_c
+                    ]
+                    for_clause_c = ", ".join(bang_ranges_c)
+                    inner_call = f"{julia_id}({', '.join(call_indices + args)})"
+                    return f"[{inner_call} for {for_clause_c}]"
+
                 if self.var_dims:
                     dims = self.var_dims.get(julia_id, [])
                     if dims:
