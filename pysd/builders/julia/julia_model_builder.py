@@ -511,6 +511,24 @@ class JuliaSectionBuilder:
         for pos, dim_name in enumerate(comp.subscripts[0]):
             size = self._subs_sizes.get(dim_name, 0)
             if size > 0:
+                # Check whether other components reference elements that fall
+                # outside this range (the "range + sibling-element" pattern,
+                # e.g. C_in_Deep_Ocean[upper] + C_in_Deep_Ocean[Layer4]).
+                if len(elem.components) > 1:
+                    range_elems = set(self._subs_elems.get(dim_name, []))
+                    all_labels: set = set()
+                    for c in elem.components:
+                        if c.subscripts and len(c.subscripts[0]) > pos:
+                            s = c.subscripts[0][pos]
+                            if s in self._subs_elems:
+                                all_labels.update(self._subs_elems[s])
+                            elif s in self._elem_to_range:
+                                all_labels.add(s)
+                    if all_labels and not all_labels <= range_elems:
+                        parent = self._infer_parent_range(list(all_labels))
+                        if parent and self._subs_sizes.get(parent, 0) > size:
+                            dim_name = parent
+                            size = self._subs_sizes[parent]
                 dims.append((dim_name, size))
             elif dim_name in self._elem_to_range:
                 # dim_name is a specific element — infer the parent range from
@@ -537,6 +555,58 @@ class JuliaSectionBuilder:
     def _range_str(self, dims: List[Tuple[str, int]]) -> str:
         """Build ``'1:N_D0, 1:N_D1, ...'`` for array declarations."""
         return ", ".join(f"1:{self._jl_n(d)}" for d, _ in dims)
+
+    def _per_index_subs(
+        self,
+        dim_name: str,
+        dim_elems: List[str],
+        abs_idx: int,
+        def_range_name: Optional[str],
+    ) -> Dict[str, str]:
+        """Build ``active_subs`` for a per-index visitor in EXCEPT expansion.
+
+        When iterating over a sub-range (*def_range_name*), Vensim aligns
+        same-size ranges positionally: if we are at position *p* within the
+        defining range, a reference ``[other_range]`` of the same size refers
+        to element *other_range[p]*.  We pre-compute the absolute Julia array
+        index for each such range so the expression visitor resolves them
+        correctly without needing to understand range aliasing.
+        """
+        subs: Dict[str, str] = {dim_name: str(abs_idx)}
+        if def_range_name is None or def_range_name == dim_name:
+            return subs
+
+        def_elems = self._subs_elems.get(def_range_name, [])
+        if not def_elems:
+            return subs
+
+        element_label = dim_elems[abs_idx - 1]
+        if element_label not in def_elems:
+            return subs
+
+        pos = def_elems.index(element_label)   # 0-based position within def_range
+        def_size = len(def_elems)
+        dim_idx_map = {e: i + 1 for i, e in enumerate(dim_elems)}
+
+        # Add the defining range mapped to the absolute parent-dimension index.
+        subs[def_range_name] = str(abs_idx)
+
+        # For every range of the same size, map it to the absolute index of its
+        # p-th element in the parent dimension (positional alignment).
+        for sr in self._abstract_subscripts:
+            if (
+                isinstance(sr.subscripts, list)
+                and len(sr.subscripts) == def_size
+                and sr.name != def_range_name
+                and sr.name != dim_name
+            ):
+                aligned_elem = sr.subscripts[pos]
+                if aligned_elem in dim_idx_map:
+                    subs[sr.name] = str(dim_idx_map[aligned_elem])
+                else:
+                    subs[sr.name] = str(pos + 1)   # fallback: position
+
+        return subs
 
     def _idx_vars(self, ndim: int) -> List[str]:
         """Generate index variable names ``_i0, _i1, ...`` for comprehensions."""
@@ -958,6 +1028,20 @@ class JuliaSectionBuilder:
             label: i + 1 for i, label in enumerate(dim_elems)
         }
 
+        # Pre-scan: detect stock and delay-fixed components so we can choose
+        # the right declaration type and pre-allocate internal state arrays.
+        has_integ = any(isinstance(c.ast, IntegStructure) for c in elem.components)
+        has_delay_fixed = any(
+            isinstance(c.ast, DelayFixedStructure) for c in elem.components
+        )
+        df_name: Optional[str] = None
+        if has_delay_fixed:
+            df_name = f"_df_{identifier}"
+            self.namespace.namespace[f"__internal_df_{identifier}"] = df_name
+            self.stock_decls.append(
+                f"@variables {df_name}(t)[{self._range_str(dims)}]"
+            )
+
         equations: List[str] = []
 
         for comp in elem.components:
@@ -968,16 +1052,23 @@ class JuliaSectionBuilder:
                     excluded_labels.add(label)
 
             # Determine which indices this component covers.
-            # The defining subscript (comp.subscripts[0]) may be a full range name
-            # OR a list of specific element labels.  Only include elements that are
-            # both in the defining scope AND not excluded.
+            # The defining subscript (comp.subscripts[0]) may be:
+            #   (a) the full dimension range name  → all elements
+            #   (b) a sub-range name               → elements of that sub-range
+            #   (c) specific element label(s)      → those elements only
             def_subs = comp.subscripts[0] if comp.subscripts else []
-            # If the first def_sub is the full range name, use all elements;
-            # otherwise, use only the listed element labels.
+            def_range_name: Optional[str] = None  # non-None only for sub-ranges (b)
+
             if def_subs and def_subs[0] == dim_name:
+                # (a) Full range
                 candidate_labels = dim_elems
+            elif def_subs and def_subs[0] in self._subs_sizes:
+                # (b) A named sub-range — expand to its elements within dim_elems
+                def_range_name = def_subs[0]
+                range_elems = self._subs_elems.get(def_range_name, [])
+                candidate_labels = [e for e in range_elems if e in label_to_idx]
             else:
-                # Specific elements: use the intersection with dim_elems
+                # (c) Specific element label(s)
                 candidate_labels = [s for s in def_subs if s in label_to_idx]
 
             covered_indices = [
@@ -1000,14 +1091,56 @@ class JuliaSectionBuilder:
                         equations.append(
                             f"# EXCEPT: {identifier}[{idx}] = {value_expr}"
                         )
-            else:
-                # Auxiliary component — use a per-index visitor so subscripted
-                # references (e.g. policy_share_feh_over_fed) are indexed.
+
+            elif isinstance(comp.ast, IntegStructure):
+                # Stock component — emit per-index ODE + initial condition.
                 for idx in covered_indices:
-                    label = dim_elems[idx - 1]
                     vis_idx = JuliaASTVisitor(
                         self.namespace, self.inline_registry, self.needed_helpers,
-                        active_subs={dim_name: str(idx)},
+                        active_subs=self._per_index_subs(
+                            dim_name, dim_elems, idx, def_range_name
+                        ),
+                        var_dims=self._var_dims, subs_sizes=self._subs_sizes,
+                        subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
+                        root=self.root,
+                    )
+                    flow_expr = vis_idx.visit(comp.ast.flow)
+                    init_expr = vis_idx.visit(comp.ast.initial)
+                    self.u0_entries.append(f"{identifier}[{idx}] => {init_expr}")
+                    equations.append(f"D({identifier}[{idx}]) ~ {flow_expr}")
+
+            elif isinstance(comp.ast, DelayFixedStructure):
+                # DELAY FIXED — approximate as first-order ODE (same as
+                # _expand_delay_fixed) but per-index with separate initials.
+                for idx in covered_indices:
+                    vis_idx = JuliaASTVisitor(
+                        self.namespace, self.inline_registry, self.needed_helpers,
+                        active_subs=self._per_index_subs(
+                            dim_name, dim_elems, idx, def_range_name
+                        ),
+                        var_dims=self._var_dims, subs_sizes=self._subs_sizes,
+                        subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
+                        root=self.root,
+                    )
+                    input_expr = vis_idx.visit(comp.ast.input)
+                    delay_expr = vis_idx.visit(comp.ast.delay_time)
+                    init_expr = vis_idx.visit(comp.ast.initial)
+                    self.u0_entries.append(f"{df_name}[{idx}] => {init_expr}")
+                    equations.append(
+                        f"D({df_name}[{idx}]) ~ "
+                        f"({input_expr} - {df_name}[{idx}]) / {delay_expr}"
+                    )
+                    equations.append(f"{identifier}[{idx}] ~ {df_name}[{idx}]")
+
+            else:
+                # Auxiliary component — use a per-index visitor with aligned
+                # subscripts so cross-range references resolve correctly.
+                for idx in covered_indices:
+                    vis_idx = JuliaASTVisitor(
+                        self.namespace, self.inline_registry, self.needed_helpers,
+                        active_subs=self._per_index_subs(
+                            dim_name, dim_elems, idx, def_range_name
+                        ),
                         var_dims=self._var_dims, subs_sizes=self._subs_sizes,
                         subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
                         root=self.root,
@@ -1016,9 +1149,14 @@ class JuliaSectionBuilder:
                     equations.append(f"{identifier}[{idx}] ~ {rhs_expr}")
 
         if not is_control:
-            self.aux_decls.append(
-                f"@variables {identifier}(t)[{self._range_str(dims)}]"
-            )
+            if has_integ:
+                self.stock_decls.append(
+                    f"@variables {identifier}(t)[{self._range_str(dims)}]"
+                )
+            else:
+                self.aux_decls.append(
+                    f"@variables {identifier}(t)[{self._range_str(dims)}]"
+                )
         return equations
 
     def _process_except_element_2d(
