@@ -1229,16 +1229,25 @@ class TestJuliaSectionBuilderInitial:
         sb.build_section()
         assert any("@parameters init_rate = 7.5" in d for d in sb.param_decls)
 
-    @pytest.mark.filterwarnings("always::UserWarning")
-    def test_initial_fallback_emits_warning(self):
-        # Reference that can't be resolved → fallback to aux + warning
+    def test_initial_fallback_frozen_stock(self):
+        # Reference that can't be resolved at translation time → frozen-stock
+        # fallback: D(x) ~ 0.0 with initial condition x(t0) = expr.
+        # No warning is emitted; the variable is a stock, not an auxiliary.
+        import warnings
         init_ast = InitialStructure(initial=ReferenceStructure("unknown_var"))
         comp = AbstractComponent(subscripts=[[], []], ast=init_ast)
         elem = AbstractElement(name="Init Fallback", components=[comp])
-        with pytest.warns(UserWarning, match="Cannot resolve INITIAL"):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             sb = _section_builder_from_elements([elem])
             sb.build_section()
-        assert any("@variables init_fallback(t)" in d for d in sb.aux_decls)
+        assert not any("Cannot resolve INITIAL" in str(x.message) for x in w)
+        # Declared as a stock variable (not an auxiliary)
+        assert any("@variables init_fallback(t)" in d for d in sb.stock_decls)
+        assert not any("@variables init_fallback(t)" in d for d in sb.aux_decls)
+        # D(init_fallback) ~ 0.0 in the equations
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("D(init_fallback)" in e for e in all_eqs)
 
     def test_resolve_ref_initial_chain(self):
         """INITIAL(aux) where aux ~ stock → resolves to stock initial."""
@@ -2450,9 +2459,10 @@ class TestCoverageGaps:
         combined = next(d for d in all_decls if "policy_share" in d)
         assert "0.3" in combined
 
-    @pytest.mark.filterwarnings("always::UserWarning")
     def test_initial_from_get_constants_exception(self, mocker, tmp_path):
-        """INITIAL(GetConstantsStructure) exception silenced → returns None → fallback."""
+        """INITIAL(GetConstantsStructure) exception → _resolve_initial_value returns None
+        → frozen-stock fallback: D(x) ~ 0.0, x(t0) = placeholder-0.0.
+        No 'Cannot resolve' warning is emitted; a GCS-read warning may be."""
         mocker.patch(
             "pysd.py_backend.external.ExtConstant",
             side_effect=FileNotFoundError("missing"),
@@ -2461,10 +2471,17 @@ class TestCoverageGaps:
         init_ast = InitialStructure(initial=gc_ast)
         comp = AbstractComponent(subscripts=[[], []], ast=init_ast)
         elem = AbstractElement(name="Init Gc Fail", components=[comp])
-        with pytest.warns(UserWarning, match="Cannot resolve INITIAL"):
+        import warnings as _w
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")
             sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl")
             sb.build_section()
-        assert any("@variables init_gc_fail(t)" in d for d in sb.aux_decls)
+        # No "Cannot resolve INITIAL" warning
+        assert not any("Cannot resolve INITIAL" in str(x.message) for x in caught)
+        # Emitted as a frozen stock, not an auxiliary
+        assert any("@variables init_gc_fail(t)" in d for d in sb.stock_decls)
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("D(init_gc_fail)" in e for e in all_eqs)
 
     def test_modular_build_no_equations_uses_empty_list(self, tmp_path):
         """Modular build with only control vars → combined = Equation[]."""

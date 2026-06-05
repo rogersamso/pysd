@@ -7,7 +7,7 @@ functions.py
 import json
 from datetime import datetime
 from pathlib import Path
-from chardet.universaldetector import UniversalDetector
+from chardet.detector import UniversalDetector
 from dataclasses import dataclass
 from typing import Dict, Set
 

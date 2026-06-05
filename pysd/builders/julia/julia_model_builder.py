@@ -606,22 +606,22 @@ class JuliaSectionBuilder:
             return []
 
         # ---- INITIAL() — freeze inner expression at t=0 ----------------
-        # Vensim's INITIAL(x) returns the value of x at t=0.  We implement
-        # this as a @parameters constant equal to x's initial condition.
+        # Vensim's INITIAL(x) returns the value of x at t=0.  Two strategies:
+        #
+        # (a) If the inner value can be resolved at translation time → @parameters.
+        # (b) Otherwise → implement as a zero-derivative stock so MTK evaluates
+        #     the initial condition at t0 and holds it constant:
+        #       D(initial_var) ~ 0.0 ; initial_var(t0) = inner_expr
         if isinstance(ast, InitialStructure):
             val = self._resolve_initial_value(ast.initial)
             if val is not None:
                 if not is_control:
                     self.param_decls.append(f"@parameters {identifier} = {val}")
                 return []
-            else:
-                warn(
-                    f"Cannot resolve INITIAL() for '{elem.name}' — "
-                    "falling back to auxiliary variable (may not be constant)."
-                )
-                rhs = visitor.visit(ast.initial)
-                self.aux_decls.append(f"@variables {identifier}(t)")
-                return [f"{identifier} ~ {rhs}"]
+            # Fall back: frozen stock — D = 0, initial value = inner expression.
+            return self._expand_initial_frozen_stock(
+                identifier, ast.initial, dims, ndim
+            )
 
         # ---- Stock (INTEG) ---------------------------------------------
         if isinstance(ast, IntegStructure):
@@ -1664,6 +1664,80 @@ class JuliaSectionBuilder:
             )
             self.aux_decls.append(f"@variables {identifier}(t)")
             return [f"# GET_DATA_FAILED: {identifier} ~ 0.0"]
+
+    def _expand_initial_frozen_stock(
+        self,
+        identifier: str,
+        inner_ast,
+        dims: List[Tuple[str, int]],
+        ndim: int,
+    ) -> List[str]:
+        """Emit ``INITIAL(expr)`` as a zero-derivative stock.
+
+        MTK evaluates the initial-condition expression at t=t0, which gives
+        the correct Vensim semantics (value frozen at the initial time).
+
+        Scalar::
+
+            @variables x(t)
+            D(x) ~ 0.0
+            u0: x => expr
+
+        1D subscripted::
+
+            @variables x(t)[1:N]
+            Symbolics.scalarize(D.(x) .~ 0.0)...
+            u0: x[i] => expr_at_i   (for i in 1..N)
+
+        2D subscripted::
+
+            @variables x(t)[1:N0, 1:N1]
+            [D(x[_i0, _i1]) ~ 0.0 for _i0 in 1:N0, _i1 in 1:N1]...
+            u0: x[i, j] => expr_at_ij
+        """
+        if ndim == 0:
+            v = JuliaASTVisitor(
+                self.namespace, self.inline_registry, self.needed_helpers,
+                subs_sizes=self._subs_sizes, root=self.root,
+            )
+            init_expr = v.visit(inner_ast)
+            self.stock_decls.append(f"@variables {identifier}(t)")
+            self.u0_entries.append(f"{identifier} => {init_expr}")
+            return [f"D({identifier}) ~ 0.0"]
+
+        if ndim == 1:
+            (d0, n0) = dims[0]
+            idx_vars = ["_i0"]
+            vnd = self._nd_visitor(dims, idx_vars)
+            raw_expr = vnd.visit(inner_ast)
+            self.stock_decls.append(
+                f"@variables {identifier}(t)[{self._range_str(dims)}]"
+            )
+            for i in range(1, n0 + 1):
+                expr_i = raw_expr.replace("_i0", str(i))
+                self.u0_entries.append(f"{identifier}[{i}] => {expr_i}")
+            return [f"Symbolics.scalarize(D.({identifier}) .~ 0.0)..."]
+
+        # ndim >= 2
+        idx_vars = self._idx_vars(ndim)
+        vnd = self._nd_visitor(dims, idx_vars)
+        raw_expr = vnd.visit(inner_ast)
+        ranges_list = [range(1, size + 1) for _, size in dims]
+        self.stock_decls.append(
+            f"@variables {identifier}(t)[{self._range_str(dims)}]"
+        )
+        for idx_combo in itertools.product(*ranges_list):
+            expr_ij = raw_expr
+            for iv, idx in zip(idx_vars, idx_combo):
+                expr_ij = expr_ij.replace(iv, str(idx))
+            idx_str = ", ".join(str(i) for i in idx_combo)
+            self.u0_entries.append(f"{identifier}[{idx_str}] => {expr_ij}")
+        for_clause = self._for_clause(dims, idx_vars)
+        idx_str_template = ", ".join(idx_vars)
+        return [
+            f"[D({identifier}[{idx_str_template}]) ~ 0.0 "
+            f"for {for_clause}]..."
+        ]
 
     def _resolve_initial_value(self, inner_ast) -> Optional[str]:
         """Return the t=0 value of *inner_ast* as a Julia literal, or None.
