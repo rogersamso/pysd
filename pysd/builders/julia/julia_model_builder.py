@@ -796,7 +796,7 @@ class JuliaSectionBuilder:
 
         # ---- First-order Smooth ----------------------------------------
         if isinstance(ast, SmoothStructure) and ast.order == 1:
-            return self._expand_smooth(identifier, ast, visitor, order=1)
+            return self._expand_smooth(identifier, ast, visitor, order=1, dims=dims)
 
         # ---- Higher-order Smooth / SmoothN -----------------------------
         if isinstance(ast, (SmoothStructure, SmoothNStructure)):
@@ -807,7 +807,7 @@ class JuliaSectionBuilder:
                     f"SMOOTH with non-integer order for '{elem.name}'; defaulting to 3."
                 )
                 order = 3
-            return self._expand_smooth(identifier, ast, visitor, order=order)
+            return self._expand_smooth(identifier, ast, visitor, order=order, dims=dims)
 
         # ---- Delay (integer order) -------------------------------------
         if isinstance(ast, (DelayStructure, DelayNStructure)):
@@ -818,7 +818,7 @@ class JuliaSectionBuilder:
                     f"DELAY with non-integer order for '{elem.name}'; defaulting to 3."
                 )
                 order = 3
-            return self._expand_delay(identifier, ast, visitor, order=order)
+            return self._expand_delay(identifier, ast, visitor, order=order, dims=dims)
 
         # ---- DELAY FIXED ------------------------------------------------
         # Approximate DELAY FIXED as a first-order ODE delay (same formula
@@ -826,7 +826,7 @@ class JuliaSectionBuilder:
         # that ModelingToolkit/OrdinaryDiffEq does not support, so this is
         # the best we can do in the MTK ODE framework.
         if isinstance(ast, DelayFixedStructure):
-            return self._expand_delay_fixed(identifier, ast, visitor)
+            return self._expand_delay_fixed(identifier, ast, visitor, dims=dims)
 
         # ---- External constant (GET XLS/DIRECT CONSTANTS) ----------------
         # Also catches piecewise-constant elements where some components are
@@ -886,7 +886,7 @@ class JuliaSectionBuilder:
 
         # ---- SAMPLE IF TRUE ---------------------------------------------
         if isinstance(ast, SampleIfTrueStructure):
-            return self._expand_sample_if_true(identifier, ast, visitor)
+            return self._expand_sample_if_true(identifier, ast, visitor, dims=dims, ndim=ndim)
 
         # ---- ALLOCATE AVAILABLE / ALLOCATE BY PRIORITY ------------------
         if isinstance(ast, (AllocateAvailableStructure, AllocateByPriorityStructure)):
@@ -1327,6 +1327,7 @@ class JuliaSectionBuilder:
         ast,
         visitor: JuliaASTVisitor,
         order: int,
+        dims: Optional[List[Tuple[str, int]]] = None,
     ) -> List[str]:
         """Expand a DELAY(N) into *order* chained first-order pipeline levels.
 
@@ -1336,18 +1337,59 @@ class JuliaSectionBuilder:
             rate    = order / delay_time
             inflow_1 = input;  inflow_i = L_{i-1} * rate  for i > 1
         """
+        dims = dims or []
+        eqs: List[str] = []
+
+        if dims:
+            ndim = len(dims)
+            idx_vars = self._idx_vars(ndim)
+            vnd = self._nd_visitor(dims, idx_vars)
+            input_nd = vnd.visit(ast.input)
+            delay_time_nd = vnd.visit(ast.delay_time)
+            initial_nd = vnd.visit(ast.initial)
+            idx_str_t = ", ".join(idx_vars)
+            for_clause = self._for_clause(dims, idx_vars)
+            ranges_list = [range(1, size + 1) for _, size in dims]
+
+            rate_nd = f"({order} / ({delay_time_nd}))"
+            prev_nd = input_nd
+            for stage in range(1, order + 1):
+                lv_name = f"_dl{stage}_{identifier}"
+                self.namespace.namespace[f"__internal_dl{stage}_{identifier}"] = lv_name
+                self.stock_decls.append(
+                    f"@variables {lv_name}(t)[{self._range_str(dims)}]"
+                )
+                for idx_combo in itertools.product(*ranges_list):
+                    expr_i = initial_nd
+                    dt_i = delay_time_nd
+                    for iv, idx in zip(idx_vars, idx_combo):
+                        expr_i = expr_i.replace(iv, str(idx))
+                        dt_i = dt_i.replace(iv, str(idx))
+                    idx_s = ", ".join(str(v) for v in idx_combo)
+                    self.u0_entries.append(
+                        f"{lv_name}[{idx_s}] => {expr_i} * ({dt_i}) / {order}"
+                    )
+                lv_ref = f"{lv_name}[{idx_str_t}]"
+                eqs.append(
+                    f"[D({lv_ref}) ~ ({prev_nd} - {lv_ref} * {rate_nd}) "
+                    f"for {for_clause}]..."
+                )
+                prev_nd = f"{lv_ref} .* {rate_nd}"
+            self.aux_decls.append(
+                f"@variables {identifier}(t)[{self._range_str(dims)}]"
+            )
+            eqs.append(f"[{identifier}[{idx_str_t}] ~ {prev_nd} for {for_clause}]...")
+            return eqs
+
         input_expr = visitor.visit(ast.input)
         delay_time_expr = visitor.visit(ast.delay_time)
         initial_expr = visitor.visit(ast.initial)
-
         rate_expr = f"({order} / {delay_time_expr})"
-        eqs: List[str] = []
         prev_outflow = input_expr
         for i in range(1, order + 1):
             lv_name = f"_dl{i}_{identifier}"
             self.namespace.namespace[f"__internal_dl{i}_{identifier}"] = lv_name
             self.stock_decls.append(f"@variables {lv_name}(t)")
-            # Initial level = initial_value * delay_time / order
             self.u0_entries.append(
                 f"{lv_name} => {initial_expr} * {delay_time_expr} / {order}"
             )
@@ -1369,6 +1411,7 @@ class JuliaSectionBuilder:
         identifier: str,
         ast,
         visitor: "JuliaASTVisitor",
+        dims: Optional[List[Tuple[str, int]]] = None,
     ) -> List[str]:
         """Approximate DELAY FIXED as a first-order ODE delay.
 
@@ -1380,15 +1423,43 @@ class JuliaSectionBuilder:
 
         with initial condition ``output(0) = initial``.
         """
+        dims = dims or []
+        lv_name = f"_df_{identifier}"
+        self.namespace.namespace[f"__internal_df_{identifier}"] = lv_name
+
+        if dims:
+            ndim = len(dims)
+            idx_vars = self._idx_vars(ndim)
+            vnd = self._nd_visitor(dims, idx_vars)
+            input_nd = vnd.visit(ast.input)
+            delay_time_nd = vnd.visit(ast.delay_time)
+            initial_nd = vnd.visit(ast.initial)
+            self.stock_decls.append(
+                f"@variables {lv_name}(t)[{self._range_str(dims)}]"
+            )
+            ranges_list = [range(1, size + 1) for _, size in dims]
+            for idx_combo in itertools.product(*ranges_list):
+                expr_i = initial_nd
+                for iv, idx in zip(idx_vars, idx_combo):
+                    expr_i = expr_i.replace(iv, str(idx))
+                idx_str = ", ".join(str(v) for v in idx_combo)
+                self.u0_entries.append(f"{lv_name}[{idx_str}] => {expr_i}")
+            self.aux_decls.append(
+                f"@variables {identifier}(t)[{self._range_str(dims)}]"
+            )
+            idx_str_t = ", ".join(idx_vars)
+            for_clause = self._for_clause(dims, idx_vars)
+            return [
+                f"[D({lv_name}[{idx_str_t}]) ~ ({input_nd} - {lv_name}[{idx_str_t}]) / ({delay_time_nd}) "
+                f"for {for_clause}]...",
+                f"[{identifier}[{idx_str_t}] ~ {lv_name}[{idx_str_t}] for {for_clause}]...",
+            ]
+
         input_expr = visitor.visit(ast.input)
         delay_time_expr = visitor.visit(ast.delay_time)
         initial_expr = visitor.visit(ast.initial)
-
-        lv_name = f"_df_{identifier}"
-        self.namespace.namespace[f"__internal_df_{identifier}"] = lv_name
         self.stock_decls.append(f"@variables {lv_name}(t)")
         self.u0_entries.append(f"{lv_name} => {initial_expr}")
-
         self.aux_decls.append(f"@variables {identifier}(t)")
         return [
             f"D({lv_name}) ~ ({input_expr} - {lv_name}) / {delay_time_expr}",
@@ -1501,6 +1572,8 @@ class JuliaSectionBuilder:
         identifier: str,
         ast,
         visitor: "JuliaASTVisitor",
+        dims: Optional[List[Tuple[str, int]]] = None,
+        ndim: int = 0,
     ) -> List[str]:
         """Expand SAMPLE IF TRUE(condition, input, initial).
 
@@ -1523,21 +1596,47 @@ class JuliaSectionBuilder:
 
         which is exact (one-step snap to input).
         """
-        condition_expr = visitor.visit(ast.condition)
-        input_expr = visitor.visit(ast.input)
-        initial_expr = visitor.visit(ast.initial)
-
+        dims = dims or []
         st_name = f"_sit_{identifier}"
         self.namespace.namespace[f"__internal_sit_{identifier}"] = st_name
-        self.stock_decls.append(f"@variables {st_name}(t)")
-        self.u0_entries.append(f"{st_name} => {initial_expr}")
 
-        # Use the simulation time_step as the relaxation divisor.
-        # With Euler integration: output_new = output + dt*(input-output)/dt = input.
-        # We look up time_step from control_vals; fall back to a symbolic reference.
         ts_val = self.control_vals.get("time_step")
         ts_expr = ts_val if ts_val is not None else "time_step"
 
+        if dims:
+            idx_vars = self._idx_vars(len(dims))
+            vnd = self._nd_visitor(dims, idx_vars)
+            condition_nd = vnd.visit(ast.condition)
+            input_nd = vnd.visit(ast.input)
+            initial_nd = vnd.visit(ast.initial)
+            idx_str_t = ", ".join(idx_vars)
+            for_clause = self._for_clause(dims, idx_vars)
+            ranges_list = [range(1, size + 1) for _, size in dims]
+
+            self.stock_decls.append(
+                f"@variables {st_name}(t)[{self._range_str(dims)}]"
+            )
+            for idx_combo in itertools.product(*ranges_list):
+                expr_i = initial_nd
+                for iv, idx in zip(idx_vars, idx_combo):
+                    expr_i = expr_i.replace(iv, str(idx))
+                idx_s = ", ".join(str(v) for v in idx_combo)
+                self.u0_entries.append(f"{st_name}[{idx_s}] => {expr_i}")
+            self.aux_decls.append(
+                f"@variables {identifier}(t)[{self._range_str(dims)}]"
+            )
+            return [
+                f"[D({st_name}[{idx_str_t}]) ~ ifelse({condition_nd} > 0.5, "
+                f"({input_nd} - {st_name}[{idx_str_t}]) / ({ts_expr}), 0.0) "
+                f"for {for_clause}]...",
+                f"[{identifier}[{idx_str_t}] ~ {st_name}[{idx_str_t}] for {for_clause}]...",
+            ]
+
+        condition_expr = visitor.visit(ast.condition)
+        input_expr = visitor.visit(ast.input)
+        initial_expr = visitor.visit(ast.initial)
+        self.stock_decls.append(f"@variables {st_name}(t)")
+        self.u0_entries.append(f"{st_name} => {initial_expr}")
         self.aux_decls.append(f"@variables {identifier}(t)")
         return [
             f"D({st_name}) ~ ifelse({condition_expr} > 0.5, "
