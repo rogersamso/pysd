@@ -496,6 +496,11 @@ class JuliaSectionBuilder:
 
         Uses the first component's first subscript list.  Dims with size == 0
         (unresolved aliases) are filtered out.
+
+        When a multi-component element has per-element subscripts (e.g.
+        ``['electricity']``, ``['heat']``, …) rather than a range name, the
+        parent range is inferred from all components' element labels so the
+        variable is correctly declared as an array.
         """
         if not elem.components:
             return []
@@ -503,10 +508,26 @@ class JuliaSectionBuilder:
         if not comp.subscripts or not comp.subscripts[0]:
             return []
         dims = []
-        for dim_name in comp.subscripts[0]:
+        for pos, dim_name in enumerate(comp.subscripts[0]):
             size = self._subs_sizes.get(dim_name, 0)
             if size > 0:
                 dims.append((dim_name, size))
+            elif dim_name in self._elem_to_range:
+                # dim_name is a specific element — infer the parent range from
+                # all components' element at this position, or fall back to the
+                # first known parent.
+                if len(elem.components) > 1:
+                    all_elems_at_pos = list({
+                        c.subscripts[0][pos]
+                        for c in elem.components
+                        if c.subscripts and len(c.subscripts[0]) > pos
+                    })
+                    parent = self._infer_parent_range(all_elems_at_pos) or self._elem_to_range[dim_name]
+                else:
+                    parent = self._elem_to_range[dim_name]
+                parent_size = self._subs_sizes.get(parent, 0)
+                if parent_size > 0:
+                    dims.append((parent, parent_size))
         return dims
 
     def _jl_n(self, dim_name: str) -> str:
@@ -591,14 +612,31 @@ class JuliaSectionBuilder:
         if not elem.components:
             return []
 
-        # ---- EXCEPT subscript exclusion -----------------------------------
-        # When multiple components exist and at least one has an :EXCEPT: clause,
-        # delegate to the per-component handler.
-        if (
-            len(elem.components) > 1
-            and any(comp.subscripts[1] for comp in elem.components)
-        ):
-            return self._process_except_element(elem, identifier, is_control)
+        # ---- EXCEPT subscript exclusion / per-element multi-component ----
+        # Delegate when:
+        # (a) at least one component has an :EXCEPT: clause, OR
+        # (b) multiple components each cover a specific element (not a full range)
+        #     of the same subscript dimension — this is the Vensim pattern for
+        #     piecewise-defined auxiliaries (e.g. hist_share[elec]=0, [heat]=0,
+        #     [liquids]=f(...)).
+        if len(elem.components) > 1:
+            _has_except = any(comp.subscripts[1] for comp in elem.components)
+            # Only apply per-element detection to plain auxiliary/constant
+            # components — skip when the element uses external structures
+            # (GET LOOKUPS, GET DATA, GET CONSTANTS) which have their own
+            # dedicated handlers.
+            _is_external = any(
+                isinstance(c.ast, (GetLookupsStructure, GetDataStructure, GetConstantsStructure))
+                for c in elem.components
+            )
+            _has_per_elem = not _is_external and any(
+                c.subscripts and c.subscripts[0]
+                and c.subscripts[0][0] not in self._subs_elems
+                and c.subscripts[0][0] in self._elem_to_range
+                for c in elem.components
+            )
+            if _has_except or _has_per_elem:
+                return self._process_except_element(elem, identifier, is_control)
 
         comp = elem.components[0]
         ast = comp.ast
@@ -929,19 +967,33 @@ class JuliaSectionBuilder:
                 for label in except_list:
                     excluded_labels.add(label)
 
-            # Determine which indices this component covers
+            # Determine which indices this component covers.
+            # The defining subscript (comp.subscripts[0]) may be a full range name
+            # OR a list of specific element labels.  Only include elements that are
+            # both in the defining scope AND not excluded.
+            def_subs = comp.subscripts[0] if comp.subscripts else []
+            # If the first def_sub is the full range name, use all elements;
+            # otherwise, use only the listed element labels.
+            if def_subs and def_subs[0] == dim_name:
+                candidate_labels = dim_elems
+            else:
+                # Specific elements: use the intersection with dim_elems
+                candidate_labels = [s for s in def_subs if s in label_to_idx]
+
             covered_indices = [
-                i for i, label in enumerate(dim_elems, start=1)
+                label_to_idx[label]
+                for label in candidate_labels
                 if label not in excluded_labels
             ]
 
-            visitor = JuliaASTVisitor(
-                self.namespace, self.inline_registry, self.needed_helpers,
-                subs_sizes=self._subs_sizes, root=self.root,
-            )
-
             if comp.type in ("Constant", ) or isinstance(comp, AbstractUnchangeableConstant):
-                # Constant component — emit as parameters or just skip
+                # Constant component — emit as parameter entries
+                visitor = JuliaASTVisitor(
+                    self.namespace, self.inline_registry, self.needed_helpers,
+                    var_dims=self._var_dims, subs_sizes=self._subs_sizes,
+                    subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
+                    root=self.root,
+                )
                 value_expr = visitor.visit(comp.ast)
                 for idx in covered_indices:
                     if not is_control:
@@ -949,9 +1001,18 @@ class JuliaSectionBuilder:
                             f"# EXCEPT: {identifier}[{idx}] = {value_expr}"
                         )
             else:
-                # Auxiliary component
-                rhs_expr = visitor.visit(comp.ast)
+                # Auxiliary component — use a per-index visitor so subscripted
+                # references (e.g. policy_share_feh_over_fed) are indexed.
                 for idx in covered_indices:
+                    label = dim_elems[idx - 1]
+                    vis_idx = JuliaASTVisitor(
+                        self.namespace, self.inline_registry, self.needed_helpers,
+                        active_subs={dim_name: str(idx)},
+                        var_dims=self._var_dims, subs_sizes=self._subs_sizes,
+                        subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
+                        root=self.root,
+                    )
+                    rhs_expr = vis_idx.visit(comp.ast)
                     equations.append(f"{identifier}[{idx}] ~ {rhs_expr}")
 
         if not is_control:
