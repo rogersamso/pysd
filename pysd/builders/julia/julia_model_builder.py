@@ -849,7 +849,7 @@ class JuliaSectionBuilder:
                     return []
                 if self.data_format == "json":
                     self._json_accumulate_constant(elem, identifier, julia_val)
-                if julia_val.startswith("["):
+                if julia_val.startswith("[") or julia_val.startswith("reshape("):
                     self.ext_const_decls.append(f"const {identifier} = {julia_val}")
                 else:
                     self.param_decls.append(f"@parameters {identifier} = {julia_val}")
@@ -2958,9 +2958,12 @@ def _format_julia_value(data) -> str:
         )
         return f"[{rows}]"
 
-    # Higher dims: flatten
-    vals = ", ".join(format_number(float(v)) for v in arr.flat)
-    return f"[{vals}]"
+    # Higher dims: reshape preserving Julia column-major indexing
+    # Flatten in Fortran (column-major) order so reshape(..., s0, s1, ...) in
+    # Julia gives A[i,j,...] == arr[i-1,j-1,...].
+    vals = ", ".join(format_number(float(v)) for v in arr.flatten(order="F"))
+    shape = ", ".join(str(s) for s in arr.shape)
+    return f"reshape([{vals}], {shape})"
 
 
 def _vensim_keyword_to_itp_type(keyword: Optional[str]) -> str:
