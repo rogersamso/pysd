@@ -388,15 +388,35 @@ class JuliaSectionBuilder:
                 candidates.append((len(sr.subscripts), sr.name))
         return min(candidates, key=lambda x: x[0])[1] if candidates else None
 
+    def _infer_parent_range_not_in(
+        self, elements: List[str], exclude: Optional[set] = None
+    ) -> Optional[str]:
+        """Like :meth:`_infer_parent_range` but skips ranges in *exclude*.
+
+        Used when a candidate range is already occupied by a non-split
+        subscript position (e.g. ``final_sources`` used for pos 1 should
+        not also be the parent for the split pos 2 — use ``final_sources1``
+        instead).
+        """
+        exclude = exclude or set()
+        candidates = []
+        for sr in self._abstract_subscripts:
+            if isinstance(sr.subscripts, list) and sr.name not in exclude:
+                if all(e in sr.subscripts for e in elements):
+                    candidates.append((len(sr.subscripts), sr.name))
+        return min(candidates, key=lambda x: x[0])[1] if candidates else None
+
     def _detect_split_ranges(
         self, components: List["AbstractComponent"]
     ) -> Dict[int, str]:
         """Return ``{position: parent_range}`` for subscript positions that
         carry different element names across *components*.
 
-        The parent range is determined by :meth:`_infer_parent_range` so that
-        ambiguous elements (present in multiple ranges) are all mapped to the
-        single range that contains the full set.
+        Non-split positions' ranges are recorded first so that the split
+        position is assigned a *different* range when the naive best-fit would
+        collide (e.g. ``efficiency_rate_of_substitution`` has ``final_sources``
+        at pos 1 and the split at pos 2 also maps to ``final_sources`` — we
+        instead assign ``final_sources1`` to avoid the collision).
         """
         all_subs = [
             c.subscripts[0]
@@ -406,11 +426,25 @@ class JuliaSectionBuilder:
         if not all_subs:
             return {}
         n_pos = len(all_subs[0])
+
+        # Collect ranges committed by non-split (constant) positions
+        committed: set = set()
+        for pos in range(n_pos):
+            vals = list({s[pos] for s in all_subs if len(s) > pos})
+            if len(vals) == 1:
+                s = vals[0]
+                if s in self._subs_elems:
+                    committed.add(s)
+                elif s in self._elem_to_range:
+                    committed.add(self._elem_to_range[s])
+
         result: Dict[int, str] = {}
         for pos in range(n_pos):
             vals = list({s[pos] for s in all_subs if len(s) > pos})
             if len(vals) > 1:
-                parent = self._infer_parent_range(vals)
+                parent = self._infer_parent_range_not_in(vals, exclude=committed)
+                if parent is None:
+                    parent = self._infer_parent_range(vals)
                 if parent:
                     result[pos] = parent
         return result
@@ -653,7 +687,18 @@ class JuliaSectionBuilder:
             return self._expand_delay_fixed(identifier, ast, visitor)
 
         # ---- External constant (GET XLS/DIRECT CONSTANTS) ----------------
-        if all(isinstance(c.ast, GetConstantsStructure) for c in elem.components):
+        # Also catches piecewise-constant elements where some components are
+        # GCS and others are plain numeric literals (e.g. var[fuel1]=GCS,
+        # var[electricity]=0, var[heat]=0).
+        # Require at least one GCS so pure-literal or stock elements are not
+        # accidentally routed here.
+        _const_like = any(
+            isinstance(c.ast, GetConstantsStructure) for c in elem.components
+        ) and all(
+            isinstance(c.ast, GetConstantsStructure) or isinstance(c.ast, (int, float))
+            for c in elem.components
+        )
+        if _const_like:
             julia_val = self._read_get_constants(elem, identifier)
             if julia_val is not None:
                 if is_control:
@@ -1702,25 +1747,46 @@ class JuliaSectionBuilder:
     ) -> Optional[str]:
         """Read all GetConstantsStructure components for *elem* using ExtConstant.
 
+        Handles three layouts:
+
+        * All-GCS: one ExtConstant handles all components via .add().
+        * Mixed GCS + numeric literal: piecewise assembly — each component is
+          read/valued independently and the results are combined into one array
+          ordered by the parent subscript range.
+        * Single scalar: trivial ExtConstant read.
+
         Returns a Julia literal string (scalar or array) on success, or None
         if the file cannot be read, in which case the caller falls through to
         the unsupported-structure handler.
         """
+        import numpy as np
         try:
             from pysd.py_backend.external import ExtConstant
 
+            gcs_comps = [c for c in elem.components if isinstance(c.ast, GetConstantsStructure)]
+            lit_comps = [c for c in elem.components if not isinstance(c.ast, GetConstantsStructure)]
+
+            # ----- Piecewise: mix of GCS + numeric literals -----
+            if gcs_comps and lit_comps:
+                return self._read_get_constants_piecewise(
+                    elem, identifier, gcs_comps, lit_comps
+                )
+
+            # ----- All GCS (the common case) -----
             comp0 = elem.components[0]
-            coords0 = self._comp_coords(comp0)
             ast0 = comp0.ast
 
-            # For multi-component elements, final_coords covers all dims
             if len(elem.components) > 1:
+                split_ranges = self._detect_split_ranges(elem.components)
+                coords0 = self._comp_coords_split(comp0, split_ranges)
                 final_coords: Dict[str, list] = {}
                 for comp in elem.components:
-                    for range_key, elem_val in self._comp_coords(comp).items():
+                    for range_key, elem_val in self._comp_coords_split(comp, split_ranges).items():
                         if range_key not in final_coords:
                             final_coords[range_key] = self._subs_elems.get(range_key, elem_val)
             else:
+                split_ranges = {}
+                coords0 = self._comp_coords(comp0)
                 final_coords = {k: self._subs_elems.get(k, v) for k, v in coords0.items()}
 
             ext = ExtConstant(
@@ -1735,7 +1801,8 @@ class JuliaSectionBuilder:
 
             for comp in elem.components[1:]:
                 ast_i = comp.ast
-                ext.add(ast_i.file, ast_i.tab, ast_i.cell, self._comp_coords(comp))
+                comp_coords = self._comp_coords_split(comp, split_ranges)
+                ext.add(ast_i.file, ast_i.tab, ast_i.cell, comp_coords)
 
             ext.initialize()
             return _format_julia_value(ext.data)
@@ -1746,6 +1813,88 @@ class JuliaSectionBuilder:
                 "— emitting placeholder."
             )
             return None
+
+    def _read_get_constants_piecewise(
+        self,
+        elem: "AbstractElement",
+        identifier: str,
+        gcs_comps: List["AbstractComponent"],
+        lit_comps: List["AbstractComponent"],
+    ) -> Optional[str]:
+        """Build a constant array from a mix of GCS and numeric-literal components.
+
+        Vensim allows piecewise definitions such as::
+
+            var[fuel1, fuel2, fuel3] = GET DIRECT CONSTANTS(...)
+            var[electricity] = 0
+            var[heat] = 0
+
+        Here we read each GCS component with its own subscript coords, collect
+        the literal values, and assemble the full array in the order given by
+        the parent subscript range.
+        """
+        import numpy as np
+        from pysd.py_backend.external import ExtConstant
+        from pysd.builders.julia.julia_expressions_builder import format_number
+
+        all_comps = elem.components
+        split_ranges = self._detect_split_ranges(all_comps)
+
+        # Build a map: element_label → float value
+        elem_values: Dict[str, float] = {}
+
+        for comp in lit_comps:
+            val = float(comp.ast) if isinstance(comp.ast, (int, float)) else 0.0
+            # Each literal component covers exactly the elements in its subscripts
+            subs = comp.subscripts[0] if comp.subscripts else []
+            for s in subs:
+                if s in self._subs_elems:
+                    for e in self._subs_elems[s]:
+                        elem_values[e] = val
+                else:
+                    elem_values[s] = val
+
+        for comp in gcs_comps:
+            ast = comp.ast
+            coords = self._comp_coords_split(comp, split_ranges)
+            final_c = {k: self._subs_elems.get(k, v) for k, v in coords.items()}
+            ext = ExtConstant(
+                file_name=ast.file, tab=ast.tab, cell=ast.cell,
+                coords=coords, root=self.root, final_coords=final_c,
+                py_name=identifier,
+            )
+            ext.initialize()
+            data = ext.data
+            arr = data.values if hasattr(data, "values") else np.asarray(data)
+            arr = np.asarray(arr, dtype=float)
+            # Map each axis label to its value
+            if arr.ndim == 0:
+                subs = comp.subscripts[0] if comp.subscripts else []
+                if subs:
+                    elem_values[subs[0]] = float(arr)
+            else:
+                for dim_name, coord_vals in data.coords.items():
+                    labels = [str(v) for v in coord_vals.values]
+                    # For each label, slice the array along this dim
+                    for idx, label in enumerate(labels):
+                        sliced = arr.take(idx, axis=list(data.dims).index(dim_name))
+                        if sliced.ndim == 0:
+                            elem_values[label] = float(sliced)
+                        # Multi-element slices need further handling; skip for now
+
+        # Find the parent range that covers all collected element labels
+        all_elems = list(elem_values.keys())
+        parent_range = self._infer_parent_range(all_elems)
+        if parent_range is None:
+            # Can't determine order; just return values in encountered order
+            vals = list(elem_values.values())
+        else:
+            ordered_elems = self._subs_elems.get(parent_range, all_elems)
+            vals = [elem_values.get(e, 0.0) for e in ordered_elems]
+
+        if len(vals) == 1:
+            return format_number(vals[0])
+        return "[" + ", ".join(format_number(v) for v in vals) + "]"
 
     # ------------------------------------------------------------------
     # JSON helpers

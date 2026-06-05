@@ -2368,6 +2368,88 @@ class TestCoverageGaps:
         sb.build_section()
         assert any("multi_const" in d for d in sb.param_decls)
 
+    def test_read_get_constants_split_range_collision_resolved(self, mocker, tmp_path):
+        """Multi-component where two subscript positions share the same parent
+        range (e.g. final_sources at pos 1 and the per-element split at pos 2).
+        _detect_split_ranges should pick a collision-free alias (final_sources1)
+        for the split dim so ext.add() sees consistent keys."""
+        import numpy as np
+        import xarray as xr
+        # Simulate 2 components each covering one fuel element × SECTORS
+        # where 'final_sources' covers both positions (pos 1 as range, pos 2 as split)
+        # and 'final_sources1' is the alias
+        sr_fs = _make_subscript_range("final_sources", ["elec", "heat"])
+        sr_fs1 = _make_subscript_range("final_sources1", ["elec", "heat"])
+        sr_sec = _make_subscript_range("SECTORS", ["A", "B"])
+
+        mock_ext = mocker.MagicMock()
+        # Data shaped as (SECTORS=2, final_sources1=2) assembled over 2 comps
+        da = xr.DataArray(
+            np.ones((2, 2)),
+            coords={"SECTORS": ["A", "B"], "final_sources1": ["elec", "heat"]},
+            dims=["SECTORS", "final_sources1"],
+        )
+        mock_ext.data = da
+        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+
+        ast1 = GetConstantsStructure(file="d.xlsx", tab="S", cell="r1")
+        ast2 = GetConstantsStructure(file="d.xlsx", tab="S", cell="r2")
+        # comp[0]: [SECTORS, final_sources, elec]   — final_sources at pos 1, elec at pos 2
+        # comp[1]: [SECTORS, final_sources, heat]
+        comp1 = AbstractComponent(subscripts=[["SECTORS", "final_sources", "elec"], []], ast=ast1)
+        comp2 = AbstractComponent(subscripts=[["SECTORS", "final_sources", "heat"], []], ast=ast2)
+        elem = AbstractElement(name="Eff Rate", components=[comp1, comp2])
+        sb = _section_builder_from_elements(
+            [elem], path=tmp_path / "m.mdl",
+            subscripts=[sr_fs, sr_fs1, sr_sec],
+        )
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            sb.build_section()
+        # Should succeed without a "Could not read" warning
+        assert not [x for x in w if "Could not read external constant" in str(x.message)]
+        assert any("eff_rate" in d for d in sb.ext_const_decls + sb.param_decls)
+
+    def test_read_get_constants_piecewise_mixed(self, mocker, tmp_path):
+        """Piecewise constant: one GCS component + two literal-0 components.
+        Should produce a combined array parameter without warnings."""
+        import numpy as np
+        import xarray as xr
+        import warnings
+
+        sr_fs = _make_subscript_range("final_sources", ["elec", "heat", "liq"])
+        sr_mfs = _make_subscript_range("matter_final_sources", ["liq"])
+
+        mock_ext = mocker.MagicMock()
+        da = xr.DataArray(
+            np.array([0.3]),
+            coords={"matter_final_sources": ["liq"]},
+            dims=["matter_final_sources"],
+        )
+        mock_ext.data = da
+        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+
+        ast_gcs = GetConstantsStructure(file="d.xlsx", tab="S", cell="r1")
+        comp_gcs = AbstractComponent(subscripts=[["matter_final_sources"], []], ast=ast_gcs)
+        comp_elec = AbstractComponent(subscripts=[["elec"], []], ast=0)
+        comp_heat = AbstractComponent(subscripts=[["heat"], []], ast=0)
+        elem = AbstractElement(name="Policy Share", components=[comp_gcs, comp_elec, comp_heat])
+        sb = _section_builder_from_elements(
+            [elem], path=tmp_path / "m.mdl",
+            subscripts=[sr_fs, sr_mfs],
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            sb.build_section()
+        # No "Could not read" warnings
+        assert not [x for x in w if "Could not read" in str(x.message)]
+        # The value should be a combined array [0.0, 0.0, 0.3] (ordered by final_sources)
+        all_decls = sb.ext_const_decls + sb.param_decls
+        assert any("policy_share" in d for d in all_decls)
+        combined = next(d for d in all_decls if "policy_share" in d)
+        assert "0.3" in combined
+
     @pytest.mark.filterwarnings("always::UserWarning")
     def test_initial_from_get_constants_exception(self, mocker, tmp_path):
         """INITIAL(GetConstantsStructure) exception silenced → returns None → fallback."""
