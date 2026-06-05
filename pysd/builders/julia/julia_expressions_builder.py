@@ -502,8 +502,54 @@ class JuliaASTVisitor:
 
         if node_subs:
             # (A) Explicit: resolve each subscript to a Julia index expression.
-            indices = []
             var_dims_list = self.var_dims.get(julia_name, [])
+
+            # Aggregation subscripts (ending with '!') generate a comprehension so
+            # that sum(X[i!, j]) → sum([X[_ii0, _i0] for _ii0 in 1:N_I]).
+            # Subscript order in the reference may differ from the variable's
+            # declaration order, so we map by name and re-order by var_dims_list.
+            if any(sub.endswith("!") for sub in node_subs):
+                bang_ranges: List[str] = []
+                ii_count = 0
+                dim_to_idx: Dict[str, str] = {}
+
+                for sub in node_subs:
+                    clean_sub = re.sub(r"[^a-z0-9_]", "_", sub.lower())
+                    if sub.endswith("!"):
+                        bare = sub[:-1]
+                        clean_bare = re.sub(r"[^a-z0-9_]", "_", bare.lower())
+                        # Find the matching dim in var_dims_list (by normalised name)
+                        dim_name = next(
+                            (d for d in var_dims_list
+                             if re.sub(r"[^a-z0-9_]", "_", d.lower()) == clean_bare),
+                            bare,
+                        )
+                        iv = f"_ii{ii_count}"
+                        ii_count += 1
+                        dim_to_idx[re.sub(r"[^a-z0-9_]", "_", dim_name.lower())] = iv
+                        bang_ranges.append(f"{iv} in 1:{self._jl_n(dim_name)}")
+                    elif sub in self.active_subs:
+                        dim_to_idx[clean_sub] = self.active_subs[sub]
+                    elif sub in self.subs_elems:
+                        idx_var = self.active_subs.get(sub)
+                        if idx_var:
+                            dim_to_idx[clean_sub] = idx_var
+                    else:
+                        if sub in self._elem_index:
+                            idx_val = next(iter(self._elem_index[sub].values()))
+                            dim_to_idx[clean_sub] = str(idx_val)
+
+                # Assemble indices in var_dims_list (declaration) order
+                indices = [
+                    dim_to_idx[re.sub(r"[^a-z0-9_]", "_", d.lower())]
+                    for d in var_dims_list
+                    if re.sub(r"[^a-z0-9_]", "_", d.lower()) in dim_to_idx
+                ]
+                inner = f"{julia_name}[{', '.join(indices)}]"
+                for_clause = ", ".join(bang_ranges)
+                return f"[{inner} for {for_clause}]"
+
+            indices = []
             for pos, sub in enumerate(node_subs):
                 if sub in self.active_subs:
                     # Range name matching an active loop variable
