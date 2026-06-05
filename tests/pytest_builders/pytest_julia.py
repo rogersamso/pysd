@@ -1370,16 +1370,18 @@ class TestJuliaSectionBuilderUnsupported:
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
         assert any("UNSUPPORTED" in e for e in all_eqs)
 
-    def test_abstract_data_component_routes_to_get_data_handler(self):
-        # AbstractData without a GetDataStructure ast → _process_get_data raises
-        # ValueError internally and emits a warning + placeholder.
+    def test_abstract_data_no_get_data_structure_falls_through_to_aux(self):
+        # AbstractData whose AST is not a GetDataStructure falls through to the
+        # regular auxiliary path and emits a "data-override" warning instead of
+        # a GET_DATA_FAILED placeholder.
         comp = AbstractData(subscripts=[[], []], ast=0.0)
         elem = AbstractElement(name="Ext Data", components=[comp])
-        with pytest.warns(UserWarning, match="Could not read GET DATA"):
+        with pytest.warns(UserWarning, match="data-override"):
             sb = _section_builder_from_elements([elem])
             sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("GET_DATA_FAILED" in e for e in all_eqs)
+        assert not any("GET_DATA_FAILED" in e for e in all_eqs), "Expected no placeholder"
+        assert any("ext_data" in e for e in all_eqs), "Expected regular equation"
 
 
 # ===========================================================================
@@ -1472,11 +1474,13 @@ class TestJuliaSectionBuilderExternal:
         assert any("sub_table_fns" in d for d in sb.lookup_const_decls)
         assert any("sub_table(i, x)" in d for d in sb.lookup_func_decls)
 
-    def test_get_lookups_high_dim_warns(self, mocker, tmp_path):
+    def test_get_lookups_3d_emits_2d_dispatch(self, mocker, tmp_path):
+        # 3D data (n_points × n_dim1 × n_dim2) is now handled correctly:
+        # emits one sub-function per (i, j) pair and a 2-index dispatch.
         import numpy as np
         import xarray as xr
         xs = np.array([0.0, 1.0])
-        ys = np.ones((2, 2, 2))
+        ys = np.ones((2, 2, 3))
         da = xr.DataArray(ys, coords={"lookup_dim": xs},
                           dims=["lookup_dim", "d1", "d2"])
         mock_ext = mocker.MagicMock()
@@ -1489,7 +1493,37 @@ class TestJuliaSectionBuilderExternal:
                                   x_row_or_col="x", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Hd Table", components=[comp])
-        with pytest.warns(UserWarning, match="> 1D subs"):
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
+            sb.build_section()
+        assert not [x for x in w if "> 1D subs" in str(x.message) or "> 2D" in str(x.message)]
+        # 2×3 = 6 sub-functions + fns array + dispatch
+        assert any("hd_table_1_1" in d for d in sb.lookup_const_decls)
+        assert any("hd_table_2_3" in d for d in sb.lookup_const_decls)
+        assert any("hd_table(i, j, x)" in d for d in sb.lookup_func_decls)
+
+    def test_get_lookups_4d_warns_and_flattens(self, mocker, tmp_path):
+        # Arrays with >3 dimensions still emit a warning and fall back to
+        # first-column approximation.
+        import numpy as np
+        import xarray as xr
+        xs = np.array([0.0, 1.0])
+        ys = np.ones((2, 2, 2, 2))
+        da = xr.DataArray(ys, coords={"lookup_dim": xs},
+                          dims=["lookup_dim", "d1", "d2", "d3"])
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = da
+        mocker.patch(
+            "pysd.py_backend.external.ExtLookup",
+            return_value=mock_ext,
+        )
+        ast = GetLookupsStructure(file="data.xlsx", tab="Sheet1",
+                                  x_row_or_col="x", cell="A1")
+        comp = AbstractComponent(subscripts=[[], []], ast=ast)
+        elem = AbstractElement(name="Hd Table", components=[comp])
+        with pytest.warns(UserWarning, match="> 2D"):
             sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
             sb.build_section()
         assert any("hd_table_itp" in d for d in sb.lookup_const_decls)
@@ -2241,22 +2275,32 @@ class TestCoverageGaps:
             sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl")
             sb.build_section()
 
-    def test_get_data_3d_raises_into_fallback(self, mocker, tmp_path):
-        """3D data array (unexpected dims) raises ValueError → fallback placeholder."""
+    def test_get_data_3d_emits_2d_dispatch(self, mocker, tmp_path):
+        """3D data (n_time × n_dim1 × n_dim2) is now handled: emits per-(i,j)
+        sub-functions and a 2-index dispatch without raising or using a placeholder."""
         import numpy as np
         import xarray as xr
+        import warnings
         ts = np.array([1995.0, 2000.0])
-        vals = np.ones((2, 2, 2))
+        vals = np.ones((2, 3, 4))
         da = xr.DataArray(vals, coords={"time": ts}, dims=["time", "d1", "d2"])
         mock_ext = mocker.MagicMock()
         mock_ext.data = da
         mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
         ast = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
-        elem = AbstractElement(name="Bad Dims", components=[comp])
-        with pytest.warns(UserWarning, match="Could not read GET DATA"):
+        elem = AbstractElement(name="Hfc Emissions", components=[comp])
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
             sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl")
             sb.build_section()
+        assert not [x for x in w if "Could not read GET DATA" in str(x.message)]
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert not any("GET_DATA_FAILED" in e for e in all_eqs)
+        # 3×4 = 12 sub-functions emitted
+        assert any("hfc_emissions_1_1" in d for d in sb.lookup_const_decls)
+        assert any("hfc_emissions_3_4" in d for d in sb.lookup_const_decls)
+        assert any("hfc_emissions(i, j, x)" in d for d in sb.lookup_func_decls)
 
     def test_initial_from_literal_float(self):
         """INITIAL(5.0) resolves to literal without needing reference resolution."""

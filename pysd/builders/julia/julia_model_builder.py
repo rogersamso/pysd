@@ -373,6 +373,69 @@ class JuliaSectionBuilder:
                 result[s] = []
         return result
 
+    def _infer_parent_range(self, elements: List[str]) -> Optional[str]:
+        """Return the smallest subscript range that contains *all* given elements.
+
+        Used to resolve ambiguity when the same element name appears in
+        multiple ranges (e.g. ``Agriculture`` is in both ``sectors`` and
+        ``SECTORS_and_HOUSEHOLDS``).
+        """
+        candidates = []
+        for sr in self._abstract_subscripts:
+            if isinstance(sr.subscripts, list) and all(
+                e in sr.subscripts for e in elements
+            ):
+                candidates.append((len(sr.subscripts), sr.name))
+        return min(candidates, key=lambda x: x[0])[1] if candidates else None
+
+    def _detect_split_ranges(
+        self, components: List["AbstractComponent"]
+    ) -> Dict[int, str]:
+        """Return ``{position: parent_range}`` for subscript positions that
+        carry different element names across *components*.
+
+        The parent range is determined by :meth:`_infer_parent_range` so that
+        ambiguous elements (present in multiple ranges) are all mapped to the
+        single range that contains the full set.
+        """
+        all_subs = [
+            c.subscripts[0]
+            for c in components
+            if c.subscripts and c.subscripts[0]
+        ]
+        if not all_subs:
+            return {}
+        n_pos = len(all_subs[0])
+        result: Dict[int, str] = {}
+        for pos in range(n_pos):
+            vals = list({s[pos] for s in all_subs if len(s) > pos})
+            if len(vals) > 1:
+                parent = self._infer_parent_range(vals)
+                if parent:
+                    result[pos] = parent
+        return result
+
+    def _comp_coords_split(
+        self,
+        comp: "AbstractComponent",
+        split_ranges: Dict[int, str],
+    ) -> Dict[str, list]:
+        """Like :meth:`_comp_coords` but uses *split_ranges* to override the
+        parent-range lookup for positions that vary across components.
+        """
+        subs = comp.subscripts[0] if comp.subscripts else []
+        result: Dict[str, list] = {}
+        for pos, s in enumerate(subs):
+            if pos in split_ranges:
+                result[split_ranges[pos]] = [s]
+            elif s in self._subs_elems:
+                result[s] = self._subs_elems[s]
+            elif s in self._elem_to_range:
+                result[self._elem_to_range[s]] = [s]
+            else:
+                result[s] = []
+        return result
+
     def _element_dims(self, elem: "AbstractElement") -> List[Tuple[str, int]]:
         """Return ``[(dim_name, dim_size), ...]`` for *elem*'s defining subscripts.
 
@@ -611,7 +674,19 @@ class JuliaSectionBuilder:
             return self._process_get_lookups(elem, identifier)
 
         # ---- GET XLS/DIRECT DATA ----------------------------------------
-        if isinstance(ast, GetDataStructure) or isinstance(comp, AbstractData):
+        # Guard: only route to GET DATA when at least one component actually
+        # carries a GetDataStructure (avoids misrouting variables that are typed
+        # as AbstractData but whose equation is a plain CallStructure).
+        _has_get_data_ast = any(
+            isinstance(c.ast, GetDataStructure) for c in elem.components
+        )
+        if isinstance(comp, AbstractData) and not _has_get_data_ast:
+            warn(
+                f"'{elem.name}' is a DATA variable but its equation is not "
+                "GET DATA — data-override mechanism not supported in the Julia "
+                "builder; emitting as a regular auxiliary."
+            )
+        if (isinstance(ast, GetDataStructure) or isinstance(comp, AbstractData)) and _has_get_data_ast:
             return self._process_get_data(elem, identifier, comp)
 
         # ---- TREND ------------------------------------------------------
@@ -1212,22 +1287,30 @@ class JuliaSectionBuilder:
 
         Uses ``ExtLookup`` to load the table at translation time, then
         emits the same ``LinearInterpolation`` pattern as inline lookups.
+        Supports scalar (1D), 1-subscript (2D), and 2-subscript (3D) lookup
+        arrays.  For multi-component elements where each component covers one
+        element of a subscript range, split-range detection is used to resolve
+        parent-range ambiguity before delegating to ExtLookup.
         """
         try:
             from pysd.py_backend.external import ExtLookup
 
             comp0 = elem.components[0]
             ast0 = comp0.ast
-            coords0 = self._comp_coords(comp0)
 
             if len(elem.components) > 1:
+                # Detect which subscript positions vary across components and
+                # find the unique containing range for each such position.
+                split_ranges = self._detect_split_ranges(elem.components)
+                coords0 = self._comp_coords_split(comp0, split_ranges)
                 final_coords: Dict[str, list] = {}
                 for comp in elem.components:
-                    for range_key, elem_val in self._comp_coords(comp).items():
+                    for range_key, elem_val in self._comp_coords_split(comp, split_ranges).items():
                         if range_key not in final_coords:
-                            # Use full range for final_coords
                             final_coords[range_key] = self._subs_elems.get(range_key, elem_val)
             else:
+                split_ranges = {}
+                coords0 = self._comp_coords(comp0)
                 final_coords = {k: self._subs_elems.get(k, v) for k, v in coords0.items()}
 
             ext = ExtLookup(
@@ -1243,7 +1326,8 @@ class JuliaSectionBuilder:
 
             for comp in elem.components[1:]:
                 ast_i = comp.ast
-                ext.add(ast_i.file, ast_i.tab, ast_i.x_row_or_col, ast_i.cell, self._comp_coords(comp))
+                comp_coords = self._comp_coords_split(comp, split_ranges)
+                ext.add(ast_i.file, ast_i.tab, ast_i.x_row_or_col, ast_i.cell, comp_coords)
 
             ext.initialize()
 
@@ -1312,10 +1396,44 @@ class JuliaSectionBuilder:
                             "interp_type": "interpolate", "subscripts": [],
                         }
                 return []
+            elif arr.ndim == 3:
+                # 3D: shape (n_points, n_dim1, n_dim2).
+                # Emit one lookup per (i, j) pair and a 2-index dispatch.
+                n_dim1, n_dim2 = arr.shape[1], arr.shape[2]
+                rows: List[List[str]] = []
+                for i in range(n_dim1):
+                    row: List[str] = []
+                    for j in range(n_dim2):
+                        col_ys = tuple(float(y) for y in arr[:, i, j])
+                        sub_name = f"{identifier}_{i + 1}_{j + 1}"
+                        const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                            sub_name, xs, col_ys, "interpolate"
+                        )
+                        self.lookup_const_decls.append(const_decl)
+                        self.lookup_func_decls.append(func_decl)
+                        self.lookup_register_decls.append(reg_decl)
+                        if self.data_format == "json":
+                            self._json_data["lookups"][sub_name] = {
+                                "x": list(xs), "y": list(col_ys),
+                                "interp_type": "interpolate", "subscripts": [],
+                            }
+                        row.append(sub_name)
+                    rows.append(row)
+                inner = ", ".join("[" + ", ".join(r) + "]" for r in rows)
+                self.lookup_const_decls.append(
+                    f"const {identifier}_fns = [{inner}]"
+                )
+                self.lookup_func_decls.append(
+                    f"{identifier}(i, j, x) = {identifier}_fns[i][j](x)"
+                )
+                self.lookup_register_decls.append(
+                    f"@register_symbolic {identifier}(i::Integer, j::Integer, x::Real)"
+                )
+                return []
             else:
                 warn(
                     f"Subscripted GET LOOKUPS '{elem.name}' has {arr.ndim - 1} "
-                    "subscript dimensions (> 1D subs) — only 1D subscripted lookups "
+                    "subscript dimensions (> 2D) — only up to 2D subscripted lookups "
                     "are supported. Emitting flattened first-column lookup as approximation."
                 )
                 ys = tuple(float(y) for y in arr.reshape(arr.shape[0], -1)[:, 0])
@@ -1328,19 +1446,12 @@ class JuliaSectionBuilder:
                 return []
 
         except Exception as exc:
-            # Primary strategy failed.  When elements have per-subscript-element
-            # components (e.g. one GET_DIRECT_LOOKUPS per sector) the merged
-            # ext.add() path raises "Error matching dimensions".  Fall back to
-            # reading each component independently.
-            try:
-                return self._process_get_lookups_per_component(elem, identifier)
-            except Exception:
-                warn(
-                    f"Could not read GET LOOKUPS for '{elem.name}': {exc} "
-                    "— emitting placeholder auxiliary."
-                )
-                self.aux_decls.append(f"@variables {identifier}(t)")
-                return [f"# GET_LOOKUPS_FAILED: {identifier} ~ 0.0"]
+            warn(
+                f"Could not read GET LOOKUPS for '{elem.name}': {exc} "
+                "— emitting placeholder auxiliary."
+            )
+            self.aux_decls.append(f"@variables {identifier}(t)")
+            return [f"# GET_LOOKUPS_FAILED: {identifier} ~ 0.0"]
 
     # ------------------------------------------------------------------
     # GET DATA processing
@@ -1361,25 +1472,25 @@ class JuliaSectionBuilder:
         try:
             from pysd.py_backend.external import ExtData
 
-            # Collect AST from first component that has a GetDataStructure
-            comp0 = None
-            for c in elem.components:
-                if isinstance(c.ast, GetDataStructure):
-                    comp0 = c
-                    break
-            if comp0 is None:
+            # Collect only components that carry a GetDataStructure
+            data_comps = [c for c in elem.components if isinstance(c.ast, GetDataStructure)]
+            if not data_comps:
                 raise ValueError("No GetDataStructure component found")
 
+            comp0 = data_comps[0]
             ast0 = comp0.ast
-            coords0 = self._comp_coords(comp0)
 
-            if len(elem.components) > 1:
+            if len(data_comps) > 1:
+                split_ranges = self._detect_split_ranges(data_comps)
+                coords0 = self._comp_coords_split(comp0, split_ranges)
                 final_coords: Dict[str, list] = {}
-                for c in elem.components:
-                    for range_key, elem_val in self._comp_coords(c).items():
+                for c in data_comps:
+                    for range_key, elem_val in self._comp_coords_split(c, split_ranges).items():
                         if range_key not in final_coords:
                             final_coords[range_key] = self._subs_elems.get(range_key, elem_val)
             else:
+                split_ranges = {}
+                coords0 = self._comp_coords(comp0)
                 final_coords = {k: self._subs_elems.get(k, v) for k, v in coords0.items()}
 
             # Determine interpolation type from AbstractData keyword
@@ -1399,11 +1510,10 @@ class JuliaSectionBuilder:
                 py_name=identifier,
             )
 
-            for c in elem.components[1:]:
-                if isinstance(c.ast, GetDataStructure):
-                    ai = c.ast
-                    ext.add(ai.file, ai.tab, ai.time_row_or_col, ai.cell,
-                            "interpolate", self._comp_coords(c))
+            for c in data_comps[1:]:
+                ai = c.ast
+                comp_coords = self._comp_coords_split(c, split_ranges)
+                ext.add(ai.file, ai.tab, ai.time_row_or_col, ai.cell, "interpolate", comp_coords)
 
             ext.initialize()
 
@@ -1464,6 +1574,39 @@ class JuliaSectionBuilder:
                 )
                 self.lookup_register_decls.append(
                     f"@register_symbolic {identifier}(i::Integer, x::Real)"
+                )
+                return []
+            elif arr.ndim == 3:
+                # 3D time-series: shape (n_time, n_dim1, n_dim2)
+                n_dim1, n_dim2 = arr.shape[1], arr.shape[2]
+                rows: List[List[str]] = []
+                for i in range(n_dim1):
+                    row: List[str] = []
+                    for j in range(n_dim2):
+                        col_ys = tuple(float(y) for y in arr[:, i, j])
+                        sub_name = f"{identifier}_{i + 1}_{j + 1}"
+                        const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                            sub_name, xs, col_ys, julia_itp
+                        )
+                        self.lookup_const_decls.append(const_decl)
+                        self.lookup_func_decls.append(func_decl)
+                        self.lookup_register_decls.append(reg_decl)
+                        if self.data_format == "json":
+                            self._json_data["data"][sub_name] = {
+                                "time": list(xs), "values": list(col_ys),
+                                "interp_type": julia_itp, "subscripts": [],
+                            }
+                        row.append(sub_name)
+                    rows.append(row)
+                inner = ", ".join("[" + ", ".join(r) + "]" for r in rows)
+                self.lookup_const_decls.append(
+                    f"const {identifier}_fns = [{inner}]"
+                )
+                self.lookup_func_decls.append(
+                    f"{identifier}(i, j, x) = {identifier}_fns[i][j](x)"
+                )
+                self.lookup_register_decls.append(
+                    f"@register_symbolic {identifier}(i::Integer, j::Integer, x::Real)"
                 )
                 return []
             else:
