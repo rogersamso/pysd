@@ -202,7 +202,13 @@ def read_vensim(mdl_file, data_files=None, data_files_encoding=None,
     return model
 
 
-def translate_to_julia(model_file, split_views=False, encoding=None, **kwargs):
+def translate_to_julia(
+    model_file,
+    split_views=False,
+    encoding=None,
+    data_format="hardcoded",
+    **kwargs,
+):
     """
     Translate a Vensim or Stella model to a standalone Julia file that uses
     ModelingToolkit.jl.  The output requires no PySD or Python at runtime.
@@ -221,6 +227,12 @@ def translate_to_julia(model_file, split_views=False, encoding=None, **kwargs):
         Source file encoding (Vensim only).  If None the encoding is read
         from the model file header; defaults to ``'UTF-8'``.
 
+    data_format: str (optional)
+        How to store external numeric data in the generated file.
+        ``"hardcoded"`` (default) inlines all values as Julia literals.
+        ``"json"`` writes a companion ``<model>_data.json`` file and generates
+        Julia code that reads it at startup via ``JSON3.jl``.
+
     subview_sep: list (optional)
         Passed to ``parse_sketch`` when ``split_views=True`` (Vensim only).
         Characters used to separate view/subview names.
@@ -234,6 +246,7 @@ def translate_to_julia(model_file, split_views=False, encoding=None, **kwargs):
     --------
     >>> path = translate_to_julia('my_model.mdl')
     >>> path = translate_to_julia('my_model.mdl', split_views=True)
+    >>> path = translate_to_julia('my_model.mdl', data_format='json')
     """
     from pathlib import Path as _Path
     from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
@@ -260,7 +273,7 @@ def translate_to_julia(model_file, split_views=False, encoding=None, **kwargs):
             "Supported formats: .mdl, .xmile, .stmx"
         )
 
-    return JuliaModelBuilder(abs_model).build_model()
+    return JuliaModelBuilder(abs_model, data_format=data_format).build_model()
 
 
 def load(py_model_file, data_files=None, data_files_encoding=None,

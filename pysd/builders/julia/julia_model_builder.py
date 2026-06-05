@@ -1118,31 +1118,65 @@ class JuliaSectionBuilder:
         ast,
         visitor: JuliaASTVisitor,
         order: int,
+        dims: Optional[List[Tuple[str, int]]] = None,
     ) -> List[str]:
         """Expand a SMOOTH(N) into *order* chained first-order ODE levels.
 
         The output variable ``identifier`` is declared as an auxiliary equal
-        to the final level.
+        to the final level.  When *dims* is provided the internal levels are
+        subscripted arrays and the equations are emitted as comprehensions.
         """
-        input_expr = visitor.visit(ast.input)
-        smooth_time_expr = visitor.visit(ast.smooth_time)
-        initial_expr = visitor.visit(ast.initial)
-
+        dims = dims or []
         eqs: List[str] = []
-        prev_expr = input_expr
-        for i in range(1, order + 1):
-            lv_name = f"_lv{i}_{identifier}"
-            # Register in namespace so other expressions can reference it
-            self.namespace.namespace[f"__internal_lv{i}_{identifier}"] = lv_name
-            self.stock_decls.append(f"@variables {lv_name}(t)")
-            self.u0_entries.append(f"{lv_name} => {initial_expr}")
-            eqs.append(
-                f"D({lv_name}) ~ ({prev_expr} - {lv_name}) / ({smooth_time_expr} / {order})"
-            )
-            prev_expr = lv_name
 
-        self.aux_decls.append(f"@variables {identifier}(t)")
-        eqs.append(f"{identifier} ~ {prev_expr}")
+        if dims:
+            # Subscripted SMOOTH — each internal level is an array.
+            (d0, n0) = dims[0]
+            vnd = self._nd_visitor(dims, ["_i0"])
+            input_nd = vnd.visit(ast.input)
+            st_nd = vnd.visit(ast.smooth_time)
+            init_nd = vnd.visit(ast.initial)
+
+            prev_nd = input_nd
+            for i in range(1, order + 1):
+                lv_name = f"_lv{i}_{identifier}"
+                self.namespace.namespace[f"__internal_lv{i}_{identifier}"] = lv_name
+                self.stock_decls.append(
+                    f"@variables {lv_name}(t)[{self._range_str(dims)}]"
+                )
+                for idx in range(1, n0 + 1):
+                    init_i = init_nd.replace("_i0", str(idx))
+                    self.u0_entries.append(f"{lv_name}[{idx}] => {init_i}")
+                lv_ref = f"{lv_name}[_i0]"
+                eqs.append(
+                    f"[D({lv_ref}) ~ ({prev_nd} - {lv_ref}) / "
+                    f"({st_nd} / {order}) for _i0 in 1:{self._jl_n(d0)}]..."
+                )
+                prev_nd = lv_ref
+            self.aux_decls.append(
+                f"@variables {identifier}(t)[{self._range_str(dims)}]"
+            )
+            eqs.append(
+                f"[{identifier}[_i0] ~ {prev_nd} for _i0 in 1:{self._jl_n(d0)}]..."
+            )
+        else:
+            input_expr = visitor.visit(ast.input)
+            smooth_time_expr = visitor.visit(ast.smooth_time)
+            initial_expr = visitor.visit(ast.initial)
+            prev_expr = input_expr
+            for i in range(1, order + 1):
+                lv_name = f"_lv{i}_{identifier}"
+                self.namespace.namespace[f"__internal_lv{i}_{identifier}"] = lv_name
+                self.stock_decls.append(f"@variables {lv_name}(t)")
+                self.u0_entries.append(f"{lv_name} => {initial_expr}")
+                eqs.append(
+                    f"D({lv_name}) ~ ({prev_expr} - {lv_name}) / "
+                    f"({smooth_time_expr} / {order})"
+                )
+                prev_expr = lv_name
+            self.aux_decls.append(f"@variables {identifier}(t)")
+            eqs.append(f"{identifier} ~ {prev_expr}")
+
         return eqs
 
     # ------------------------------------------------------------------

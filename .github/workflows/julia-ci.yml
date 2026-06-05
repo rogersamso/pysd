@@ -1,0 +1,78 @@
+# CI for Julia builder tests that require a Julia runtime with ModelingToolkit.jl.
+#
+# Non-Julia tests (the vast majority) run in the main ci.yml workflow without Docker.
+# This workflow runs only the @pytest.mark.julia tests inside a Docker container
+# that pre-installs Julia and ModelingToolkit.jl.
+#
+# The job is separate from the main CI so a slow Julia package installation
+# does not block the fast Python-only test suite.
+
+name: Julia CI
+
+on:
+  push:
+    paths:
+      - 'pysd/builders/julia/**'
+      - 'tests/pytest_builders/pytest_julia*.py'
+      - 'Dockerfile.julia'
+      - '.github/workflows/julia-ci.yml'
+  pull_request:
+    paths:
+      - 'pysd/builders/julia/**'
+      - 'tests/pytest_builders/pytest_julia*.py'
+      - 'Dockerfile.julia'
+      - '.github/workflows/julia-ci.yml'
+  workflow_dispatch:
+  schedule:
+    # Run weekly to catch Julia/MTK upstream breakage
+    - cron: '0 8 * * 1'
+
+jobs:
+  julia-tests:
+    name: Julia builder (Julia ${{ matrix.julia-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1.10', '1.11']
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - name: Cache Julia packages
+        uses: julia-actions/cache@v2
+
+      - name: Install Julia packages
+        run: |
+          julia --startup-file=no -e '
+            using Pkg
+            Pkg.add(["ModelingToolkit", "OrdinaryDiffEq",
+                     "OrdinaryDiffEqLowOrderRK", "DataInterpolations", "JSON3"])
+            Pkg.precompile()
+          '
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -U pip wheel
+          pip install --prefer-binary -r tests/requirements.txt
+          pip install --prefer-binary -e .
+
+      - name: Run Julia builder unit tests (no Julia runtime needed)
+        run: |
+          pytest tests/pytest_builders/pytest_julia.py -m "not julia" -v --tb=short
+
+      - name: Run Julia runtime tests
+        run: |
+          pytest tests/pytest_builders/ -m julia -v --tb=short

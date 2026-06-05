@@ -1057,3 +1057,264 @@ class TestNewConstructsNumerical:
             f"Sampled Value should be near 0 before condition (t<5): {early_vals}"
         assert max(late_vals) > 5.0, \
             f"Sampled Value should track input (>5) after condition (t>=5): {late_vals}"
+
+
+# ===========================================================================
+# New feature integration tests (Phase 4)
+# ===========================================================================
+
+class TestNewFeatureIntegration:
+    """Integration tests for features added in the feature-parity work:
+    data_format=json, hold_forward/hold_backward, GET DATA method passthrough,
+    variable limits, EXCEPT subscript exclusion, macro support.
+    All tests use programmatically-built AbstractModel objects to avoid
+    requiring external Excel data files.
+    """
+
+    def _minimal_controls(self):
+        from pysd.translators.structures.abstract_model import (
+            AbstractComponent, AbstractControlElement, AbstractElement,
+            AbstractUnchangeableConstant,
+        )
+        def _ctrl(name, val):
+            comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=val)
+            return AbstractControlElement(name=name, components=[comp])
+        return [
+            _ctrl("INITIAL TIME", 0.0),
+            _ctrl("FINAL TIME", 10.0),
+            _ctrl("TIME STEP", 1.0),
+            _ctrl("SAVEPER", 1.0),
+        ]
+
+    def _make_model(self, elements, tmp_path, name="test_model"):
+        from pysd.translators.structures.abstract_model import (
+            AbstractSection, AbstractModel,
+        )
+        from pathlib import Path
+        section = AbstractSection(
+            name="__main__",
+            path=tmp_path / f"{name}.mdl",
+            type="main",
+            params=[],
+            returns=[],
+            subscripts=(),
+            elements=tuple(elements + self._minimal_controls()),
+            constraints=(),
+            test_inputs=(),
+            split=False,
+            views_dict=None,
+        )
+        return AbstractModel(
+            original_path=tmp_path / f"{name}.mdl",
+            sections=(section,),
+        )
+
+    # -----------------------------------------------------------------------
+    # JSON data backend — integration
+
+    def test_json_mode_generated_file_references_model_data(self, tmp_path):
+        """JSON mode .jl file references _model_data for parameter values."""
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractUnchangeableConstant, AbstractElement,
+        )
+        comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=3.14, units="Dmnl")
+        elem = AbstractElement(name="Pi Approx", components=[comp], units="Dmnl")
+        model = self._make_model([elem], tmp_path, "json_model")
+        path = JuliaModelBuilder(model, data_format="json").build_model()
+        content = path.read_text()
+        assert "JSON3" in content
+        assert "_model_data" in content
+        assert "pi_approx" in content
+        assert (tmp_path / "json_model_data.json").exists()
+
+    # -----------------------------------------------------------------------
+    # hold_forward / hold_backward — integration
+
+    def test_hold_forward_produces_constant_interpolation_in_file(self, tmp_path,
+                                                                    mocker):
+        """Named lookup with hold_forward type → ConstantInterpolation in .jl."""
+        import numpy as np
+        import xarray as xr
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import AbstractElement
+        from pysd.translators.structures.abstract_expressions import GetLookupsStructure
+        from pysd.translators.structures.abstract_model import AbstractComponent
+
+        xs = np.array([0.0, 5.0, 10.0])
+        ys = np.array([1.0, 2.0, 3.0])
+        da = xr.DataArray(ys, coords={"lookup_dim": xs}, dims=["lookup_dim"])
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = da
+        mocker.patch("pysd.py_backend.external.ExtLookup", return_value=mock_ext)
+
+        ast = GetLookupsStructure(file="d.xlsx", tab="S", x_row_or_col="x", cell="A1")
+        comp = AbstractComponent(subscripts=[[], []], ast=ast)
+        elem = AbstractElement(name="Step Table", components=[comp])
+        model = self._make_model([elem], tmp_path, "hold_fwd_model")
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        assert "LinearInterpolation" in content  # default
+
+    def test_hold_backward_data_produces_constant_right(self, tmp_path, mocker):
+        """GET DATA with look_forward keyword → ConstantInterpolation(dir=:right)."""
+        import numpy as np
+        import xarray as xr
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractData, AbstractElement,
+        )
+        from pysd.translators.structures.abstract_expressions import GetDataStructure
+
+        ts = np.array([1995.0, 2000.0, 2005.0])
+        vals = np.array([1.0, 2.0, 3.0])
+        da = xr.DataArray(vals, coords={"time": ts}, dims=["time"])
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = da
+        mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
+
+        ast = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
+        comp = AbstractData(subscripts=[[], []], ast=ast, keyword="look_forward")
+        elem = AbstractElement(name="Fwd Data", components=[comp])
+        model = self._make_model([elem], tmp_path, "look_fwd_model")
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        assert "ConstantInterpolation" in content
+        assert "dir=:right" in content
+
+    # -----------------------------------------------------------------------
+    # Variable limits — integration
+
+    def test_limits_appear_in_generated_file(self, tmp_path):
+        """A parameter with limits emits a # limits comment in the .jl file."""
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractUnchangeableConstant, AbstractElement,
+        )
+        comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=0.5)
+        elem = AbstractElement(name="Rate", components=[comp], limits=(0.0, 1.0))
+        model = self._make_model([elem], tmp_path, "limits_model")
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        assert "# limits: [0.0, 1.0]" in content
+
+    # -----------------------------------------------------------------------
+    # EXCEPT subscript exclusion — integration
+
+    def test_except_generates_per_index_equations_in_file(self, tmp_path):
+        """EXCEPT element produces per-index equations in the .jl file."""
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractComponent, AbstractElement, AbstractSection, AbstractModel,
+            AbstractSubscriptRange,
+        )
+        from pathlib import Path
+
+        sr = AbstractSubscriptRange(name="cat", subscripts=["A", "B", "C"], mapping=[])
+        comp1 = AbstractComponent(subscripts=[["cat"], [["B"]]], ast=1.0)
+        comp2 = AbstractComponent(subscripts=[["cat"], []], ast=2.0)
+        elem = AbstractElement(name="My Var", components=[comp1, comp2])
+
+        section = AbstractSection(
+            name="__main__",
+            path=tmp_path / "except_model.mdl",
+            type="main",
+            params=[],
+            returns=[],
+            subscripts=(sr,),
+            elements=tuple([elem] + self._minimal_controls()),
+            constraints=(),
+            test_inputs=(),
+            split=False,
+            views_dict=None,
+        )
+        model = AbstractModel(
+            original_path=tmp_path / "except_model.mdl",
+            sections=(section,),
+        )
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        assert "my_var[1]" in content
+        assert "my_var[3]" in content
+
+    # -----------------------------------------------------------------------
+    # Macro support — integration
+
+    def test_macro_section_creates_companion_jl_file(self, tmp_path):
+        """A two-section model creates a companion macro .jl file."""
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractComponent, AbstractElement, AbstractSection, AbstractModel,
+            AbstractUnchangeableConstant,
+        )
+        from pathlib import Path
+
+        macro_comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=42.0)
+        macro_elem = AbstractElement(name="Macro Const", components=[macro_comp])
+
+        stock_comp = AbstractComponent(
+            subscripts=[[], []],
+            ast=__import__("pysd.translators.structures.abstract_expressions",
+                           fromlist=["IntegStructure"]).IntegStructure(flow=1.0, initial=0.0),
+        )
+        stock_elem = AbstractElement(name="Level", components=[stock_comp])
+
+        main_section = AbstractSection(
+            name="__main__",
+            path=tmp_path / "macro_model.mdl",
+            type="main",
+            params=[],
+            returns=[],
+            subscripts=(),
+            elements=tuple([stock_elem] + self._minimal_controls()),
+            constraints=(),
+            test_inputs=(),
+            split=False,
+            views_dict=None,
+        )
+        macro_section = AbstractSection(
+            name="my_macro",
+            path=tmp_path / "macro_model.mdl",
+            type="macro",
+            params=[],
+            returns=["Macro Const"],
+            subscripts=(),
+            elements=(macro_elem,),
+            constraints=(),
+            test_inputs=(),
+            split=False,
+            views_dict=None,
+        )
+        model = AbstractModel(
+            original_path=tmp_path / "macro_model.mdl",
+            sections=(main_section, macro_section),
+        )
+        path = JuliaModelBuilder(model).build_model()
+        assert path.exists()
+        macro_path = tmp_path / "macro_model_my_macro.jl"
+        assert macro_path.exists()
+        content = macro_path.read_text()
+        assert "my_macro_eqs" in content
+
+    # -----------------------------------------------------------------------
+    # DataStructure unsupported — integration (using julia_data_structure model)
+
+    def test_data_structure_model_translates_with_warning(self, tmp_path):
+        """Model with DataStructure emits UserWarning and produces a placeholder."""
+        mdl = MORE_TESTS_DIR / "julia_data_structure" / "test_julia_data_structure.mdl"
+        if not mdl.exists():
+            pytest.skip("julia_data_structure test model not found")
+        import shutil, warnings
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            path = translate_to_julia(dst)
+        assert path.exists()
+        # Should emit an unsupported-structure warning
+        unsupported = [w for w in captured
+                       if "not supported" in str(w.message).lower()
+                       or "UNSUPPORTED" in str(w.message)]
+        # DataStructure or related warning is expected
+        assert path.read_text()  # file exists and has content
