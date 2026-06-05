@@ -38,6 +38,7 @@ from pysd.translators.structures.abstract_expressions import (
 ARITHMETIC_OPS: dict = {
     "+": "+",
     "-": "-",
+    "negative": "-",   # Vensim unary negation AST operator
     "*": "*",
     "/": "/",
     "^": "^",
@@ -76,8 +77,8 @@ BUILTIN_FUNCTIONS: dict = {
     "ARCSIN": "asin",
     "ARCCOS": "acos",
     "ARCTAN": "atan",
-    "INTEGER": "trunc",
-    "INT": "trunc",
+    "INTEGER": "_trunc",
+    "INT": "_trunc",
     "MIN": "min",
     "MAX": "max",
     "MODULO": "mod",
@@ -113,6 +114,9 @@ BUILTIN_FUNCTIONS: dict = {
 # All conditions use `ifelse` + `&`/`|` instead of `?:` / `&&` / `||` so
 # they remain valid when called with symbolic (Num) arguments inside MTK equations.
 HELPER_IMPLEMENTATIONS: dict = {
+    # Base.trunc is not available as a symbolic primitive in MTK.
+    # Register a thin wrapper so INTEGER(x) works inside equations.
+    "_trunc": "_trunc(x::Real) = Base.trunc(x)\n@register_symbolic _trunc(x::Real)",
     "_log_base": "_log_base(x, base) = log(base, x)",
     "_xidz": "_xidz(x, y, z) = ifelse(iszero(y), z, x / y)",
     "_zidz": "_zidz(x, y) = ifelse(iszero(y), 0.0, x / y)",
@@ -255,6 +259,8 @@ class JuliaASTVisitor:
         active_subs: Optional[Dict[str, str]] = None,
         var_dims: Optional[Dict[str, List[str]]] = None,
         subs_sizes: Optional[Dict[str, int]] = None,
+        subs_elems: Optional[Dict[str, List[str]]] = None,
+        lookup_names: Optional[Set[str]] = None,
         root=None,
     ) -> None:
         self.namespace = namespace
@@ -277,8 +283,24 @@ class JuliaASTVisitor:
             re.sub(r"[^a-z0-9_]", "_", k.lower()): v
             for k, v in self.subs_sizes.items()
         }
+        # lookup_names: identifiers that are GET DATA / GET LOOKUPS functions
+        # — bare references to these should be auto-called as f(t) or f(i, t)
+        self.lookup_names = lookup_names or set()
+        # subs_elems: range_name -> ordered list of element labels
+        self.subs_elems = subs_elems or {}
+        # Pre-compute element_label -> {range_name: 1-based-index} for fast lookups
+        self._elem_index: Dict[str, Dict[str, int]] = {}
+        for rng, elems in self.subs_elems.items():
+            for i, lbl in enumerate(elems):
+                if lbl not in self._elem_index:
+                    self._elem_index[lbl] = {}
+                self._elem_index[lbl][rng] = i + 1
         # root: Path to the model directory (for reading external files)
         self._root = root
+
+    def _jl_n(self, dim_name: str) -> str:
+        """Julia constant name for the size of *dim_name* (``N_DIMNAME``)."""
+        return "N_" + re.sub(r"[^a-z0-9]", "_", dim_name.lower()).upper()
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -448,12 +470,82 @@ class JuliaASTVisitor:
                 "using a sanitised fallback identifier."
             )
             julia_name = re.sub(r"[^a-z0-9_]", "_", node.reference.lower())
-        # Append subscript indices when in an active 2D (or higher) subscript context
-        if self.active_subs and self.var_dims:
+        # Apply subscript indices.  Two sources:
+        #
+        # (A) Explicit subscripts in the AST node  (e.g. share_FEH[solids])
+        #     Each entry is either a range name (→ use active loop variable) or
+        #     a specific element label (→ resolve to 1-based numeric index).
+        # (B) Active loop variables from the enclosing comprehension context
+        #     (only when the AST carries no explicit subscripts).
+        node_subs = (
+            node.subscripts.subscripts
+            if node.subscripts is not None and hasattr(node.subscripts, "subscripts")
+            else []
+        )
+
+        # If this identifier is a GET DATA/LOOKUPS function referenced bare (no
+        # call syntax), auto-call it with the active subscript indices + t.
+        if julia_name in self.lookup_names and not node_subs:
+            dims = self.var_dims.get(julia_name, [])
+            if self.active_subs:
+                indices = [self.active_subs[d] for d in dims if d in self.active_subs]
+                return f"{julia_name}({', '.join(indices + ['t'])})"
+            elif dims:
+                # Scalar context, subscripted lookup: broadcast over all dims
+                idx_vars = [f"_ii{k}" for k in range(len(dims))]
+                ranges = ", ".join(
+                    f"{iv} in 1:{self._jl_n(d)}" for iv, d in zip(idx_vars, dims)
+                )
+                return f"[{julia_name}({', '.join(idx_vars + ['t'])}) for {ranges}]"
+            else:
+                return f"{julia_name}(t)"
+
+        if node_subs:
+            # (A) Explicit: resolve each subscript to a Julia index expression.
+            indices = []
+            var_dims_list = self.var_dims.get(julia_name, [])
+            for pos, sub in enumerate(node_subs):
+                if sub in self.active_subs:
+                    # Range name matching an active loop variable
+                    indices.append(self.active_subs[sub])
+                elif sub in self.subs_elems:
+                    # Range name with all elements — use active loop var if available
+                    idx_var = self.active_subs.get(sub)
+                    if idx_var:
+                        indices.append(idx_var)
+                    # otherwise skip (rare; let it fall through)
+                else:
+                    # Specific element label → numeric index in the variable's dim
+                    # Try to match against the corresponding dim of the variable.
+                    parent_range = None
+                    if pos < len(var_dims_list):
+                        candidate = var_dims_list[pos]
+                        if sub in self._elem_index.get(sub, {}) and candidate in self._elem_index.get(sub, {}):
+                            parent_range = candidate
+                    if parent_range is None:
+                        # Fallback: use whichever range contains this element and
+                        # is one of the variable's dims.
+                        for rng in var_dims_list:
+                            if sub in self._elem_index.get(sub, {}) and rng in self._elem_index.get(sub, {}):
+                                parent_range = rng
+                                break
+                    if parent_range is None and sub in self._elem_index:
+                        # Last resort: use the first known range
+                        parent_range = next(iter(self._elem_index[sub]))
+                    if parent_range is not None and sub in self._elem_index.get(sub, {}):
+                        indices.append(str(self._elem_index[sub][parent_range]))
+                    elif sub in self._elem_index:
+                        idx_val = next(iter(self._elem_index[sub].values()))
+                        indices.append(str(idx_val))
+            if indices:
+                julia_name = julia_name + "[" + ", ".join(indices) + "]"
+        elif self.active_subs and self.var_dims:
+            # (B) No explicit subscripts: apply active loop variables.
             dims = self.var_dims.get(julia_name, [])
             indices = [self.active_subs[d] for d in dims if d in self.active_subs]
             if indices:
                 julia_name = julia_name + "[" + ", ".join(indices) + "]"
+
         return julia_name
 
     def _call(self, node: CallStructure) -> str:
@@ -468,8 +560,29 @@ class JuliaASTVisitor:
             # (which will be a Julia interpolation function if loaded correctly).
             julia_id = self.namespace.get(node.function.reference)
             if julia_id is not None:
-                # This is a model-variable lookup call — emit as-is
                 args = [self.visit(a) for a in node.arguments]
+                if self.var_dims:
+                    dims = self.var_dims.get(julia_id, [])
+                    if dims:
+                        if self.active_subs:
+                            # Subscript comprehension context: prepend active indices.
+                            # historic_gfcf(t) → historic_gfcf(_i0, t)
+                            indices = [
+                                self.active_subs[d] for d in dims if d in self.active_subs
+                            ]
+                            if indices:
+                                args = indices + args
+                        else:
+                            # Scalar context: broadcast over all dim indices.
+                            # sum(historic_labour_compensation(t))
+                            # → sum([historic_labour_compensation(_ii0, t) for _ii0 in 1:N_SECTORS])
+                            idx_vars = [f"_ii{k}" for k in range(len(dims))]
+                            full_args = idx_vars + args
+                            ranges = ", ".join(
+                                f"{iv} in 1:{self._jl_n(d)}"
+                                for iv, d in zip(idx_vars, dims)
+                            )
+                            return f"[{julia_id}({', '.join(full_args)}) for {ranges}]"
                 return f"{julia_id}({', '.join(args)})"
             warn(f"Unknown Vensim function '{node.function.reference}'; using lowercase name.")
             julia_func = re.sub(r"[^a-z0-9_]", "_", node.function.reference.lower())

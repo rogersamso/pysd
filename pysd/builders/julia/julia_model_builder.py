@@ -191,6 +191,8 @@ class JuliaSectionBuilder:
         self.u0_entries: List[str] = []
         # Map julia identifier -> list of dim names (for subscripted vars)
         self._var_dims: Dict[str, List[str]] = {}
+        # Names of identifiers that are lookup/data functions (need `(t)` when referenced bare)
+        self._lookup_func_names: Set[str] = set()
 
         # Reverse map: element label → parent range name (for per-element component coords)
         self._elem_to_range: Dict[str, str] = {}
@@ -295,6 +297,25 @@ class JuliaSectionBuilder:
         # First pass: populate the namespace with all element names
         for elem in self.abstract_elements:
             self.namespace.add_to_namespace(elem.name)
+
+        # Pre-populate _var_dims for every subscripted element so that the
+        # subscript-indexed visitor can correctly index forward-referenced
+        # variables even when they haven't been processed yet.
+        for elem in self.abstract_elements:
+            identifier = self.namespace.namespace.get(elem.name)
+            if identifier:
+                dims = self._element_dims(elem)
+                if dims:
+                    self._var_dims[identifier] = [d for d, _ in dims]
+
+        # Pre-populate _lookup_func_names for GET DATA / GET LOOKUPS elements
+        # so that bare references to them in equations auto-call f(t).
+        for elem in self.abstract_elements:
+            identifier = self.namespace.namespace.get(elem.name)
+            if identifier and elem.components:
+                if all(isinstance(c.ast, GetLookupsStructure) for c in elem.components) or \
+                   any(isinstance(c.ast, GetDataStructure) for c in elem.components):
+                    self._lookup_func_names.add(identifier)
 
         # Emit subscript size constants (const N_DIMNAME = n)
         for name, size in sorted(self._subs_sizes.items()):
@@ -512,7 +533,8 @@ class JuliaSectionBuilder:
         return JuliaASTVisitor(
             self.namespace, self.inline_registry, self.needed_helpers,
             active_subs=active_subs, var_dims=self._var_dims,
-            subs_sizes=self._subs_sizes, root=self.root,
+            subs_sizes=self._subs_sizes, subs_elems=self._subs_elems,
+            lookup_names=self._lookup_func_names, root=self.root,
         )
 
     def _nd_u0_entries(
@@ -592,7 +614,9 @@ class JuliaSectionBuilder:
         # Scalar visitor (no active subscript context)
         visitor = JuliaASTVisitor(
             self.namespace, self.inline_registry, self.needed_helpers,
-            subs_sizes=self._subs_sizes, root=self.root,
+            var_dims=self._var_dims, subs_sizes=self._subs_sizes,
+            subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
+            root=self.root,
         )
 
         # ---- Named lookup table ----------------------------------------
@@ -632,11 +656,21 @@ class JuliaSectionBuilder:
                 self.u0_entries.append(f"{identifier} => {initial_expr}")
                 return [f"D({identifier}) ~ {flow_expr}"]
             elif ndim == 1:
+                (d0, n0) = dims[0]
+                vnd1 = self._nd_visitor(dims, ["_i0"])
+                flow_nd1 = vnd1.visit(ast.flow)
+                init_nd1 = vnd1.visit(ast.initial)
                 self.stock_decls.append(
                     f"@variables {identifier}(t)[{self._range_str(dims)}]"
                 )
-                self._nd_u0_entries(identifier, dims, initial_expr)
-                return [f"Symbolics.scalarize(D.({identifier}) .~ {flow_expr})..."]
+                for i in range(1, n0 + 1):
+                    self.u0_entries.append(
+                        f"{identifier}[{i}] => {init_nd1.replace('_i0', str(i))}"
+                    )
+                return [
+                    f"[D({identifier}[_i0]) ~ {flow_nd1} "
+                    f"for _i0 in 1:{self._jl_n(d0)}]..."
+                ]
             else:
                 # N≥2 dims: comprehension with N index variables
                 idx_vars = self._idx_vars(ndim)
@@ -798,15 +832,20 @@ class JuliaSectionBuilder:
             self.aux_decls.append(f"@variables {identifier}(t)")
             return [f"{identifier} ~ {rhs_expr}{lim_comment}"]
         elif ndim == 1:
-            rhs_expr = visitor.visit(ast)
+            (d0, n0) = dims[0]
+            vnd1 = self._nd_visitor(dims, ["_i0"])
+            rhs_nd1 = vnd1.visit(ast)
             if is_control:
                 if identifier in self.control_vals:
-                    self.control_vals[identifier] = rhs_expr
+                    self.control_vals[identifier] = rhs_nd1
                 return []
             self.aux_decls.append(
                 f"@variables {identifier}(t)[{self._range_str(dims)}]"
             )
-            return [f"Symbolics.scalarize({identifier} .~ {rhs_expr})..."]
+            return [
+                f"[{identifier}[_i0] ~ {rhs_nd1} "
+                f"for _i0 in 1:{self._jl_n(d0)}]..."
+            ]
         else:
             # N≥2 dims: comprehension with N index variables
             idx_vars = self._idx_vars(ndim)
@@ -2395,14 +2434,16 @@ class JuliaSectionBuilder:
             self._helpers_block(),
             self._lookup_block(),
             self._declarations_block(),
+            # Control variables (time_step, initial_time, …) must be defined
+            # before the module includes so equations can reference them.
+            self._control_block(),
+            "\n",
             include_block,
             leftover_block,
             "\n",
             combined,
             "\n",
             self._u0_block(),
-            "\n",
-            self._control_block(),
             "\n",
             self._system_block(),
             "\n",

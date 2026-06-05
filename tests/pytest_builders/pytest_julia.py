@@ -1182,7 +1182,9 @@ class TestJuliaSectionBuilderSubscripts:
         sb.build_section()
         assert any("output(t)[" in d for d in sb.aux_decls)
         eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("Symbolics.scalarize" in e for e in eqs)
+        # 1D subscripted aux now emits a per-element comprehension (like ndim≥2)
+        # instead of Symbolics.scalarize, to avoid ifelse shape-mismatch errors.
+        assert any("output[_i0]" in e and "for _i0" in e for e in eqs)
 
     def test_2d_subscripted_auxiliary(self):
         sr1 = _make_subscript_range("row_dim", ["R1", "R2"])
