@@ -832,14 +832,17 @@ class TestJuliaModelBuilder:
         assert "function run_model(" in content
 
     def test_run_model_skips_initializeprob(self, tmp_path):
-        """ODEProblem must pass build_initializeprob=false to skip MTK's
-        initialization system. Vensim models are pure ODEs with explicit stock
-        initial values — the initialization system causes OOM from symbolic
-        resolution of algebraic loops and large numbers of symbolic u0 entries."""
+        """run_model must skip MTK's initialization system (build_initializeprob=false)
+        and fill missing state variables with 0.0 via unknowns(sys). After
+        structural_simplify, MTK may promote algebraic-loop variables to state
+        variables with no explicit u0 entry; iterating unknowns(sys) ensures all
+        are covered. The initialization system itself OOMs on large models."""
         model = self._minimal_model(tmp_path)
         path = JuliaModelBuilder(model).build_model()
         content = path.read_text()
         assert "build_initializeprob = false" in content
+        assert "unknowns(sys)" in content
+        assert "get(u0_dict, x, 0.0)" in content
 
     def test_output_contains_entrypoint_invocations(self, tmp_path):
         """Generated script must actually call run_model() and save_results() so

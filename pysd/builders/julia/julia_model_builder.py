@@ -2999,7 +2999,11 @@ class JuliaSectionBuilder:
         ts = self.control_vals.get("time_step") or "time_step"
         return textwrap.dedent(f"""\
             function run_model(; u0=u0, tspan=tspan, dt={ts}, solver=Euler())
-                prob = ODEProblem(sys, u0, tspan;
+                # structural_simplify may promote algebraic-loop variables to state
+                # variables that have no explicit u0 entry; fill those with 0.0.
+                u0_dict = Dict{{Any,Any}}(u0)
+                u0_complete = [x => get(u0_dict, x, 0.0) for x in unknowns(sys)]
+                prob = ODEProblem(sys, u0_complete, tspan;
                     build_initializeprob = false)
                 # saveat ensures solution is stored at every dt step,
                 # which is required for correct output of observed (auxiliary) variables.
