@@ -148,6 +148,21 @@ HELPER_IMPLEMENTATIONS: dict = {
     # ACTIVE INITIAL(expr, initial) — in ODE mode expr is always live;
     # we just return expr (the first argument).
     "_active_initial": "_active_initial(expr, initial) = expr",
+    # INVERT_MATRIX helpers — registered as symbolic black boxes so Symbolics
+    # does not attempt symbolic matrix algebra (which hangs for large matrices).
+    # At solve time the concrete array is passed and inv is computed numerically.
+    "_inv_mat2d_elem": (
+        "function _inv_mat2d_elem(mat::AbstractMatrix, i::Int, j::Int)\n"
+        "    return inv(mat)[i, j]\n"
+        "end\n"
+        "@register_symbolic _inv_mat2d_elem(mat::AbstractMatrix, i::Int, j::Int)"
+    ),
+    "_inv_mat3d_elem": (
+        "function _inv_mat3d_elem(mat::AbstractArray, b::Int, i::Int, j::Int)\n"
+        "    return inv(mat[b, :, :])[i, j]\n"
+        "end\n"
+        "@register_symbolic _inv_mat3d_elem(mat::AbstractArray, b::Int, i::Int, j::Int)"
+    ),
 }
 
 # Helper functions that receive the current time *t* as their first argument
@@ -217,15 +232,23 @@ def lookup_interpolation_code(
     ys_vec = format_vector(ys)
     itp_name = f"{name}_itp"
 
+    _extrap = "ExtrapolationType.Constant"
     if itp_type == "hold_forward":
-        const_decl = f"const {itp_name} = ConstantInterpolation({ys_vec}, {xs_vec})"
+        const_decl = (
+            f"const {itp_name} = ConstantInterpolation({ys_vec}, {xs_vec};"
+            f" extrapolation_left = {_extrap}, extrapolation_right = {_extrap})"
+        )
     elif itp_type == "hold_backward":
         const_decl = (
-            f"const {itp_name} = ConstantInterpolation({ys_vec}, {xs_vec}; dir=:right)"
+            f"const {itp_name} = ConstantInterpolation({ys_vec}, {xs_vec};"
+            f" dir=:right, extrapolation_left = {_extrap}, extrapolation_right = {_extrap})"
         )
     else:
         # "interpolate", "extrapolate", or any unrecognised type → linear
-        const_decl = f"const {itp_name} = LinearInterpolation({ys_vec}, {xs_vec})"
+        const_decl = (
+            f"const {itp_name} = LinearInterpolation({ys_vec}, {xs_vec};"
+            f" extrapolation_left = {_extrap}, extrapolation_right = {_extrap})"
+        )
 
     func_decl = f"{name}(x) = {itp_name}(x)"
     register_decl = f"@register_symbolic {name}(x::Real)"
@@ -301,6 +324,56 @@ class JuliaASTVisitor:
     def _jl_n(self, dim_name: str) -> str:
         """Julia constant name for the size of *dim_name* (``N_DIMNAME``)."""
         return "N_" + re.sub(r"[^a-z0-9]", "_", dim_name.lower()).upper()
+
+    def _collect_bang_subs(self, node) -> List[str]:
+        """Return unique '!'-subscript strings found anywhere in *node*'s subtree."""
+        result: List[str] = []
+        seen: set = set()
+
+        def _scan(n: Any) -> None:
+            if isinstance(n, ReferenceStructure):
+                subs = (
+                    n.subscripts.subscripts
+                    if n.subscripts is not None and hasattr(n.subscripts, "subscripts")
+                    else []
+                )
+                for s in subs:
+                    if s.endswith("!") and s not in seen:
+                        seen.add(s)
+                        result.append(s)
+            elif isinstance(n, CallStructure):
+                fsubs = (
+                    n.function.subscripts.subscripts
+                    if n.function.subscripts is not None
+                    and hasattr(n.function.subscripts, "subscripts")
+                    else []
+                )
+                for s in fsubs:
+                    if s.endswith("!") and s not in seen:
+                        seen.add(s)
+                        result.append(s)
+                for arg in n.arguments:
+                    _scan(arg)
+            elif isinstance(n, (ArithmeticStructure, LogicStructure)):
+                for arg in n.arguments:
+                    _scan(arg)
+
+        _scan(node)
+        return result
+
+    def _with_extra_subs(self, extra: Dict[str, str]) -> "JuliaASTVisitor":
+        """Return a child visitor with *extra* entries added to active_subs."""
+        return JuliaASTVisitor(
+            self.namespace,
+            self.registry,
+            self.needed_helpers,
+            active_subs={**self.active_subs, **extra},
+            var_dims=self.var_dims,
+            subs_sizes=self.subs_sizes,
+            subs_elems=self.subs_elems,
+            lookup_names=self.lookup_names,
+            root=self._root,
+        )
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -504,10 +577,12 @@ class JuliaASTVisitor:
             # (A) Explicit: resolve each subscript to a Julia index expression.
             var_dims_list = self.var_dims.get(julia_name, [])
 
-            # Aggregation subscripts (ending with '!') generate a comprehension so
-            # that sum(X[i!, j]) → sum([X[_ii0, _i0] for _ii0 in 1:N_I]).
-            # Subscript order in the reference may differ from the variable's
-            # declaration order, so we map by name and re-order by var_dims_list.
+            # Aggregation subscripts (ending with '!') are handled here.
+            # Normally the outer _call for sum/prod/vmax/vmin pre-populates
+            # active_subs for ! dims so that all references sharing the same !
+            # subscript are inside ONE comprehension (not separate comprehensions
+            # multiplied together).  If an ! dim is already in active_subs we
+            # reuse that loop variable; otherwise we generate a new comprehension.
             if any(sub.endswith("!") for sub in node_subs):
                 bang_ranges: List[str] = []
                 ii_count = 0
@@ -518,16 +593,22 @@ class JuliaASTVisitor:
                     if sub.endswith("!"):
                         bare = sub[:-1]
                         clean_bare = re.sub(r"[^a-z0-9_]", "_", bare.lower())
-                        # Find the matching dim in var_dims_list (by normalised name)
-                        dim_name = next(
-                            (d for d in var_dims_list
-                             if re.sub(r"[^a-z0-9_]", "_", d.lower()) == clean_bare),
-                            bare,
-                        )
-                        iv = f"_ii{ii_count}"
-                        ii_count += 1
-                        dim_to_idx[re.sub(r"[^a-z0-9_]", "_", dim_name.lower())] = iv
-                        bang_ranges.append(f"{iv} in 1:{self._jl_n(dim_name)}")
+                        if clean_bare in self._clean_active_subs:
+                            # Already being iterated by an outer loop (added by sum
+                            # handler) — reuse the existing loop variable.
+                            iv = self._clean_active_subs[clean_bare]
+                            dim_to_idx[clean_bare] = iv
+                        else:
+                            # Find the matching dim in var_dims_list (by normalised name)
+                            dim_name = next(
+                                (d for d in var_dims_list
+                                 if re.sub(r"[^a-z0-9_]", "_", d.lower()) == clean_bare),
+                                bare,
+                            )
+                            iv = f"_ii{ii_count}"
+                            ii_count += 1
+                            dim_to_idx[re.sub(r"[^a-z0-9_]", "_", dim_name.lower())] = iv
+                            bang_ranges.append(f"{iv} in 1:{self._jl_n(dim_name)}")
                     elif sub in self.active_subs:
                         dim_to_idx[clean_sub] = self.active_subs[sub]
                     elif sub in self.subs_elems:
@@ -536,54 +617,159 @@ class JuliaASTVisitor:
                             dim_to_idx[clean_sub] = idx_var
                     else:
                         if sub in self._elem_index:
-                            idx_val = next(iter(self._elem_index[sub].values()))
-                            dim_to_idx[clean_sub] = str(idx_val)
+                            # Key dim_to_idx by the variable's DIMENSION NAME (not
+                            # the element label) so the index assembly over
+                            # var_dims_list can find it.  Also prefer the variable's
+                            # own declared dim to avoid picking a larger parent range.
+                            target_dim = None
+                            for d in var_dims_list:
+                                if d in self._elem_index[sub]:
+                                    target_dim = d
+                                    break
+                            if target_dim is None:
+                                target_dim = next(iter(self._elem_index[sub]))
+                            clean_dim = re.sub(r"[^a-z0-9_]", "_", target_dim.lower())
+                            dim_to_idx[clean_dim] = str(self._elem_index[sub][target_dim])
 
-                # Assemble indices in var_dims_list (declaration) order
-                indices = [
-                    dim_to_idx[re.sub(r"[^a-z0-9_]", "_", d.lower())]
-                    for d in var_dims_list
-                    if re.sub(r"[^a-z0-9_]", "_", d.lower()) in dim_to_idx
+                # Assemble indices in var_dims_list (declaration) order.
+                # When a dim name doesn't match any key in dim_to_idx (common when
+                # Vensim aliases differ, e.g. 'sectors' decl vs 'sectors1' in ref),
+                # fall back to size-matching then positional assignment.
+                bang_iv_pool = [
+                    dim_to_idx[re.sub(r"[^a-z0-9_]", "_", sub[:-1].lower())]
+                    for sub in node_subs
+                    if sub.endswith("!")
+                    and re.sub(r"[^a-z0-9_]", "_", sub[:-1].lower()) in dim_to_idx
                 ]
+                used_ivars: set = set()
+                if var_dims_list:
+                    indices = []
+                    for d in var_dims_list:
+                        clean_d = re.sub(r"[^a-z0-9_]", "_", d.lower())
+                        if clean_d in dim_to_idx:
+                            iv = dim_to_idx[clean_d]
+                            indices.append(iv)
+                            used_ivars.add(iv)
+                        else:
+                            # Size-based fallback first
+                            d_size = (self.subs_sizes.get(d, 0) or
+                                      self._clean_subs_sizes.get(clean_d, 0))
+                            matched = None
+                            for sub in node_subs:
+                                if not sub.endswith("!"):
+                                    continue
+                                bare = sub[:-1]
+                                cb = re.sub(r"[^a-z0-9_]", "_", bare.lower())
+                                iv = dim_to_idx.get(cb)
+                                if iv is None or iv in used_ivars:
+                                    continue
+                                bare_size = (self.subs_sizes.get(bare, 0) or
+                                             self._clean_subs_sizes.get(cb, 0))
+                                if d_size > 0 and bare_size == d_size:
+                                    matched = iv
+                                    used_ivars.add(iv)
+                                    break
+                            if matched is None:
+                                # Positional fallback
+                                for iv in bang_iv_pool:
+                                    if iv not in used_ivars:
+                                        matched = iv
+                                        used_ivars.add(iv)
+                                        break
+                            if matched is not None:
+                                indices.append(matched)
+                else:
+                    # No var_dims info: use node_subs order as fallback
+                    indices = []
+                    for sub in node_subs:
+                        key = re.sub(
+                            r"[^a-z0-9_]", "_",
+                            (sub[:-1] if sub.endswith("!") else sub).lower(),
+                        )
+                        if key in dim_to_idx:
+                            indices.append(dim_to_idx[key])
+
                 inner = f"{julia_name}[{', '.join(indices)}]"
-                for_clause = ", ".join(bang_ranges)
-                return f"[{inner} for {for_clause}]"
+                if bang_ranges:
+                    for_clause = ", ".join(bang_ranges)
+                    return f"[{inner} for {for_clause}]"
+                else:
+                    # All ! dims were already active — no new comprehension
+                    return inner
 
             indices = []
+            # Track which active loop vars have been consumed by alignment so
+            # two different range names (e.g. sectors_a_matrix and
+            # sectors_a_matrix1) that both map to the same element-set don't
+            # both resolve to the same variable.
+            used_align_vars: set = set()
             for pos, sub in enumerate(node_subs):
                 if sub in self.active_subs:
                     # Range name matching an active loop variable
-                    indices.append(self.active_subs[sub])
+                    lv = self.active_subs[sub]
+                    indices.append(lv)
+                    used_align_vars.add(lv)
                 elif sub in self.subs_elems:
-                    # Range name with all elements — use active loop var if available
+                    # Range name with all elements — use active loop var if available.
+                    # First try direct name match, then fall back to element-set
+                    # alignment (handles aliases like sectors_a_matrix ↔ sectors).
                     idx_var = self.active_subs.get(sub)
-                    if idx_var:
+                    if idx_var and idx_var not in used_align_vars:
                         indices.append(idx_var)
-                    # otherwise skip (rare; let it fall through)
+                        used_align_vars.add(idx_var)
+                    elif not idx_var:
+                        # Aligned range: find an active range with the same elements
+                        sub_elems = self.subs_elems.get(sub, [])
+                        aligned = None
+                        # Element-set match (exact) — prefer first unused
+                        for ar, lv in self.active_subs.items():
+                            if lv in used_align_vars:
+                                continue
+                            if sub_elems and self.subs_elems.get(ar, []) == sub_elems:
+                                aligned = lv
+                                break
+                        # Size match fallback
+                        if aligned is None and sub_elems:
+                            sub_size = len(sub_elems)
+                            for ar, lv in self.active_subs.items():
+                                if lv in used_align_vars:
+                                    continue
+                                if len(self.subs_elems.get(ar, [])) == sub_size:
+                                    aligned = lv
+                                    break
+                        if aligned:
+                            indices.append(aligned)
+                            used_align_vars.add(aligned)
+                        # else: genuinely unresolvable — skip (rare)
                 else:
-                    # Specific element label → numeric index in the variable's dim
-                    # Try to match against the corresponding dim of the variable.
+                    # Specific element label → numeric index in the variable's own dim.
+                    # Prefer the variable's declared dim at this position so that
+                    # sub-ranges (e.g. matter_final_sources) yield a local index,
+                    # not the index from a larger parent range (e.g. final_sources).
                     parent_range = None
                     if pos < len(var_dims_list):
                         candidate = var_dims_list[pos]
-                        if sub in self._elem_index.get(sub, {}) and candidate in self._elem_index.get(sub, {}):
+                        if sub in self._elem_index and candidate in self._elem_index[sub]:
                             parent_range = candidate
                     if parent_range is None:
-                        # Fallback: use whichever range contains this element and
-                        # is one of the variable's dims.
+                        # Fallback: any of the variable's declared dims that contain sub
                         for rng in var_dims_list:
-                            if sub in self._elem_index.get(sub, {}) and rng in self._elem_index.get(sub, {}):
+                            if sub in self._elem_index and rng in self._elem_index[sub]:
                                 parent_range = rng
                                 break
                     if parent_range is None and sub in self._elem_index:
-                        # Last resort: use the first known range
+                        # Last resort: first known range (may be wrong for sub-ranges)
                         parent_range = next(iter(self._elem_index[sub]))
-                    if parent_range is not None and sub in self._elem_index.get(sub, {}):
+                    if parent_range is not None and sub in self._elem_index:
                         indices.append(str(self._elem_index[sub][parent_range]))
                     elif sub in self._elem_index:
                         idx_val = next(iter(self._elem_index[sub].values()))
                         indices.append(str(idx_val))
             if indices:
+                # GET DATA / LOOKUPS functions must use call syntax f(i, t),
+                # not array-index syntax f[i].
+                if julia_name in self.lookup_names:
+                    return f"{julia_name}({', '.join(indices + ['t'])})"
                 julia_name = julia_name + "[" + ", ".join(indices) + "]"
         elif self.active_subs and self.var_dims:
             # (B) No explicit subscripts: apply active loop variables.
@@ -626,15 +812,21 @@ class JuliaASTVisitor:
                         if sub.endswith("!"):
                             bare = sub[:-1]
                             clean_bare = re.sub(r"[^a-z0-9_]", "_", bare.lower())
-                            dim_name = next(
-                                (d for d in var_dims_list
-                                 if re.sub(r"[^a-z0-9_]", "_", d.lower()) == clean_bare),
-                                bare,
-                            )
-                            iv = f"_ii{ii_count_c}"
-                            ii_count_c += 1
-                            dim_to_idx_c[re.sub(r"[^a-z0-9_]", "_", dim_name.lower())] = iv
-                            bang_ranges_c.append(f"{iv} in 1:{self._jl_n(dim_name)}")
+                            if clean_bare in self._clean_active_subs:
+                                # Already iterated by an outer SUM comprehension —
+                                # reuse the existing loop variable, don't add a new range.
+                                iv = self._clean_active_subs[clean_bare]
+                                dim_to_idx_c[clean_bare] = iv
+                            else:
+                                dim_name = next(
+                                    (d for d in var_dims_list
+                                     if re.sub(r"[^a-z0-9_]", "_", d.lower()) == clean_bare),
+                                    bare,
+                                )
+                                iv = f"_ii{ii_count_c}"
+                                ii_count_c += 1
+                                dim_to_idx_c[re.sub(r"[^a-z0-9_]", "_", dim_name.lower())] = iv
+                                bang_ranges_c.append(f"{iv} in 1:{self._jl_n(dim_name)}")
                         elif sub in self.active_subs:
                             dim_to_idx_c[clean_sub] = self.active_subs[sub]
                         elif sub in self.subs_elems:
@@ -645,14 +837,125 @@ class JuliaASTVisitor:
                             if sub in self._elem_index:
                                 idx_val = next(iter(self._elem_index[sub].values()))
                                 dim_to_idx_c[clean_sub] = str(idx_val)
-                    call_indices = [
-                        dim_to_idx_c[re.sub(r"[^a-z0-9_]", "_", d.lower())]
-                        for d in var_dims_list
-                        if re.sub(r"[^a-z0-9_]", "_", d.lower()) in dim_to_idx_c
+                    # Assemble call indices in var_dims_list order with fallback
+                    bang_iv_pool_c = [
+                        dim_to_idx_c[re.sub(r"[^a-z0-9_]", "_", sub[:-1].lower())]
+                        for sub in func_node_subs
+                        if sub.endswith("!")
+                        and re.sub(r"[^a-z0-9_]", "_", sub[:-1].lower()) in dim_to_idx_c
                     ]
-                    for_clause_c = ", ".join(bang_ranges_c)
+                    used_ivars_c: set = set()
+                    if var_dims_list:
+                        call_indices = []
+                        for d in var_dims_list:
+                            clean_d = re.sub(r"[^a-z0-9_]", "_", d.lower())
+                            if clean_d in dim_to_idx_c:
+                                iv = dim_to_idx_c[clean_d]
+                                call_indices.append(iv)
+                                used_ivars_c.add(iv)
+                            else:
+                                d_size = (self.subs_sizes.get(d, 0) or
+                                          self._clean_subs_sizes.get(clean_d, 0))
+                                matched = None
+                                for sub in func_node_subs:
+                                    if not sub.endswith("!"):
+                                        continue
+                                    bare = sub[:-1]
+                                    cb = re.sub(r"[^a-z0-9_]", "_", bare.lower())
+                                    iv = dim_to_idx_c.get(cb)
+                                    if iv is None or iv in used_ivars_c:
+                                        continue
+                                    bare_size = (self.subs_sizes.get(bare, 0) or
+                                                 self._clean_subs_sizes.get(cb, 0))
+                                    if d_size > 0 and bare_size == d_size:
+                                        matched = iv
+                                        used_ivars_c.add(iv)
+                                        break
+                                if matched is None:
+                                    for iv in bang_iv_pool_c:
+                                        if iv not in used_ivars_c:
+                                            matched = iv
+                                            used_ivars_c.add(iv)
+                                            break
+                                if matched is not None:
+                                    call_indices.append(matched)
+                    else:
+                        call_indices = []
+                        for sub in func_node_subs:
+                            key = re.sub(
+                                r"[^a-z0-9_]", "_",
+                                (sub[:-1] if sub.endswith("!") else sub).lower(),
+                            )
+                            if key in dim_to_idx_c:
+                                call_indices.append(dim_to_idx_c[key])
                     inner_call = f"{julia_id}({', '.join(call_indices + args)})"
-                    return f"[{inner_call} for {for_clause_c}]"
+                    if bang_ranges_c:
+                        for_clause_c = ", ".join(bang_ranges_c)
+                        return f"[{inner_call} for {for_clause_c}]"
+                    else:
+                        # All ! dims already active via outer comprehension.
+                        return inner_call
+
+                # Explicit function subscripts without '!': resolve each subscript
+                # positionally (range name → active loop var; element label →
+                # literal index), matching the logic in _reference for explicit
+                # node_subs.  This handles e.g.
+                #   Historic_water_use[sectors, water](Time)
+                # where var_dims uses the parent dim 'sectors_and_households'
+                # which doesn't appear in active_subs, but 'sectors' does.
+                if func_node_subs:
+                    var_dims_list = self.var_dims.get(julia_id, [])
+                    call_indices: List[str] = []
+                    used_align_vars_c2: set = set()
+                    for pos, sub in enumerate(func_node_subs):
+                        if sub in self.active_subs:
+                            lv = self.active_subs[sub]
+                            call_indices.append(lv)
+                            used_align_vars_c2.add(lv)
+                        elif sub in self.subs_elems:
+                            idx_var = self.active_subs.get(sub)
+                            if idx_var and idx_var not in used_align_vars_c2:
+                                call_indices.append(idx_var)
+                                used_align_vars_c2.add(idx_var)
+                            elif not idx_var:
+                                sub_elems = self.subs_elems.get(sub, [])
+                                aligned: Optional[str] = None
+                                for ar, lv in self.active_subs.items():
+                                    if lv in used_align_vars_c2:
+                                        continue
+                                    if sub_elems and self.subs_elems.get(ar, []) == sub_elems:
+                                        aligned = lv
+                                        break
+                                if aligned is None and sub_elems:
+                                    sub_size = len(sub_elems)
+                                    for ar, lv in self.active_subs.items():
+                                        if lv in used_align_vars_c2:
+                                            continue
+                                        if len(self.subs_elems.get(ar, [])) == sub_size:
+                                            aligned = lv
+                                            break
+                                if aligned:
+                                    call_indices.append(aligned)
+                                    used_align_vars_c2.add(aligned)
+                        else:
+                            parent_range: Optional[str] = None
+                            if pos < len(var_dims_list):
+                                candidate = var_dims_list[pos]
+                                if sub in self._elem_index and candidate in self._elem_index[sub]:
+                                    parent_range = candidate
+                            if parent_range is None:
+                                for rng in var_dims_list:
+                                    if sub in self._elem_index and rng in self._elem_index[sub]:
+                                        parent_range = rng
+                                        break
+                            if parent_range is None and sub in self._elem_index:
+                                parent_range = next(iter(self._elem_index[sub]))
+                            if parent_range is not None and sub in self._elem_index:
+                                call_indices.append(str(self._elem_index[sub][parent_range]))
+                            elif sub in self._elem_index:
+                                call_indices.append(str(next(iter(self._elem_index[sub].values()))))
+                    if call_indices:
+                        return f"{julia_id}({', '.join(call_indices + args)})"
 
                 if self.var_dims:
                     dims = self.var_dims.get(julia_id, [])
@@ -700,7 +1003,43 @@ class JuliaASTVisitor:
         if julia_func in HELPER_IMPLEMENTATIONS:
             self.needed_helpers.add(julia_func)
 
+        # sum/prod/vmax/vmin with ! subscripts: generate ONE comprehension that
+        # covers ALL references sharing the same ! dim, rather than separate
+        # per-reference comprehensions that would be multiplied/added as arrays.
+        if julia_func in ("sum", "prod", "maximum", "minimum") and len(node.arguments) == 1:
+            bang_subs = self._collect_bang_subs(node.arguments[0])
+            new_bang_subs = [
+                s for s in bang_subs
+                if re.sub(r"[^a-z0-9_]", "_", s[:-1].lower())
+                not in self._clean_active_subs
+            ]
+            if new_bang_subs:
+                extra_subs: Dict[str, str] = {}
+                agg_ranges: List[str] = []
+                ii_cnt = 0
+                for sub in new_bang_subs:
+                    bare = sub[:-1]
+                    clean_bare = re.sub(r"[^a-z0-9_]", "_", bare.lower())
+                    iv = f"_ii{ii_cnt}"
+                    ii_cnt += 1
+                    extra_subs[bare] = iv
+                    extra_subs[clean_bare] = iv
+                    agg_ranges.append(f"{iv} in 1:{self._jl_n(bare)}")
+                child = self._with_extra_subs(extra_subs)
+                arg_expr = child.visit(node.arguments[0])
+                for_clause_agg = ", ".join(agg_ranges)
+                return f"{julia_func}([{arg_expr} for {for_clause_agg}])"
+
         args = [self.visit(a) for a in node.arguments]
+
+        # Symbolics.jl ifelse requires a Bool condition.  Vensim IF THEN ELSE
+        # accepts any numeric condition (nonzero = true), so a bare variable or
+        # arithmetic expression must be wrapped with `!= 0`.  Only LogicStructure
+        # arguments (comparisons like `<`, `>`, `==`, and logical operators) are
+        # already Bool — leave them untouched.
+        if julia_func == "ifelse" and args:
+            if not isinstance(node.arguments[0], LogicStructure):
+                args[0] = f"({args[0]} != 0)"
 
         # Time-dependent helpers receive the symbolic *t* as their first arg
         if julia_func in _TIME_HELPERS:

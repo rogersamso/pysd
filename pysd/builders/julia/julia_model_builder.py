@@ -30,6 +30,7 @@ from pysd.translators.structures.abstract_model import (
 from pysd.translators.structures.abstract_expressions import (
     AllocateAvailableStructure,
     AllocateByPriorityStructure,
+    CallStructure,
     DataStructure,
     DelayFixedStructure,
     DelayNStructure,
@@ -586,13 +587,19 @@ class JuliaSectionBuilder:
 
         pos = def_elems.index(element_label)   # 0-based position within def_range
         def_size = len(def_elems)
-        dim_idx_map = {e: i + 1 for i, e in enumerate(dim_elems)}
 
-        # Add the defining range mapped to the absolute parent-dimension index.
-        subs[def_range_name] = str(abs_idx)
+        # Map the defining sub-range to its 1-based index WITHIN the sub-range,
+        # not the absolute parent-dimension index.  Variables declared over the
+        # sub-range (e.g. `sectors`) are 1-indexed from 1, so using the parent
+        # dimension's absolute index (abs_idx) would produce out-of-bounds access
+        # when the sub-range is offset within the parent (e.g. Households at 1,
+        # sectors at 2-15).
+        subs[def_range_name] = str(pos + 1)
 
-        # For every range of the same size, map it to the absolute index of its
-        # p-th element in the parent dimension (positional alignment).
+        # For every range of the same size, Vensim aligns them positionally:
+        # position *pos* in def_range corresponds to position *pos* in the other
+        # range.  Each such range is also 1-indexed from 1 in Julia, so the
+        # correct index is always pos+1.
         for sr in self._abstract_subscripts:
             if (
                 isinstance(sr.subscripts, list)
@@ -600,11 +607,7 @@ class JuliaSectionBuilder:
                 and sr.name != def_range_name
                 and sr.name != dim_name
             ):
-                aligned_elem = sr.subscripts[pos]
-                if aligned_elem in dim_idx_map:
-                    subs[sr.name] = str(dim_idx_map[aligned_elem])
-                else:
-                    subs[sr.name] = str(pos + 1)   # fallback: position
+                subs[sr.name] = str(pos + 1)
 
         return subs
 
@@ -643,14 +646,21 @@ class JuliaSectionBuilder:
 
     @staticmethod
     def _limits_comment(elem: "AbstractElement") -> str:
-        """Return a ``# limits: [min, max]`` comment if *elem* has non-trivial limits,
-        otherwise return an empty string."""
+        """Return a block comment ``#= limits: [min, max] =#`` if *elem* has
+        non-trivial limits, otherwise return an empty string.
+
+        Block comments are used (rather than line comments ``#``) so that the
+        trailing ``,`` separator added by the equation-array join is placed
+        AFTER the closing ``=#`` and is therefore visible to the Julia parser.
+        A line comment would swallow the comma, removing the array separator
+        and causing a ParseError.
+        """
         lims = getattr(elem, "limits", (None, None))
         if not lims or (lims[0] is None and lims[1] is None):
             return ""
         lo = "-Inf" if lims[0] is None else format_number(float(lims[0]))
         hi = "Inf" if lims[1] is None else format_number(float(lims[1]))
-        return f"  # limits: [{lo}, {hi}]"
+        return f"  #= limits: [{lo}, {hi}] =#"
 
     def _json_add_limits(self, elem: "AbstractElement", identifier: str) -> None:
         """Store limits metadata into ``_json_data["constants"]`` when in json mode."""
@@ -767,14 +777,26 @@ class JuliaSectionBuilder:
                 (d0, n0) = dims[0]
                 vnd1 = self._nd_visitor(dims, ["_i0"])
                 flow_nd1 = vnd1.visit(ast.flow)
-                init_nd1 = vnd1.visit(ast.initial)
                 self.stock_decls.append(
                     f"@variables {identifier}(t)[{self._range_str(dims)}]"
                 )
-                for i in range(1, n0 + 1):
-                    self.u0_entries.append(
-                        f"{identifier}[{i}] => {init_nd1.replace('_i0', str(i))}"
-                    )
+                # Numpy 1D literal: use scalar per element to avoid assigning
+                # a full vector to each scalar u0 entry.
+                try:
+                    import numpy as _np
+                    if isinstance(ast.initial, _np.ndarray) and ast.initial.ndim == 1 and len(ast.initial) == n0:
+                        for i, v in enumerate(ast.initial, 1):
+                            self.u0_entries.append(
+                                f"{identifier}[{i}] => {format_number(float(v))}"
+                            )
+                    else:
+                        raise TypeError
+                except (ImportError, TypeError, ValueError):
+                    init_nd1 = vnd1.visit(ast.initial)
+                    for i in range(1, n0 + 1):
+                        self.u0_entries.append(
+                            f"{identifier}[{i}] => {init_nd1.replace('_i0', str(i))}"
+                        )
                 return [
                     f"[D({identifier}[_i0]) ~ {flow_nd1} "
                     f"for _i0 in 1:{self._jl_n(d0)}]..."
@@ -788,7 +810,32 @@ class JuliaSectionBuilder:
                 self.stock_decls.append(
                     f"@variables {identifier}(t)[{self._range_str(dims)}]"
                 )
-                self._nd_u0_entries(identifier, dims, initial_expr)
+                # Numpy ndarray initial: generate per-element scalar u0 entries.
+                # Variable-reference initial: use nd_visitor (which inserts index
+                # variables into subscripted references) then substitute each
+                # index variable with its concrete value — same strategy as
+                # ndim==1.  This prevents assigning a full N-D array to each
+                # scalar u0 entry (causes MTK "Cannot equate arrays of different
+                # sizes" error).
+                try:
+                    import numpy as _np
+                    expected_shape = tuple(n for _, n in dims)
+                    if isinstance(ast.initial, _np.ndarray) and ast.initial.shape == expected_shape:
+                        for idx in _np.ndindex(*expected_shape):
+                            idx_s = ", ".join(str(i + 1) for i in idx)
+                            val = format_number(float(ast.initial[idx]))
+                            self.u0_entries.append(f"{identifier}[{idx_s}] => {val}")
+                    else:
+                        raise TypeError
+                except (ImportError, TypeError, ValueError):
+                    init_nd = vnd.visit(ast.initial)
+                    ranges_nd = [range(1, size + 1) for _, size in dims]
+                    for idx_combo in itertools.product(*ranges_nd):
+                        idx_s = ", ".join(str(i) for i in idx_combo)
+                        init_val = init_nd
+                        for var, val in zip(idx_vars, idx_combo):
+                            init_val = init_val.replace(var, str(val))
+                        self.u0_entries.append(f"{identifier}[{idx_s}] => {init_val}")
                 return [
                     f"[D({identifier}[{idx_str}]) ~ {flow_nd} "
                     f"for {self._for_clause(dims, idx_vars)}]..."
@@ -941,6 +988,24 @@ class JuliaSectionBuilder:
             return [f"{identifier} ~ {rhs_expr}{lim_comment}"]
         elif ndim == 1:
             (d0, n0) = dims[0]
+            # Special case: literal numpy array RHS.  A comprehension would put
+            # the full N-element vector on each scalar LHS, causing an MTK shape
+            # mismatch error ("Cannot add arguments of different sizes").
+            # Generate individual per-element equations instead.
+            try:
+                import numpy as _np
+                if isinstance(ast, _np.ndarray) and ast.ndim == 1 and len(ast) == n0:
+                    if is_control:
+                        return []
+                    self.aux_decls.append(
+                        f"@variables {identifier}(t)[{self._range_str(dims)}]"
+                    )
+                    return [
+                        f"{identifier}[{i + 1}] ~ {format_number(float(ast[i]))}"
+                        for i in range(n0)
+                    ]
+            except (ImportError, TypeError, ValueError):
+                pass
             vnd1 = self._nd_visitor(dims, ["_i0"])
             rhs_nd1 = vnd1.visit(ast)
             if is_control:
@@ -955,6 +1020,34 @@ class JuliaSectionBuilder:
                 f"for _i0 in 1:{self._jl_n(d0)}]..."
             ]
         else:
+            # Special case: INVERT_MATRIX → matrix-level Symbolics.scalarize equations
+            if self._is_invert_matrix(ast):
+                return self._build_invert_matrix_equations(
+                    identifier, ast, dims, is_control
+                )
+            # Special case: literal numpy array RHS for N≥2 dim auxiliary.
+            # Like the 1D case, a comprehension would put the full array on each
+            # scalar LHS.  Generate per-element equations instead.
+            try:
+                import numpy as _np
+                expected_shape = tuple(n for _, n in dims)
+                if isinstance(ast, _np.ndarray) and ast.shape == expected_shape:
+                    if is_control:
+                        return []
+                    self.aux_decls.append(
+                        f"@variables {identifier}(t)[{self._range_str(dims)}]"
+                    )
+                    # Iterate over all multi-index combinations (Fortran column-major
+                    # order is NOT assumed — we iterate in C order but Julia indices
+                    # are 1-based).
+                    eqs = []
+                    for idx in _np.ndindex(*expected_shape):
+                        julia_idx = ", ".join(str(i + 1) for i in idx)
+                        val = format_number(float(ast[idx]))
+                        eqs.append(f"{identifier}[{julia_idx}] ~ {val}")
+                    return eqs
+            except (ImportError, TypeError, ValueError):
+                pass
             # N≥2 dims: comprehension with N index variables
             idx_vars = self._idx_vars(ndim)
             vnd = self._nd_visitor(dims, idx_vars)
@@ -971,6 +1064,73 @@ class JuliaSectionBuilder:
                 f"[{identifier}[{idx_str}] ~ {rhs_nd} "
                 f"for {self._for_clause(dims, idx_vars)}]..."
             ]
+
+    @staticmethod
+    def _is_invert_matrix(ast) -> bool:
+        """Return True if *ast* is a Vensim INVERT_MATRIX call."""
+        return (
+            isinstance(ast, CallStructure)
+            and isinstance(ast.function, ReferenceStructure)
+            and ast.function.reference.lower().replace(" ", "_") == "invert_matrix"
+        )
+
+    def _build_invert_matrix_equations(
+        self,
+        identifier: str,
+        ast: "CallStructure",
+        dims: List[Tuple[str, int]],
+        is_control: bool,
+    ) -> List[str]:
+        """Emit element-wise INVERT_MATRIX equations via registered helper functions.
+
+        Symbolics symbolic arrays do not support colon (:) slice indexing and
+        calling inv(Matrix{Num}) triggers a full symbolic LU decomposition which
+        hangs for matrices larger than ~4x4.  Instead we emit equations that use
+        @register_symbolic black-box helpers (_inv_mat2d_elem / _inv_mat3d_elem)
+        that are evaluated numerically at solve time.
+
+        For 2-D LHS (no batch dims):
+            [result[i,j] ~ _inv_mat2d_elem(mat, i, j) for i in 1:N0, j in 1:N1]...
+        For 3-D+ LHS (first N-2 dims are batch):
+            [result[b,i,j] ~ _inv_mat3d_elem(mat, b, i, j)
+             for b in 1:N0, i in 1:N1, j in 1:N2]...
+        """
+        if is_control:
+            return []
+
+        mat_ref = ast.arguments[0]
+        mat_name = self.namespace.get(mat_ref.reference) or re.sub(
+            r"[^a-z0-9_]", "_", mat_ref.reference.lower()
+        )
+
+        self.aux_decls.append(
+            f"@variables {identifier}(t)[{self._range_str(dims)}]"
+        )
+
+        mat_dims = dims[-2:]
+        (d1, _), (d2, _) = mat_dims
+        n1 = self._jl_n(d1)
+        n2 = self._jl_n(d2)
+
+        ndim = len(dims)
+        if ndim == 2:
+            self.needed_helpers.add("_inv_mat2d_elem")
+            return [
+                f"[{identifier}[_i1, _i2] ~ _inv_mat2d_elem({mat_name}, _i1, _i2) "
+                f"for _i1 in 1:{n1}, _i2 in 1:{n2}]..."
+            ]
+
+        # ndim >= 3: first N-2 dims are batch dims.
+        self.needed_helpers.add("_inv_mat3d_elem")
+        batch_dims = dims[:-2]
+        batch_idx_vars = [f"_ib{k}" for k in range(len(batch_dims))]
+        batch_idx = ", ".join(batch_idx_vars)
+        all_idx = ", ".join(batch_idx_vars + ["_i1", "_i2"])
+        batch_for = self._for_clause(batch_dims, batch_idx_vars)
+        return [
+            f"[{identifier}[{all_idx}] ~ _inv_mat3d_elem({mat_name}, {batch_idx}, _i1, _i2) "
+            f"for {batch_for}, _i1 in 1:{n1}, _i2 in 1:{n2}]..."
+        ]
 
     # ------------------------------------------------------------------
     # EXCEPT subscript exclusion
@@ -2274,15 +2434,28 @@ class JuliaSectionBuilder:
             var[electricity] = 0
             var[heat] = 0
 
-        Here we read each GCS component with its own subscript coords, collect
-        the literal values, and assemble the full array in the order given by
-        the parent subscript range.
+        For 1-D subscripts the element labels are collected and ordered by their
+        parent range.  For 2-D+ subscripts a numpy array of the full shape is
+        built and each component fills its slice.
         """
         import numpy as np
         from pysd.py_backend.external import ExtConstant
         from pysd.builders.julia.julia_expressions_builder import format_number
 
         all_comps = elem.components
+
+        # ---- Detect dimensionality ----------------------------------------
+        max_ndim = max(
+            (len(c.subscripts[0]) for c in all_comps if c.subscripts and c.subscripts[0]),
+            default=0
+        )
+
+        if max_ndim >= 2:
+            return self._read_get_constants_piecewise_nd(
+                elem, identifier, gcs_comps, lit_comps
+            )
+
+        # ---- 1-D path (original logic) ------------------------------------
         split_ranges = self._detect_split_ranges(all_comps)
 
         # Build a map: element_label → float value
@@ -2290,7 +2463,6 @@ class JuliaSectionBuilder:
 
         for comp in lit_comps:
             val = float(comp.ast) if isinstance(comp.ast, (int, float)) else 0.0
-            # Each literal component covers exactly the elements in its subscripts
             subs = comp.subscripts[0] if comp.subscripts else []
             for s in subs:
                 if s in self._subs_elems:
@@ -2312,7 +2484,6 @@ class JuliaSectionBuilder:
             data = ext.data
             arr = data.values if hasattr(data, "values") else np.asarray(data)
             arr = np.asarray(arr, dtype=float)
-            # Map each axis label to its value
             if arr.ndim == 0:
                 subs = comp.subscripts[0] if comp.subscripts else []
                 if subs:
@@ -2320,18 +2491,14 @@ class JuliaSectionBuilder:
             else:
                 for dim_name, coord_vals in data.coords.items():
                     labels = [str(v) for v in coord_vals.values]
-                    # For each label, slice the array along this dim
                     for idx, label in enumerate(labels):
                         sliced = arr.take(idx, axis=list(data.dims).index(dim_name))
                         if sliced.ndim == 0:
                             elem_values[label] = float(sliced)
-                        # Multi-element slices need further handling; skip for now
 
-        # Find the parent range that covers all collected element labels
         all_elems = list(elem_values.keys())
         parent_range = self._infer_parent_range(all_elems)
         if parent_range is None:
-            # Can't determine order; just return values in encountered order
             vals = list(elem_values.values())
         else:
             ordered_elems = self._subs_elems.get(parent_range, all_elems)
@@ -2340,6 +2507,106 @@ class JuliaSectionBuilder:
         if len(vals) == 1:
             return format_number(vals[0])
         return "[" + ", ".join(format_number(v) for v in vals) + "]"
+
+    def _read_get_constants_piecewise_nd(
+        self,
+        elem: "AbstractElement",
+        identifier: str,
+        gcs_comps: List["AbstractComponent"],
+        lit_comps: List["AbstractComponent"],
+    ) -> Optional[str]:
+        """Multi-dimensional (N≥2) piecewise assembly.
+
+        Handles the common Vensim pattern where a 2D+ constant is defined by
+        a mix of GCS and literal-value components, each covering a different
+        sub-range of one dimension while sharing all other dimensions.
+
+        Example (pymedeas world model):
+            materials_for_o_m_per_capacity_installed_res_elec[RES_ELEC, materials]
+              [RES_ELEC_DISPATCHABLE, materials] = 0   (literal)
+              [RES_ELEC_VARIABLE,     materials] = GCS (Excel data)
+
+        The full parent dims are determined by _element_dims, then a numpy
+        array is allocated and each component fills its slice.
+        """
+        import numpy as np
+        from pysd.py_backend.external import ExtConstant
+
+        # Determine full parent dimensions for each subscript position
+        dims = self._element_dims(elem)
+        if not dims:
+            return None
+
+        parent_dim_names = [d for d, _ in dims]
+        parent_dim_elems = [self._subs_elems.get(d, []) for d in parent_dim_names]
+
+        if any(len(e) == 0 for e in parent_dim_elems):
+            return None  # unknown dim — fall back to caller
+
+        shape = tuple(len(e) for e in parent_dim_elems)
+        full_arr = np.zeros(shape)
+
+        def _comp_idx_arrays(comp_subs):
+            """Return index arrays (one per dim) for np.ix_."""
+            idx_arrs = []
+            for pos, elems in enumerate(parent_dim_elems):
+                s = comp_subs[pos] if pos < len(comp_subs) else None
+                if s is None:
+                    idx_arrs.append(np.arange(len(elems)))
+                elif s in self._subs_elems:
+                    # Sub-range: indices of its elements in the parent dim
+                    sub_els = set(self._subs_elems[s])
+                    idxs = [i for i, e in enumerate(elems) if e in sub_els]
+                    idx_arrs.append(np.array(idxs, dtype=int))
+                elif s in elems:
+                    idx_arrs.append(np.array([elems.index(s)], dtype=int))
+                else:
+                    idx_arrs.append(np.arange(len(elems)))
+            return idx_arrs
+
+        # Fill literal components
+        for comp in lit_comps:
+            val = float(comp.ast) if isinstance(comp.ast, (int, float)) else 0.0
+            comp_subs = comp.subscripts[0] if comp.subscripts else []
+            idx_arrs = _comp_idx_arrays(comp_subs)
+            full_arr[np.ix_(*idx_arrs)] = val
+
+        # Fill GCS components
+        for comp in gcs_comps:
+            ast = comp.ast
+            comp_subs = comp.subscripts[0] if comp.subscripts else []
+            idx_arrs = _comp_idx_arrays(comp_subs)
+
+            # Build coords keyed by parent dim names with the actual element lists
+            coords: Dict[str, list] = {}
+            for pos, (dim_name, elems) in enumerate(zip(parent_dim_names, parent_dim_elems)):
+                s = comp_subs[pos] if pos < len(comp_subs) else None
+                if s in self._subs_elems:
+                    coords[dim_name] = self._subs_elems[s]
+                elif s in elems:
+                    coords[dim_name] = [s]
+                else:
+                    coords[dim_name] = list(elems)
+
+            try:
+                ext = ExtConstant(
+                    file_name=ast.file, tab=ast.tab, cell=ast.cell,
+                    coords=coords, root=self.root, final_coords=coords,
+                    py_name=identifier,
+                )
+                ext.initialize()
+                data_arr = np.asarray(
+                    ext.data.values if hasattr(ext.data, "values") else ext.data,
+                    dtype=float,
+                )
+                full_arr[np.ix_(*idx_arrs)] = data_arr
+            except Exception as exc:
+                warn(
+                    f"Could not read external constant for '{elem.name}' "
+                    f"(component {comp_subs}): {exc}"
+                )
+
+        return _format_julia_value(full_arr)
 
     # ------------------------------------------------------------------
     # JSON helpers
@@ -2689,7 +2956,31 @@ class JuliaSectionBuilder:
     def _u0_block(self) -> str:
         if not self.u0_entries:
             return "u0 = []\n"
-        lines = ",\n    ".join(self.u0_entries)
+        # MTK's InitializationProblem rejects @parameters symbols as u0 values
+        # (only concrete numbers or other unknowns are accepted).  Build a map
+        # of parameter_name → literal_value from param_decls so we can inline
+        # any parameter references — whether bare or inside expressions — on
+        # the RHS of u0 entries.
+        import re as _re_u0
+        param_vals: Dict[str, str] = {}
+        for decl in self.param_decls:
+            m = _re_u0.match(r"@parameters\s+(\w+)\s*=\s*(.+)", decl)
+            if m:
+                param_vals[m.group(1)] = m.group(2).strip()
+
+        def _subst_params(expr: str) -> str:
+            for name, val in param_vals.items():
+                expr = _re_u0.sub(r"\b" + _re_u0.escape(name) + r"\b", val, expr)
+            return expr
+
+        resolved: List[str] = []
+        for entry in self.u0_entries:
+            if "=>" in entry:
+                lhs, rhs = entry.split("=>", 1)
+                resolved.append(f"{lhs.strip()} => {_subst_params(rhs.strip())}")
+            else:
+                resolved.append(entry)
+        lines = ",\n    ".join(resolved)
         return f"u0 = [\n    {lines},\n]\n"
 
     def _control_block(self) -> str:
@@ -2708,11 +2999,27 @@ class JuliaSectionBuilder:
         ts = self.control_vals.get("time_step") or "time_step"
         return textwrap.dedent(f"""\
             function run_model(; u0=u0, tspan=tspan, dt={ts}, solver=Euler())
-                prob = ODEProblem(sys, u0, tspan)
+                prob = ODEProblem(sys, u0, tspan;
+                    build_initializeprob = false)
                 # saveat ensures solution is stored at every dt step,
                 # which is required for correct output of observed (auxiliary) variables.
                 solve(prob, solver; dt=dt, saveat=tspan[1]:dt:tspan[2])
             end
+            """)
+
+    def _entrypoint_block(self) -> str:
+        """Generate the top-level calls that run the model and save results.
+
+        Without this block the generated script only defines functions and exits
+        silently when invoked with ``julia model.jl``.
+        """
+        nc_name = f"{self.model_name}_results.nc"
+        return textwrap.dedent(f"""\
+            println("Running model…")
+            sol = run_model()
+            println("Saving results to {nc_name}…")
+            save_results(sol, joinpath(@__DIR__, "{nc_name}"))
+            println("Done.")
             """)
 
     def _save_results_function(self) -> str:
@@ -2866,6 +3173,7 @@ class JuliaSectionBuilder:
             "\n",
             self._run_function(),
             self._save_results_function(),
+            self._entrypoint_block(),
         ])
 
     def _modular_main_content(
@@ -2909,6 +3217,7 @@ class JuliaSectionBuilder:
             "\n",
             self._run_function(),
             self._save_results_function(),
+            self._entrypoint_block(),
         ])
 
 

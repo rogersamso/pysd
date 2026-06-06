@@ -337,6 +337,25 @@ class TestLookupInterpolationCode:
         )
         assert "LinearInterpolation" in const_decl
 
+    def test_linear_interpolation_has_constant_left_extrapolation(self):
+        # MTK evaluates at t=0 during init; data may start at e.g. 2020
+        const_decl, _, _ = lookup_interpolation_code(
+            "lut", (2020.0, 2050.0), (0.0, 1.0), "interpolate"
+        )
+        assert "ExtrapolationType.Constant" in const_decl
+
+    def test_constant_interpolation_has_constant_left_extrapolation(self):
+        const_decl, _, _ = lookup_interpolation_code(
+            "lut", (2020.0, 2050.0), (0.0, 1.0), "hold_forward"
+        )
+        assert "ExtrapolationType.Constant" in const_decl
+
+    def test_extrapolate_type_also_has_constant_extrapolation(self):
+        const_decl, _, _ = lookup_interpolation_code(
+            "lut", (2020.0, 2050.0), (0.0, 1.0), "extrapolate"
+        )
+        assert "ExtrapolationType.Constant" in const_decl
+
 
 # ===========================================================================
 # JuliaASTVisitor
@@ -812,6 +831,77 @@ class TestJuliaModelBuilder:
         content = path.read_text()
         assert "function run_model(" in content
 
+    def test_run_model_skips_initializeprob(self, tmp_path):
+        """ODEProblem must pass build_initializeprob=false to skip MTK's
+        initialization system. Vensim models are pure ODEs with explicit stock
+        initial values — the initialization system causes OOM from symbolic
+        resolution of algebraic loops and large numbers of symbolic u0 entries."""
+        model = self._minimal_model(tmp_path)
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        assert "build_initializeprob = false" in content
+
+    def test_output_contains_entrypoint_invocations(self, tmp_path):
+        """Generated script must actually call run_model() and save_results() so
+        running it with ``julia model.jl`` produces output rather than silently
+        defining functions and exiting."""
+        model = self._minimal_model(tmp_path)
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        # run_model() must be called and result assigned
+        assert "sol = run_model()" in content
+        # save_results must be called with the sol and a .nc path
+        assert "save_results(sol," in content
+        assert ".nc" in content
+
+    def test_u0_param_reference_inlined_to_numeric(self, tmp_path):
+        """A stock whose initial condition is a constant parameter must have
+        the numeric value inlined in u0, not the parameter symbol.
+        MTK's InitializationProblem rejects @parameters symbols as u0 values
+        whether they appear bare or inside expressions."""
+        # constant 'k' = 5.0; stock 's' INTEG(0, k)
+        k_comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=5.0)
+        k_elem = AbstractElement(name="K", components=[k_comp])
+        integ = IntegStructure(
+            flow=0.0, initial=ReferenceStructure("K")
+        )
+        s_comp = AbstractComponent(subscripts=[[], []], ast=integ)
+        s_elem = AbstractElement(name="S", components=[s_comp])
+        # stock 'q' INTEG(0, k * 2.0) — param inside expression
+        flow2 = ArithmeticStructure(
+            operators=["*"],
+            arguments=[ReferenceStructure("K"), 2.0],
+        )
+        integ2 = IntegStructure(
+            flow=0.0,
+            initial=ArithmeticStructure(
+                operators=["*"],
+                arguments=[ReferenceStructure("K"), 2.0],
+            ),
+        )
+        q_comp = AbstractComponent(subscripts=[[], []], ast=integ2)
+        q_elem = AbstractElement(name="Q", components=[q_comp])
+        control_elems = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[k_elem, s_elem, q_elem] + control_elems,
+            path=tmp_path / "param_u0_model.mdl",
+        )
+        model = AbstractModel(
+            original_path=tmp_path / "param_u0_model.mdl",
+            sections=(section,),
+        )
+        content = JuliaModelBuilder(model).build_model().read_text()
+        # bare param reference → inlined
+        assert "s => 5.0" in content
+        assert "s => k" not in content
+        # param inside expression → also inlined
+        assert "k" not in content.split("u0 = [")[1].split("]")[0]
+
     def test_control_vars_emitted(self, tmp_path):
         model = self._minimal_model(tmp_path)
         path = JuliaModelBuilder(model).build_model()
@@ -1128,6 +1218,38 @@ class TestJuliaASTVisitorExtended:
             result = v.visit(node)
         assert result == "0.0"
 
+    def test_sum_subscripted_lookup_call_no_double_comprehension(self):
+        """SUM(f[dim!](t)) where f is a subscripted lookup must produce a single
+        comprehension sum([f(_ii0, t) for _ii0 in 1:N_DIM]), not a nested one.
+
+        Regression for the pymedeas world model: historic_labour_compensation_share
+        was generated as sum([[f(_ii0,t) for _ii0 in 1:N] for _ii0 in 1:N]).
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("historic_labour_compensation")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            subs_sizes={"sectors": 14},
+            var_dims={"historic_labour_compensation": ["sectors"]},
+        )
+        # SUM(historic_labour_compensation[sectors!](Time))
+        node = CallStructure(
+            function=ReferenceStructure("SUM"),
+            arguments=[
+                CallStructure(
+                    function=ReferenceStructure(
+                        "historic_labour_compensation",
+                        subscripts=SubscriptsReferenceStructure(subscripts=("sectors!",)),
+                    ),
+                    arguments=[ReferenceStructure("Time")],
+                )
+            ],
+        )
+        result = v.visit(node)
+        assert result == "sum([historic_labour_compensation(_ii0, t) for _ii0 in 1:N_SECTORS])"
+
 
 # ===========================================================================
 # Section builder — subscript handling
@@ -1262,6 +1384,63 @@ class TestJuliaSectionBuilderInitial:
         sb = _section_builder_from_elements([stock, aux_elem, init_elem])
         sb.build_section()
         assert any("@parameters init_a = 99.0" in d for d in sb.param_decls)
+
+    def test_2d_stock_with_2d_initial_ref_generates_indexed_u0(self):
+        """A 2D stock whose initial condition is a 2D variable reference must
+        produce per-element u0 entries with matching indices, e.g.
+          level[1, 1] => base[1, 1]
+        not the full-array form
+          level[1, 1] => base          ← causes MTK shape-mismatch error
+        """
+        # Build: base[sector, fuel] = 1.0 (constant), level[sector, fuel] integ(0, base)
+        subs_sector = _make_subscript_range("sector", ["s1", "s2"])
+        subs_fuel = _make_subscript_range("fuel", ["f1", "f2", "f3"])
+
+        base_comp = AbstractUnchangeableConstant(
+            subscripts=[["sector", "fuel"], []], ast=1.0
+        )
+        base_elem = AbstractElement(name="Base", components=[base_comp])
+
+        flow_ast = 0.0
+        init_ast = ReferenceStructure("Base", subscripts=(["sector", "fuel"],))
+        integ_ast = IntegStructure(flow=flow_ast, initial=init_ast)
+        level_comp = AbstractComponent(
+            subscripts=[["sector", "fuel"], []], ast=integ_ast
+        )
+        level_elem = AbstractElement(name="Level", components=[level_comp])
+
+        sb = _section_builder_from_elements(
+            [base_elem, level_elem],
+            subscripts=[subs_sector, subs_fuel],
+        )
+        sb.build_section()
+
+        # Every u0 entry must index BOTH dimensions; none should be bare "base"
+        for entry in sb.u0_entries:
+            if entry.startswith("level["):
+                assert "base[" in entry, (
+                    f"u0 entry assigns full 2D array to scalar element: {entry!r}"
+                )
+
+    def test_2d_stock_with_numpy_array_initial_generates_scalar_u0(self):
+        """A 2D stock whose initial condition is a literal numpy array must
+        produce per-element u0 entries with scalar values."""
+        import numpy as np
+        subs_row = _make_subscript_range("row", ["r1", "r2"])
+        subs_col = _make_subscript_range("col", ["c1", "c2"])
+        init_arr = np.array([[1.0, 2.0], [3.0, 4.0]])
+        integ_ast = IntegStructure(flow=0.0, initial=init_arr)
+        comp = AbstractComponent(subscripts=[["row", "col"], []], ast=integ_ast)
+        elem = AbstractElement(name="M", components=[comp])
+        sb = _section_builder_from_elements(
+            [elem],
+            subscripts=[subs_row, subs_col],
+        )
+        sb.build_section()
+        assert "m[1, 1] => 1.0" in sb.u0_entries
+        assert "m[1, 2] => 2.0" in sb.u0_entries
+        assert "m[2, 1] => 3.0" in sb.u0_entries
+        assert "m[2, 2] => 4.0" in sb.u0_entries
 
 
 # ===========================================================================
@@ -2056,6 +2235,361 @@ class TestCoverageGaps:
         result = v.visit(node)
         assert result == "inv(my_matrix, 3)"
 
+    def test_aligned_range_subscript_resolves_to_active_loop_var(self):
+        """When a RHS reference uses an ALIGNED range (same elements as the LHS
+        loop dimension but with a different name), the expression visitor should
+        resolve it to the current loop variable — not drop it.
+
+        Regression for pymedeas world model:
+          ia_matrix[sectors, sectors1] with active_subs {sectors:_i0, sectors1:_i1}
+          RHS: historic_ia_matrix[year2009, sectors_a_matrix, sectors_a_matrix1]
+          Expected: historic_ia_matrix[15, _i0, _i1]
+          Broken:   historic_ia_matrix[15]  (sectors_a_matrix dropped)
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("historic ia matrix")
+        registry = InlineLookupRegistry()
+        needed = set()
+        sector_elems = ["S1", "S2", "S3"]
+        year_elems   = ["y1995", "y1996", "year2009"]
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            active_subs={"sectors": "_i0", "sectors1": "_i1"},
+            var_dims={"historic_ia_matrix": ["economic_years", "sectors_a_matrix", "sectors_a_matrix1"]},
+            subs_sizes={
+                "economic_years":    3,
+                "sectors":           3,
+                "sectors1":          3,
+                "sectors_a_matrix":  3,
+                "sectors_a_matrix1": 3,
+            },
+            subs_elems={
+                "economic_years":    year_elems,
+                "sectors":           sector_elems,
+                "sectors1":          sector_elems,
+                "sectors_a_matrix":  sector_elems,
+                "sectors_a_matrix1": sector_elems,
+            },
+        )
+        # Reference: historic_ia_matrix[year2009, sectors_a_matrix, sectors_a_matrix1]
+        # year2009 is element index 3 in economic_years; sectors_a_matrix → _i0; sectors_a_matrix1 → _i1
+        node = ReferenceStructure(
+            "historic ia matrix",
+            subscripts=SubscriptsReferenceStructure(
+                subscripts=["year2009", "sectors_a_matrix", "sectors_a_matrix1"]
+            ),
+        )
+        result = v.visit(node)
+        # year2009 is the 3rd element of economic_years → index 3
+        # sectors_a_matrix aligns with sectors → _i0
+        # sectors_a_matrix1 aligns with sectors1 → _i1
+        assert "_i0" in result, (
+            f"Expected _i0 in result (sectors_a_matrix alignment), got: {result}"
+        )
+        assert "_i1" in result, (
+            f"Expected _i1 in result (sectors_a_matrix1 alignment), got: {result}"
+        )
+        assert result == "historic_ia_matrix[3, _i0, _i1]", (
+            f"Expected historic_ia_matrix[3, _i0, _i1], got: {result}"
+        )
+
+    def test_get_data_with_explicit_subscripts_uses_call_syntax(self):
+        """GET DATA / LOOKUPS variables referenced with explicit subscripts must
+        use function-call syntax f(idx, t), NOT array-indexing syntax f[idx].
+
+        Regression for pymedeas world model:
+          invest_res_elec[res_elec] ~ ... * invest_cost_res_elec[res_elec]
+        where invest_cost_res_elec IS a GET_DIRECT_DATA lookup.
+        Expected: invest_cost_res_elec(_i0, t)
+        Broken:   invest_cost_res_elec[_i0]   (MethodError at model load)
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("invest cost res elec")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            active_subs={"res_elec": "_i0"},
+            lookup_names={"invest_cost_res_elec"},
+            subs_elems={"res_elec": ["RES1", "RES2", "RES3"]},
+        )
+        node = ReferenceStructure(
+            "invest cost res elec",
+            subscripts=SubscriptsReferenceStructure(subscripts=["res_elec"]),
+        )
+        result = v.visit(node)
+        assert result == "invest_cost_res_elec(_i0, t)", (
+            f"Expected invest_cost_res_elec(_i0, t) (call syntax), got: {result}"
+        )
+        assert "[" not in result, (
+            f"Should not use array indexing [], got: {result}"
+        )
+
+    def test_element_label_resolves_to_subrange_index_not_parent(self):
+        """When an element label is used as an explicit subscript, the 1-based
+        index must come from the variable's OWN dimension, not from a larger
+        parent dimension that also contains the same element.
+
+        Regression for pymedeas world model:
+          final_sources        = [electricity, heat, liquids, gases, solids]  (size 5)
+          matter_final_sources = [liquids, gases, solids]                     (size 3)
+          potential_fe_gen[matter_final_sources]  (declared over sub-range)
+
+          Reference: potential_fe_gen[liquids]
+          Expected:  potential_fe_gen[1]   (index of 'liquids' in matter_final_sources)
+          Broken:    potential_fe_gen[3]   (index of 'liquids' in final_sources, picked
+                                            because final_sources was iterated first in
+                                            _elem_index)
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("potential fe gen")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            var_dims={"potential_fe_gen": ["matter_final_sources"]},
+            subs_elems={
+                # Larger parent range — liquids is at index 3 here
+                "final_sources": ["electricity", "heat", "liquids", "gases", "solids"],
+                # The variable's own range — liquids is at index 1 here
+                "matter_final_sources": ["liquids", "gases", "solids"],
+            },
+        )
+        node = ReferenceStructure(
+            "potential fe gen",
+            subscripts=SubscriptsReferenceStructure(subscripts=["liquids"]),
+        )
+        result = v.visit(node)
+        assert result == "potential_fe_gen[1]", (
+            f"Expected potential_fe_gen[1] (index in matter_final_sources), got: {result}"
+        )
+
+    def test_element_label_with_bang_subscript_uses_dim_index(self):
+        """When a reference has both a literal element-label subscript and a '!'
+        aggregation subscript, the element label must resolve to the index within
+        the variable's OWN declared dimension — and that index must appear in the
+        generated comprehension alongside the aggregation loop variable.
+
+        Regression for pymedeas world model:
+          fuels                        = [electricity, heat, liquids, gases, solids]  (size 5)
+          transport_modes_pkm          = [car, bus, train, air]  (size 4)
+          transport_modes_pkm_commercial = [car, bus, train]     (size 3, sub-range)
+          energy_pkm[fuels, transport_modes_pkm]
+
+          Reference: energy_pkm[liquids, transport_modes_pkm_commercial!]
+            ('liquids' is element 3 of fuels; '!' triggers a sum comprehension)
+          Expected: [energy_pkm[3, _ii0] for _ii0 in 1:N_TRANSPORT_MODES_PKM_COMMERCIAL]
+          Broken:   [energy_pkm[_ii0] for _ii0 in 1:N_TRANSPORT_MODES_PKM_COMMERCIAL]
+                    (fuel index 3 dropped; only the aggregation var is emitted)
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("energy pkm")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            var_dims={"energy_pkm": ["fuels", "transport_modes_pkm"]},
+            subs_sizes={
+                "fuels": 5,
+                "transport_modes_pkm": 4,
+                "transport_modes_pkm_commercial": 3,
+            },
+            subs_elems={
+                "fuels": ["electricity", "heat", "liquids", "gases", "solids"],
+                "transport_modes_pkm": ["car", "bus", "train", "air"],
+                "transport_modes_pkm_commercial": ["car", "bus", "train"],
+            },
+        )
+        node = ReferenceStructure(
+            "energy pkm",
+            subscripts=SubscriptsReferenceStructure(
+                subscripts=["liquids", "transport_modes_pkm_commercial!"]
+            ),
+        )
+        result = v.visit(node)
+        # 'liquids' is the 3rd element of fuels → fixed index 3
+        # 'transport_modes_pkm_commercial!' → loop var _ii0
+        assert "3" in result, (
+            f"Expected fuel index 3 in result, got: {result}"
+        )
+        assert "_ii0" in result, (
+            f"Expected aggregation loop var _ii0 in result, got: {result}"
+        )
+        assert "energy_pkm[3, _ii0]" in result, (
+            f"Expected energy_pkm[3, _ii0] in comprehension, got: {result}"
+        )
+
+    def test_lookup_call_with_explicit_subscripts_resolves_all_indices(self):
+        """Lookup called as function with explicit non-! subscripts must resolve all indices.
+
+        Vensim: Historic_water_use[sectors, water](Time) inside a [sectors, water] loop.
+        Broken: historic_water_use(_i1, t)   ← only water index; sectors index dropped
+                because var_dims uses parent dim 'sectors_and_households' not in active_subs
+        Fixed:  historic_water_use(_i0, _i1, t)  ← both indices from func_node_subs
+
+        The function has declared dims [sectors_and_households, water], active loop has
+        sectors→_i0 and water→_i1.  The func subscripts [sectors, water] directly name
+        the active loop ranges, so both indices must appear.
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("historic water use")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            var_dims={"historic_water_use": ["sectors_and_households", "water"]},
+            subs_sizes={
+                "sectors": 35,
+                "sectors_and_households": 36,
+                "water": 3,
+            },
+            subs_elems={
+                "sectors": [f"sec{i}" for i in range(35)],
+                "sectors_and_households": [f"sec{i}" for i in range(35)] + ["households"],
+                "water": ["blue", "green", "grey"],
+            },
+        )
+        # Simulate active subscript context: looping over [sectors, water]
+        v = v._with_extra_subs({"sectors": "_i0", "water": "_i1"})
+        v.lookup_names = {"historic_water_use"}
+        node = CallStructure(
+            function=ReferenceStructure(
+                "historic water use",
+                subscripts=SubscriptsReferenceStructure(subscripts=["sectors", "water"]),
+            ),
+            arguments=[1.0],
+        )
+        result = v.visit(node)
+        assert "_i0" in result, f"Expected sector index _i0, got: {result}"
+        assert "_i1" in result, f"Expected water index _i1, got: {result}"
+        assert result == "historic_water_use(_i0, _i1, 1.0)", (
+            f"Expected historic_water_use(_i0, _i1, 1.0), got: {result}"
+        )
+
+    def test_lookup_call_with_element_label_subscript_resolves_literal_index(self):
+        """Lookup call with element-label subscript must resolve to a literal index.
+
+        Vensim: Historic_water_use[Households, water](Time) inside a [water] loop.
+        Broken: could give wrong indices or drop the element-label index entirely
+        Fixed:  historic_water_use(36, _i0, t)  ← 36 = index of 'households' in
+                sectors_and_households (1-based), _i0 = active water loop var
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("historic water use")
+        registry = InlineLookupRegistry()
+        needed = set()
+        subs_elems = {
+            "sectors_and_households": [f"sec{i}" for i in range(35)] + ["Households"],
+            "water": ["blue", "green", "grey"],
+        }
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            var_dims={"historic_water_use": ["sectors_and_households", "water"]},
+            subs_sizes={"sectors_and_households": 36, "water": 3},
+            subs_elems=subs_elems,
+        )
+        # _elem_index is built from subs_elems automatically: Households → index 36
+        # Active sub: looping over [water]
+        v = v._with_extra_subs({"water": "_i0"})
+        v.lookup_names = {"historic_water_use"}
+        node = CallStructure(
+            function=ReferenceStructure(
+                "historic water use",
+                subscripts=SubscriptsReferenceStructure(subscripts=["Households", "water"]),
+            ),
+            arguments=[1.0],
+        )
+        result = v.visit(node)
+        assert "36" in result, f"Expected literal index 36 for Households, got: {result}"
+        assert "_i0" in result, f"Expected water index _i0, got: {result}"
+
+    def test_ifelse_bare_reference_condition_wrapped_with_ne_zero(self):
+        """IF THEN ELSE with a bare variable as condition must emit `!= 0`.
+
+        Vensim: IF THEN ELSE(activate_elf, then_expr, 0)
+        Broken: ifelse(activate_elf, then_expr, 0.0)
+                → ArgumentError: Condition of `ifelse` must be a `Bool`
+        Fixed:  ifelse(activate_elf != 0, then_expr, 0.0)
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("activate elf")
+        ns.add_to_namespace("x")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(ns, registry, needed)
+        node = CallStructure(
+            function=ReferenceStructure("IF THEN ELSE"),
+            arguments=[
+                ReferenceStructure("activate elf"),
+                ReferenceStructure("x"),
+                0.0,
+            ],
+        )
+        result = v.visit(node)
+        assert "!= 0" in result, (
+            f"Expected '!= 0' in ifelse condition for bare reference, got: {result}"
+        )
+        assert result.startswith("ifelse("), f"Expected ifelse call, got: {result}"
+
+    def test_ifelse_logic_condition_not_double_wrapped(self):
+        """IF THEN ELSE with a comparison condition must NOT add != 0.
+
+        Vensim: IF THEN ELSE(t < 2015, then_expr, 0)
+        Expected: ifelse((t < 2015.0), then_expr, 0.0)
+        Must NOT become: ifelse((t < 2015.0) != 0, then_expr, 0.0)
+        """
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("t")
+        ns.add_to_namespace("x")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(ns, registry, needed)
+        node = CallStructure(
+            function=ReferenceStructure("IF THEN ELSE"),
+            arguments=[
+                LogicStructure(operators=["<"], arguments=[ReferenceStructure("t"), 2015.0]),
+                ReferenceStructure("x"),
+                0.0,
+            ],
+        )
+        result = v.visit(node)
+        assert "!= 0" not in result, (
+            f"Expected no '!= 0' for comparison condition, got: {result}"
+        )
+        assert "< 2015.0" in result, f"Expected '< 2015.0' in result, got: {result}"
+
+    def test_subscripted_aux_literal_array_generates_per_element_equations(self):
+        """A subscripted auxiliary whose AST is a literal numpy array must NOT
+        produce a comprehension that puts the full vector on each scalar LHS.
+
+        Vensim:  res_elec_variables[RES_elec] = 0, 0, 0, 0, 1, 1, 1, 1
+
+        Broken:  [res_elec_variables[_i0] ~ [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+                  for _i0 in 1:N_RES_ELEC]...
+                  → MTK ArgumentError: Cannot add arguments of different sizes
+                    shapes [1:8] and []
+
+        Fixed:   res_elec_variables[1] ~ 0.0,
+                 res_elec_variables[2] ~ 0.0,
+                 ...
+                 res_elec_variables[8] ~ 1.0,
+        """
+        import numpy as np
+        sr = _make_subscript_range("res_elec", ["w", "x", "y", "z"])
+        arr = np.array([0.0, 0.0, 1.0, 1.0])
+        elem = _make_subscripted_element("res elec variables", arr, "res_elec")
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        eqs = [e for eqlist, _ in sb.built_elements.values() for e in eqlist]
+        joined = "\n".join(eqs)
+        # Must NOT put the full array on the RHS of each element
+        assert "[0.0, 0.0, 1.0, 1.0]" not in joined, (
+            f"Full array must not appear as RHS in equations: {joined}"
+        )
+        # Must generate per-element equations
+        assert "res_elec_variables[1] ~" in joined, f"Missing element 1 eq: {joined}"
+        assert "res_elec_variables[4] ~" in joined, f"Missing element 4 eq: {joined}"
+
     # --- julia_model_builder.py ---
 
     def test_inline_lookup_registered_after_build(self, tmp_path):
@@ -2460,6 +2994,71 @@ class TestCoverageGaps:
         assert any("policy_share" in d for d in all_decls)
         combined = next(d for d in all_decls if "policy_share" in d)
         assert "0.3" in combined
+
+    def test_read_get_constants_piecewise_2d(self, mocker, tmp_path):
+        """Piecewise 2D constant: one GCS component covering a sub-range of the
+        first dimension + one literal-0 component covering the complement.
+
+        Regression for pymedeas world model:
+          materials_for_o_m_per_capacity_installed_res_elec[RES_ELEC, materials]
+            - [RES_ELEC_DISPATCHABLE, materials] = 0  (literal, 4 elements)
+            - [RES_ELEC_VARIABLE, materials]    = GCS (4 elements from Excel)
+
+        The piecewise assembly must produce a 2D Julia matrix (shape 4×2 in the
+        test), NOT a flat 1D vector of 4+2=6 zeros.
+
+        Broken: const v = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   (1D, 6 elements)
+        Fixed:  const v = [0.0 0.0; 0.0 0.0; 1.0 2.0; 3.0 4.0]  (2D, 4×2)
+        """
+        import numpy as np
+        import xarray as xr
+        import warnings
+
+        # Subscript ranges
+        sr_a      = _make_subscript_range("dim_a",      ["a1", "a2", "a3", "a4"])
+        sr_a_first = _make_subscript_range("dim_a_first", ["a1", "a2"])
+        sr_a_rest  = _make_subscript_range("dim_a_rest",  ["a3", "a4"])
+        sr_b      = _make_subscript_range("dim_b",      ["b1", "b2"])
+
+        # GCS mock: returns 2×2 DataArray for [dim_a_rest, dim_b]
+        mock_ext = mocker.MagicMock()
+        da = xr.DataArray(
+            np.array([[1.0, 2.0], [3.0, 4.0]]),
+            coords={"dim_a_rest": ["a3", "a4"], "dim_b": ["b1", "b2"]},
+            dims=["dim_a_rest", "dim_b"],
+        )
+        mock_ext.data = da
+        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+
+        ast_gcs  = GetConstantsStructure(file="d.xlsx", tab="S", cell="r1")
+        comp_gcs = AbstractComponent(
+            subscripts=[["dim_a_rest", "dim_b"], []], ast=ast_gcs
+        )
+        comp_lit = AbstractComponent(
+            subscripts=[["dim_a_first", "dim_b"], []], ast=0
+        )
+        elem = AbstractElement(name="V", components=[comp_lit, comp_gcs])
+        sb = _section_builder_from_elements(
+            [elem], path=tmp_path / "m.mdl",
+            subscripts=[sr_a, sr_a_first, sr_a_rest, sr_b],
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            sb.build_section()
+
+        assert not [x for x in w if "Could not read" in str(x.message)]
+        all_decls = sb.ext_const_decls + sb.param_decls
+        combined = next((d for d in all_decls if "const v = " in d), None)
+        assert combined is not None, f"Expected 'const v' in decls, got: {all_decls}"
+
+        # Must be a 2D matrix (contains ';' row separator), NOT a 1D flat vector
+        assert ";" in combined, (
+            f"Expected a 2D matrix (with ';') in declaration, got: {combined}"
+        )
+        # GCS values must appear
+        assert "1.0" in combined and "4.0" in combined, (
+            f"GCS values 1.0 and 4.0 should appear in constant, got: {combined}"
+        )
 
     def test_initial_from_get_constants_exception(self, mocker, tmp_path):
         """INITIAL(GetConstantsStructure) exception → _resolve_initial_value returns None
@@ -3025,7 +3624,7 @@ class TestVariableLimits:
         )
         comment = JuliaSectionBuilder._limits_comment(elem)
         assert "0.0" in comment and "1.0" in comment
-        assert comment.startswith("  # limits:")
+        assert comment.startswith("  #= limits:")
 
     def test_limits_comment_lower_only(self):
         elem = AbstractElement(
@@ -3050,7 +3649,7 @@ class TestVariableLimits:
         elem = AbstractElement(name="Birth Rate", components=[comp], limits=(0.0, 1.0))
         sb = _section_builder_from_elements([elem])
         sb.build_section()
-        assert any("# limits:" in d for d in sb.param_decls)
+        assert any("#= limits:" in d for d in sb.param_decls)
 
     def test_limits_appear_in_aux_equation(self):
         comp = AbstractComponent(subscripts=[[], []], ast=2.5)
@@ -3058,7 +3657,7 @@ class TestVariableLimits:
         sb = _section_builder_from_elements([elem])
         sb.build_section()
         eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("# limits:" in e for e in eqs)
+        assert any("#= limits:" in e for e in eqs)
 
     def test_limits_in_full_generated_file(self, tmp_path):
         comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=0.5)
@@ -3075,7 +3674,7 @@ class TestVariableLimits:
         model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
         path = JuliaModelBuilder(model).build_model()
         content = path.read_text()
-        assert "# limits:" in content
+        assert "#= limits:" in content
 
     def test_limits_stored_in_json(self, tmp_path):
         import json
@@ -3220,6 +3819,65 @@ class TestExceptSubscriptExclusion:
         assert comp1_eqs, "comp1 formula must appear in some equation"
         assert all("in [2]" in e or "_i0, 2]" in e for e in comp1_eqs), (
             f"comp1's formula must only cover row 2 (B); got: {comp1_eqs}"
+        )
+
+    def test_subrange_component_uses_subrange_index_on_rhs(self):
+        """When a component covers a sub-range of the LHS dimension, RHS
+        references to variables subscripted over that sub-range must use
+        the 1-based index WITHIN the sub-range, not the parent dimension index.
+
+        Regression for pymedeas world model:
+          SECTORS_AND_HOUSEHOLDS = [H, A, B]  (parent dim, size 3)
+          sectors                = [A, B]     (sub-range, size 2)
+          my_var[sectors_and_households];  component: my_var[sectors] = other_var[sectors]
+        Expected: my_var[2] ~ other_var[1],  my_var[3] ~ other_var[2]
+        Broken:   my_var[2] ~ other_var[2],  my_var[3] ~ other_var[3] (OOB!)
+        """
+        sr_parent = _make_subscript_range("sectors_and_households", ["H", "A", "B"])
+        sr_sub    = _make_subscript_range("sectors", ["A", "B"])
+
+        # other_var[sectors] — simple auxiliary subscripted over the sub-range
+        other_comp = AbstractComponent(
+            subscripts=[["sectors"], []],
+            ast=1.0,
+        )
+        other_elem = AbstractElement(name="other var", components=[other_comp])
+
+        # my_var[sectors_and_households] with two components:
+        #   comp1: my_var[sectors] = other_var[sectors]
+        #   comp2: my_var[H]       = 0.0
+        # Having both forces _element_dims to infer sectors_and_households as parent.
+        my_comp_sectors = AbstractComponent(
+            subscripts=[["sectors"], []],
+            ast=ReferenceStructure("other var"),
+        )
+        my_comp_h = AbstractComponent(
+            subscripts=[["H"], []],
+            ast=0.0,
+        )
+        my_elem = AbstractElement(name="my var", components=[my_comp_sectors, my_comp_h])
+
+        sb = _section_builder_from_elements(
+            [other_elem, my_elem],
+            subscripts=[sr_parent, sr_sub],
+        )
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+
+        my_var_eqs = [e for e in eqs if e.startswith("my_var[")]
+        # 3 equations: sectors components (A→index 2, B→index 3) + H component (index 1)
+        assert len(my_var_eqs) == 3, f"expected 3 my_var equations, got: {my_var_eqs}"
+        # A at parent index 2 → sub-range index 1 in sectors
+        assert any("my_var[2] ~ other_var[1]" in e for e in my_var_eqs), (
+            f"my_var[2] should reference other_var[1]; got: {my_var_eqs}"
+        )
+        # B at parent index 3 → sub-range index 2 in sectors
+        assert any("my_var[3] ~ other_var[2]" in e for e in my_var_eqs), (
+            f"my_var[3] should reference other_var[2]; got: {my_var_eqs}"
+        )
+        # H at parent index 1 uses the constant formula
+        assert any("my_var[1] ~ 0.0" in e for e in my_var_eqs), (
+            f"my_var[1] should be 0.0; got: {my_var_eqs}"
         )
 
 
@@ -3474,3 +4132,145 @@ class TestMdlFileTranslation:
             jl_path = translate_to_julia(dst, data_format="json")
         json_path = jl_path.with_name(f"{jl_path.stem}_data.json")
         assert json_path.exists()
+
+
+# ===========================================================================
+# Phase 3F — INVERT_MATRIX support
+# ===========================================================================
+
+class TestInvertMatrix:
+    """INVERT_MATRIX must generate Symbolics.scalarize matrix-level equations,
+    not element-wise inv(scalar, n) calls which are invalid in Julia.
+
+    Regression for MethodError: no method matching inv(::Num, ::Int64)
+    """
+
+    def _make_mat_elem(self, lhs_name, mat_ref_name, dims_2d, n_size):
+        """Helper: element(lhs_name) = INVERT_MATRIX(mat_ref_name[dims...], n)"""
+        mat_ast = CallStructure(
+            function=ReferenceStructure(reference="invert_matrix"),
+            arguments=(
+                ReferenceStructure(
+                    reference=mat_ref_name,
+                    subscripts=SubscriptsReferenceStructure(subscripts=dims_2d),
+                ),
+                n_size,
+            ),
+        )
+        comp = AbstractComponent(subscripts=[dims_2d, []], ast=mat_ast)
+        return AbstractElement(name=lhs_name, components=[comp])
+
+    def test_2d_invert_matrix_generates_scalarize(self):
+        """2D case: matrix1i[d,d1] = INVERT_MATRIX(matrix_1[d,d1], 2)
+        should produce:  Symbolics.scalarize(matrix1i .~ inv(matrix_1))...
+        NOT element-wise: [matrix1i[_i0,_i1] ~ inv(matrix_1[_i0,_i1], 2) ...]
+        """
+        sr_d  = _make_subscript_range("d",  ["A", "B"])
+        sr_d1 = _make_subscript_range("d1", ["A", "B"])
+
+        mat_comp = AbstractComponent(subscripts=[["d", "d1"], []], ast=0.0)
+        mat_elem = AbstractElement(name="matrix 1", components=[mat_comp])
+
+        inv_elem = self._make_mat_elem("matrix1i", "matrix_1", ["d", "d1"], 2)
+
+        sb = _section_builder_from_elements(
+            [mat_elem, inv_elem],
+            subscripts=[sr_d, sr_d1],
+        )
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        inv_eqs = [e for e in eqs if "matrix1i" in e]
+
+        assert len(inv_eqs) == 1, f"expected 1 equation, got: {inv_eqs}"
+        eq = inv_eqs[0]
+        # Should use the registered helper function
+        assert "_inv_mat2d_elem" in eq, (
+            f"Expected _inv_mat2d_elem helper in equation, got: {eq}"
+        )
+        assert "matrix_1" in eq, (
+            f"Expected matrix_1 argument, got: {eq}"
+        )
+        # Must NOT contain the broken scalar inv with size argument
+        assert "inv(matrix_1[_i0, _i1], 2" not in eq, (
+            f"Should not contain element-wise inv with size arg, got: {eq}"
+        )
+        # Must NOT use slice indexing (:)
+        assert ":, :" not in eq, (
+            f"Should not use slice indexing :, :, got: {eq}"
+        )
+
+    def test_3d_invert_matrix_generates_batch_scalarize(self):
+        """3D case: matrix3i[d,dim1,dim2] = INVERT_MATRIX(matrix_3[d,dim1,dim2], 3)
+        should produce:
+          [Symbolics.scalarize(matrix3i[_i0, :, :] .~ inv(matrix_3[_i0, :, :]))...
+           for _i0 in 1:N_D]...
+        NOT element-wise: [matrix3i[_i0,_i1,_i2] ~ inv(matrix_3[_i0,_i1,_i2], 3) ...]
+        """
+        sr_d    = _make_subscript_range("d",    ["A", "B"])
+        sr_dim1 = _make_subscript_range("dim1", ["h", "m", "l"])
+        sr_dim2 = _make_subscript_range("dim2", ["h", "m", "l"])
+
+        mat_comp = AbstractComponent(subscripts=[["d", "dim1", "dim2"], []], ast=0.0)
+        mat_elem = AbstractElement(name="matrix 3", components=[mat_comp])
+
+        inv_elem = self._make_mat_elem(
+            "matrix3i", "matrix_3", ["d", "dim1", "dim2"], 3
+        )
+
+        sb = _section_builder_from_elements(
+            [mat_elem, inv_elem],
+            subscripts=[sr_d, sr_dim1, sr_dim2],
+        )
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        inv_eqs = [e for e in eqs if "matrix3i" in e]
+
+        assert len(inv_eqs) == 1, f"expected 1 equation, got: {inv_eqs}"
+        eq = inv_eqs[0]
+        # Should use the 3D registered helper function
+        assert "_inv_mat3d_elem" in eq, (
+            f"Expected _inv_mat3d_elem helper in equation, got: {eq}"
+        )
+        assert "matrix_3" in eq, (
+            f"Expected matrix_3 argument in equation, got: {eq}"
+        )
+        # Must NOT use slice indexing (:)
+        assert ":, :" not in eq, (
+            f"Should not use slice indexing :, :, got: {eq}"
+        )
+        # Must NOT contain the broken element-wise pattern
+        assert "inv(matrix_3[_i0, _i1, _i2]" not in eq, (
+            f"Should not contain element-wise scalar inv call, got: {eq}"
+        )
+
+    def test_invert_matrix_translation_from_mdl(self, tmp_path):
+        """Full pipeline: translate test_invert_matrix.mdl and check output."""
+        import shutil
+        mdl = Path("tests/test-models/tests/invert_matrix/test_invert_matrix.mdl")
+        if not mdl.exists():
+            pytest.skip("invert_matrix test model not found")
+        shutil.copy(mdl, tmp_path / mdl.name)
+        from pysd import translate_to_julia
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            jl_path = translate_to_julia(tmp_path / mdl.name)
+        content = jl_path.read_text()
+        # No broken element-wise inv with size argument
+        assert "inv(matrix_1[_i0, _i1], 2" not in content, (
+            "Found broken element-wise inv(matrix_1[...], n) in generated code"
+        )
+        assert "inv(matrix_3[_i0, _i1, _i2]" not in content, (
+            "Found broken element-wise inv(matrix_3[...]) in generated code"
+        )
+        # Should use registered helper functions
+        assert "_inv_mat2d_elem" in content, (
+            "Expected _inv_mat2d_elem helper in generated code"
+        )
+        assert "_inv_mat3d_elem" in content, (
+            "Expected _inv_mat3d_elem helper in generated code"
+        )
+        # Should not pass size argument to inv
+        assert ", 2.0)" not in content and ", 3.0)" not in content, (
+            "inv() should not receive a size argument in generated code"
+        )
