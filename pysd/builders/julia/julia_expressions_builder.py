@@ -77,11 +77,17 @@ BUILTIN_FUNCTIONS: dict = {
     "ARCSIN": "asin",
     "ARCCOS": "acos",
     "ARCTAN": "atan",
+    "SINH": "sinh",
+    "COSH": "cosh",
+    "TANH": "tanh",
     "INTEGER": "_trunc",
     "INT": "_trunc",
+    "POWER": "_power",
     "MIN": "min",
     "MAX": "max",
     "MODULO": "mod",
+    "QUANTUM": "_quantum",
+    "PI": "_pi",
     # Control flow — parser stores as "if_then_else" (underscores)
     "IF THEN ELSE": "ifelse",
     "IF_THEN_ELSE": "ifelse",
@@ -108,6 +114,31 @@ BUILTIN_FUNCTIONS: dict = {
     "STEP": "_step",
     "WITH LOOKUP": "_with_lookup",
     "WITH_LOOKUP": "_with_lookup",
+    # XMILE pulse/ramp variants
+    "XPULSE": "_xpulse",
+    "XPULSE_TRAIN": "_xpulse_train",
+    "XRAMP": "_xramp",
+    # Random functions
+    "RANDOM 0 1": "_random_0_1",
+    "RANDOM_0_1": "_random_0_1",
+    "RANDOM UNIFORM": "_random_uniform",
+    "RANDOM_UNIFORM": "_random_uniform",
+    "RANDOM NORMAL": "_random_normal",
+    "RANDOM_NORMAL": "_random_normal",
+    "RANDOM EXPONENTIAL": "_random_exponential",
+    "RANDOM_EXPONENTIAL": "_random_exponential",
+    # Vector operations
+    "VECTOR SELECT": "_vector_select",
+    "VECTOR_SELECT": "_vector_select",
+    "VECTOR SORT ORDER": "_vector_sort_order",
+    "VECTOR_SORT_ORDER": "_vector_sort_order",
+    "VECTOR REORDER": "_vector_reorder",
+    "VECTOR_REORDER": "_vector_reorder",
+    "VECTOR RANK": "_vector_rank",
+    "VECTOR_RANK": "_vector_rank",
+    # Time value
+    "GET TIME VALUE": "_get_time_value",
+    "GET_TIME_VALUE": "_get_time_value",
 }
 
 # One-line Julia implementations for helper functions.
@@ -163,10 +194,84 @@ HELPER_IMPLEMENTATIONS: dict = {
         "end\n"
         "@register_symbolic _inv_mat3d_elem(mat::AbstractArray, b::Int, i::Int, j::Int)"
     ),
+    "_power": "_power(x, y) = x ^ y\n@register_symbolic _power(x::Real, y::Real)",
+    "_quantum": (
+        "_quantum(a, b) = ifelse(b < 1e-6, float(a), b * _trunc(a / b))\n"
+        "@register_symbolic _quantum(a::Real, b::Real)"
+    ),
+    "_pi": "_pi() = Base.MathConstants.pi",
+    # XMILE variants: Xpulse has (start, magnitude), Xramp has (slope, start)
+    "_xpulse": (
+        "_xpulse(t_now, start, magnitude) = "
+        "ifelse((t_now >= start) & (t_now < start + magnitude), magnitude, 0.0)"
+    ),
+    "_xpulse_train": (
+        "_xpulse_train(t_now, start, interval, magnitude) = "
+        "ifelse((t_now >= start) & "
+        "(mod(t_now - start, interval) < magnitude), magnitude, 0.0)"
+    ),
+    "_xramp": (
+        "_xramp(t_now, slope, start_time) = "
+        "slope * max(0.0, t_now - start_time)"
+    ),
+    # Random functions — opaque wrappers so MTK calls them at every timestep
+    "_random_0_1": (
+        "_random_0_1() = Base.rand()\n"
+        "@register_symbolic _random_0_1()"
+    ),
+    "_random_uniform": (
+        "_random_uniform(lo, hi, _seed) = lo + (hi - lo) * Base.rand()\n"
+        "@register_symbolic _random_uniform(lo::Real, hi::Real, _seed::Real)"
+    ),
+    "_random_normal": (
+        "function _random_normal(lo, hi, mean, std, _seed)\n"
+        "    x = mean + std * Base.randn()\n"
+        "    return clamp(x, lo, hi)\n"
+        "end\n"
+        "@register_symbolic _random_normal(lo::Real, hi::Real, mean::Real, std::Real, _seed::Real)"
+    ),
+    "_random_exponential": (
+        "function _random_exponential(lo, hi, mean, _seed)\n"
+        "    x = lo + mean * Base.randexp()\n"
+        "    return clamp(x, lo, hi)\n"
+        "end\n"
+        "@register_symbolic _random_exponential(lo::Real, hi::Real, mean::Real, _seed::Real)"
+    ),
+    # Vector operations
+    "_vector_select": (
+        "function _vector_select(sel_vec, expr_vec, miss_val, action)\n"
+        "    selected = [expr_vec[i] for i in eachindex(sel_vec) if sel_vec[i] != 0]\n"
+        "    isempty(selected) && return miss_val\n"
+        "    action == 0 && return selected[1]\n"
+        "    action == 1 && return sum(selected)\n"
+        "    action == 2 && return maximum(selected)\n"
+        "    action == 3 && return minimum(selected)\n"
+        "    action == 4 && return sum(selected) / length(selected)\n"
+        "    return miss_val\n"
+        "end"
+    ),
+    "_vector_sort_order": (
+        "_vector_sort_order(vec, dir) = "
+        "Float64.(ifelse(dir > 0, sortperm(vec), sortperm(vec, rev=true)))"
+    ),
+    "_vector_reorder": (
+        "_vector_reorder(vec, order) = vec[Int.(order)]"
+    ),
+    "_vector_rank": (
+        "_vector_rank(vec, dir) = "
+        "Float64.(invperm(ifelse(dir > 0, sortperm(vec), sortperm(vec, rev=true))))"
+    ),
+    "_get_time_value": (
+        "_get_time_value(t_now, lookup_fn, lo, hi) = "
+        "lookup_fn(clamp(t_now, lo, hi))"
+    ),
 }
 
 # Helper functions that receive the current time *t* as their first argument
-_TIME_HELPERS: frozenset = frozenset({"_pulse", "_pulse_train", "_ramp", "_step"})
+_TIME_HELPERS: frozenset = frozenset({
+    "_pulse", "_pulse_train", "_ramp", "_step",
+    "_xpulse", "_xpulse_train", "_xramp", "_get_time_value",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -1002,6 +1107,8 @@ class JuliaASTVisitor:
 
         if julia_func in HELPER_IMPLEMENTATIONS:
             self.needed_helpers.add(julia_func)
+            if julia_func == "_quantum":
+                self.needed_helpers.add("_trunc")
 
         # sum/prod/vmax/vmin with ! subscripts: generate ONE comprehension that
         # covers ALL references sharing the same ! dim, rather than separate

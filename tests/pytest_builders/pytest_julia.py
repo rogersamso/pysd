@@ -553,6 +553,103 @@ class TestJuliaASTVisitor:
         result = v.visit(node)
         assert result.startswith("_ramp(t,")
 
+    # --- newly added functions -----------------------------------------------
+
+    def test_power_maps_to_helper(self):
+        v, _, _, needed = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="power"),
+            arguments=(2.0, 3.0),
+        )
+        result = v.visit(node)
+        assert "_power" in result
+        assert "_power" in needed
+
+    def test_sinh_maps_directly(self):
+        v, *_ = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="sinh"),
+            arguments=(1.0,),
+        )
+        result = v.visit(node)
+        assert result == "sinh(1.0)"
+
+    def test_cosh_maps_directly(self):
+        v, *_ = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="cosh"),
+            arguments=(1.0,),
+        )
+        result = v.visit(node)
+        assert result == "cosh(1.0)"
+
+    def test_tanh_maps_directly(self):
+        v, *_ = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="tanh"),
+            arguments=(1.0,),
+        )
+        result = v.visit(node)
+        assert result == "tanh(1.0)"
+
+    def test_quantum_pulls_in_trunc(self):
+        v, _, _, needed = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="quantum"),
+            arguments=(10.0, 3.0),
+        )
+        result = v.visit(node)
+        assert "_quantum" in result
+        assert "_quantum" in needed
+        assert "_trunc" in needed
+
+    def test_random_uniform_registered(self):
+        v, _, _, needed = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="random_uniform"),
+            arguments=(0.0, 1.0, 42.0),
+        )
+        result = v.visit(node)
+        assert "_random_uniform" in result
+        assert "_random_uniform" in needed
+
+    def test_vector_sort_order_registered(self):
+        v, _, _, needed = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="vector_sort_order"),
+            arguments=(1.0, 1.0),
+        )
+        result = v.visit(node)
+        assert "_vector_sort_order" in result
+        assert "_vector_sort_order" in needed
+
+    def test_get_time_value_prepends_t(self):
+        v, *_ = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="get_time_value"),
+            arguments=(1.0, 2.0, 3.0),
+        )
+        result = v.visit(node)
+        assert result.startswith("_get_time_value(t,")
+
+    def test_xpulse_prepends_t(self):
+        v, *_ = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="Xpulse"),
+            arguments=(10.0, 5.0),
+        )
+        result = v.visit(node)
+        assert result.startswith("_xpulse(t,")
+
+    def test_xramp_prepends_t(self):
+        v, *_ = _visitor_with_namespace()
+        node = CallStructure(
+            function=ReferenceStructure(reference="Xramp"),
+            arguments=(0.5, 10.0),
+        )
+        result = v.visit(node)
+        assert result.startswith("_xramp(t,")
+
     # --- InitialStructure / GameStructure -----------------------------------
 
     def test_initial_structure_returns_inner(self):
