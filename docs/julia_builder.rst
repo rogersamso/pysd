@@ -45,8 +45,11 @@ Install the required Julia packages once::
        "ModelingToolkit",   # only needed for the mtk backend
    ])'
 
-Then install the ``PySD.jl`` companion library from your PySD checkout::
+Then install the ``PySD.jl`` companion library. It lives in a submodule of
+the PySD repo (``pysd/builders/julia/PySD.jl/``) and can also be found at
+https://github.com/rogersamso/PySD.jl.  From the root of your PySD checkout::
 
+   git submodule update --init pysd/builders/julia/PySD.jl
    julia -e 'using Pkg; Pkg.develop(path="pysd/builders/julia/PySD.jl")'
 
 
