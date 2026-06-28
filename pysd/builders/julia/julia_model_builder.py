@@ -101,14 +101,19 @@ class JuliaModelBuilder:
         self,
         abstract_model: AbstractModel,
         data_format: str = "hardcoded",
+        backend: str = "ode",
     ) -> None:
         if data_format not in ("hardcoded", "json"):
             raise ValueError(
                 f"data_format must be 'hardcoded' or 'json', got {data_format!r}"
             )
+        if backend not in ("ode", "mtk"):
+            raise ValueError(
+                f"backend must be 'ode' or 'mtk', got {backend!r}"
+            )
         self.original_path = abstract_model.original_path
         self.sections = [
-            JuliaSectionBuilder(section, data_format=data_format)
+            JuliaSectionBuilder(section, data_format=data_format, backend=backend)
             for section in abstract_model.sections
         ]
 
@@ -144,7 +149,9 @@ class JuliaSectionBuilder:
         self,
         abstract_section: AbstractSection,
         data_format: str = "hardcoded",
+        backend: str = "ode",
     ) -> None:
+        self.backend: str = backend
         self.name: str = abstract_section.name
         self.path: Path = abstract_section.path.with_suffix(".jl")
         self.root: Path = self.path.parent
@@ -188,6 +195,7 @@ class JuliaSectionBuilder:
         self.lookup_const_decls: List[str] = []
         self.lookup_func_decls: List[str] = []
         self.lookup_register_decls: List[str] = []
+        self.lookup_identifiers: Set[str] = set()
         self.subs_const_decls: List[str] = []
         self.u0_entries: List[str] = []
         # Map julia identifier -> list of dim names (for subscripted vars)
@@ -896,7 +904,14 @@ class JuliaSectionBuilder:
                     return []
                 if self.data_format == "json":
                     self._json_accumulate_constant(elem, identifier, julia_val)
-                if julia_val.startswith("[") or julia_val.startswith("reshape("):
+                has_subs = any(
+                    bool(self._comp_coords(c)) for c in elem.components
+                )
+                if (has_subs
+                    or julia_val.startswith("[")
+                    or julia_val.startswith("reshape(")
+                    or julia_val.startswith("vcat(")
+                    or "pysd_xlsx_read_constant" in julia_val and "[" in julia_val):
                     self.ext_const_decls.append(f"const {identifier} = {julia_val}")
                 else:
                     self.param_decls.append(f"@parameters {identifier} = {julia_val}")
@@ -1114,21 +1129,21 @@ class JuliaSectionBuilder:
 
         ndim = len(dims)
         if ndim == 2:
-            self.needed_helpers.add("_inv_mat2d_elem")
+            self.needed_helpers.add("pysd_inv_mat2d_elem")
             return [
-                f"[{identifier}[_i1, _i2] ~ _inv_mat2d_elem({mat_name}, _i1, _i2) "
+                f"[{identifier}[_i1, _i2] ~ pysd_inv_mat2d_elem({mat_name}, _i1, _i2) "
                 f"for _i1 in 1:{n1}, _i2 in 1:{n2}]..."
             ]
 
         # ndim >= 3: first N-2 dims are batch dims.
-        self.needed_helpers.add("_inv_mat3d_elem")
+        self.needed_helpers.add("pysd_inv_mat3d_elem")
         batch_dims = dims[:-2]
         batch_idx_vars = [f"_ib{k}" for k in range(len(batch_dims))]
         batch_idx = ", ".join(batch_idx_vars)
         all_idx = ", ".join(batch_idx_vars + ["_i1", "_i2"])
         batch_for = self._for_clause(batch_dims, batch_idx_vars)
         return [
-            f"[{identifier}[{all_idx}] ~ _inv_mat3d_elem({mat_name}, {batch_idx}, _i1, _i2) "
+            f"[{identifier}[{all_idx}] ~ pysd_inv_mat3d_elem({mat_name}, {batch_idx}, _i1, _i2) "
             f"for {batch_for}, _i1 in 1:{n1}, _i2 in 1:{n2}]..."
         ]
 
@@ -1786,7 +1801,7 @@ class JuliaSectionBuilder:
                 f"@variables {identifier}(t)[{self._range_str(dims)}]"
             )
             return [
-                f"[D({st_name}[{idx_str_t}]) ~ ifelse({condition_nd} > 0.5, "
+                f"[D({st_name}[{idx_str_t}]) ~ pysd_ifelse({condition_nd} > 0.5, "
                 f"({input_nd} - {st_name}[{idx_str_t}]) / ({ts_expr}), 0.0) "
                 f"for {for_clause}]...",
                 f"[{identifier}[{idx_str_t}] ~ {st_name}[{idx_str_t}] for {for_clause}]...",
@@ -1799,7 +1814,7 @@ class JuliaSectionBuilder:
         self.u0_entries.append(f"{st_name} => {initial_expr}")
         self.aux_decls.append(f"@variables {identifier}(t)")
         return [
-            f"D({st_name}) ~ ifelse({condition_expr} > 0.5, "
+            f"D({st_name}) ~ pysd_ifelse({condition_expr} > 0.5, "
             f"({input_expr} - {st_name}) / ({ts_expr}), 0.0)",
             f"{identifier} ~ {st_name}",
         ]
@@ -1859,20 +1874,101 @@ class JuliaSectionBuilder:
     def _process_get_lookups(
         self, elem: "AbstractElement", identifier: str
     ) -> List[str]:
-        """Read external lookup data and emit a named interpolation function.
+        """Emit a named interpolation function for external lookup data.
 
-        Uses ``ExtLookup`` to load the table at translation time, then
-        emits the same ``LinearInterpolation`` pattern as inline lookups.
-        Supports scalar (1D), 1-subscript (2D), and 2-subscript (3D) lookup
-        arrays.  For multi-component elements where each component covers one
-        element of a subscript range, split-range detection is used to resolve
-        parent-range ambiguity before delegating to ExtLookup.
+        For single-component (scalar) lookups, emits a runtime
+        ``pysd_xlsx_read_series`` call so the Excel file is read when the
+        Julia model loads.  Multi-component (subscripted) lookups fall back
+        to reading at translation time via ``ExtLookup``.
         """
+        comp0 = elem.components[0]
+        ast0 = comp0.ast
+
+        # ---- Single-component scalar: emit runtime Excel read ----
+        if self.data_format != "json" and len(elem.components) == 1 and not self._comp_coords(comp0):
+            file_expr = f'joinpath(@__DIR__, "{ast0.file}")'
+            series_call = (
+                f'pysd_xlsx_read_series({file_expr}, '
+                f'"{ast0.tab}", "{ast0.x_row_or_col}", "{ast0.cell}")'
+            )
+            itp_name = f"{identifier}_itp"
+            const_decl = (
+                f"const {itp_name} = let (_xs, _ys) = {series_call}\n"
+                f"    LinearInterpolation(_ys, _xs; "
+                f"extrapolation_left=ExtrapolationType.Constant, "
+                f"extrapolation_right=ExtrapolationType.Constant)\nend"
+            )
+            func_decl = f"{identifier}(x) = {itp_name}(x)"
+            reg_decl = f"@register_symbolic {identifier}(x::Real)"
+            self.lookup_const_decls.append(const_decl)
+            self.lookup_func_decls.append(func_decl)
+            self.lookup_register_decls.append(reg_decl)
+            self.lookup_identifiers.add(identifier)
+            return []
+
+        # ---- Single-component subscripted: runtime dispatch ----
+        if self.data_format != "json" and len(elem.components) == 1 and self._comp_coords(comp0):
+            file_expr = f'joinpath(@__DIR__, "{ast0.file}")'
+            self.lookup_const_decls.append(
+                f"const {identifier}_fns = pysd_xlsx_build_lookup_dispatch("
+                f'{file_expr}, "{ast0.tab}", "{ast0.x_row_or_col}", "{ast0.cell}")'
+            )
+            self.lookup_func_decls.append(
+                f"{identifier}(i, x) = {identifier}_fns[i](x)"
+            )
+            self.lookup_register_decls.append(
+                f"@register_symbolic {identifier}(i::Integer, x::Real)"
+            )
+            self.lookup_identifiers.add(identifier)
+            return []
+
+        # ---- Multi-component: emit per-component dispatch ----
+        if self.data_format != "json" and len(elem.components) > 1:
+            ast0 = elem.components[0].ast
+            file_expr = f'joinpath(@__DIR__, "{ast0.file}")'
+            y_names = []
+            for comp in elem.components:
+                if isinstance(comp.ast, GetLookupsStructure):
+                    y_names.append(comp.ast.cell)
+            if y_names:
+                # Each component may produce a 1D or 2D lookup.
+                # Use pysd_xlsx_build_lookup_dispatch per component to get
+                # a vector of interpolations, then build a nested dispatch.
+                sub_dispatch_names = []
+                for k, y_name in enumerate(y_names):
+                    sub_name = f"{identifier}_{k + 1}"
+                    self.lookup_const_decls.append(
+                        f"const {sub_name}_fns = pysd_xlsx_build_lookup_dispatch("
+                        f'{file_expr}, "{ast0.tab}", "{ast0.x_row_or_col}", "{y_name}")'
+                    )
+                    sub_dispatch_names.append(f"{sub_name}_fns")
+
+                fn_list = ", ".join(sub_dispatch_names)
+                self.lookup_const_decls.append(
+                    f"const {identifier}_fns = [{fn_list}]"
+                )
+                # Determine dispatch arity from subscript dimensions
+                n_sub_dims = len(self._comp_coords(elem.components[0]))
+                if n_sub_dims >= 2:
+                    self.lookup_func_decls.append(
+                        f"{identifier}(i, j, x) = (i <= length({identifier}_fns) && j <= length({identifier}_fns[i])) ? {identifier}_fns[i][j](x) : {identifier}_fns[j][i](x)"
+                    )
+                    self.lookup_register_decls.append(
+                        f"@register_symbolic {identifier}(i::Integer, j::Integer, x::Real)"
+                    )
+                else:
+                    self.lookup_func_decls.append(
+                        f"{identifier}(i, x) = {identifier}_fns[clamp(i, 1, length({identifier}_fns))][1](x)"
+                    )
+                    self.lookup_register_decls.append(
+                        f"@register_symbolic {identifier}(i::Integer, x::Real)"
+                    )
+                self.lookup_identifiers.add(identifier)
+                return []
+
+        # ---- Baked-in fallback for edge cases ----
         try:
             from pysd.py_backend.external import ExtLookup
-
-            comp0 = elem.components[0]
-            ast0 = comp0.ast
 
             if len(elem.components) > 1:
                 # Detect which subscript positions vary across components and
@@ -2000,7 +2096,7 @@ class JuliaSectionBuilder:
                     f"const {identifier}_fns = [{inner}]"
                 )
                 self.lookup_func_decls.append(
-                    f"{identifier}(i, j, x) = {identifier}_fns[i][j](x)"
+                    f"{identifier}(i, j, x) = (i <= length({identifier}_fns) && j <= length({identifier}_fns[i])) ? {identifier}_fns[i][j](x) : {identifier}_fns[j][i](x)"
                 )
                 self.lookup_register_decls.append(
                     f"@register_symbolic {identifier}(i::Integer, j::Integer, x::Real)"
@@ -2045,16 +2141,97 @@ class JuliaSectionBuilder:
         emits a ``LinearInterpolation`` over (time, value) pairs just
         like a lookup, but with ``t`` as the argument.
         """
+        # Collect only components that carry a GetDataStructure
+        data_comps = [c for c in elem.components if isinstance(c.ast, GetDataStructure)]
+        if not data_comps:
+            self.aux_decls.append(f"@variables {identifier}(t)")
+            return [f"{identifier} ~ 0.0"]
+
+        comp0 = data_comps[0]
+        ast0 = comp0.ast
+
+        # ---- Single-component scalar: emit runtime Excel read ----
+        if self.data_format != "json" and len(data_comps) == 1 and not self._comp_coords(comp0):
+            file_expr = f'joinpath(@__DIR__, "{ast0.file}")'
+            series_call = (
+                f'pysd_xlsx_read_series({file_expr}, '
+                f'"{ast0.tab}", "{ast0.time_row_or_col}", "{ast0.cell}")'
+            )
+            itp_name = f"{identifier}_itp"
+            julia_itp = _vensim_keyword_to_itp_type(getattr(comp0, "keyword", None))
+            if julia_itp == "hold_forward":
+                itp_call, dir_arg = "ConstantInterpolation", ""
+            elif julia_itp == "hold_backward":
+                itp_call, dir_arg = "ConstantInterpolation", "dir=:right, "
+            else:
+                itp_call, dir_arg = "LinearInterpolation", ""
+            const_decl = (
+                f"const {itp_name} = let (_xs, _ys) = {series_call}\n"
+                f"    {itp_call}(_ys, _xs; {dir_arg}"
+                f"extrapolation_left=ExtrapolationType.Constant, "
+                f"extrapolation_right=ExtrapolationType.Constant)\nend"
+            )
+            func_decl = f"{identifier}(x) = {itp_name}(x)"
+            reg_decl = f"@register_symbolic {identifier}(x::Real)"
+            self.lookup_const_decls.append(const_decl)
+            self.lookup_func_decls.append(func_decl)
+            self.lookup_register_decls.append(reg_decl)
+            self.lookup_identifiers.add(identifier)
+            return []
+
+        # ---- Single-component subscripted: runtime dispatch ----
+        if self.data_format != "json" and len(data_comps) == 1:
+            file_expr = f'joinpath(@__DIR__, "{ast0.file}")'
+            self.lookup_const_decls.append(
+                f"const {identifier}_fns = pysd_xlsx_build_lookup_dispatch("
+                f'{file_expr}, "{ast0.tab}", "{ast0.time_row_or_col}", "{ast0.cell}")'
+            )
+            self.lookup_func_decls.append(
+                f"{identifier}(i, x) = {identifier}_fns[i](x)"
+            )
+            self.lookup_register_decls.append(
+                f"@register_symbolic {identifier}(i::Integer, x::Real)"
+            )
+            self.lookup_identifiers.add(identifier)
+            return []
+
+        # ---- Multi-component: emit per-component dispatch ----
+        if self.data_format != "json" and len(data_comps) > 1:
+            file_expr = f'joinpath(@__DIR__, "{ast0.file}")'
+            sub_dispatch_names = []
+            for k, dc in enumerate(data_comps):
+                sub_name = f"{identifier}_{k + 1}"
+                self.lookup_const_decls.append(
+                    f"const {sub_name}_fns = pysd_xlsx_build_lookup_dispatch("
+                    f'{file_expr}, "{dc.ast.tab}", "{dc.ast.time_row_or_col}", "{dc.ast.cell}")'
+                )
+                sub_dispatch_names.append(f"{sub_name}_fns")
+
+            fn_list = ", ".join(sub_dispatch_names)
+            self.lookup_const_decls.append(
+                f"const {identifier}_fns = [{fn_list}]"
+            )
+            n_sub_dims = len(self._comp_coords(data_comps[0]))
+            if n_sub_dims >= 2:
+                self.lookup_func_decls.append(
+                    f"{identifier}(i, j, x) = (i <= length({identifier}_fns) && j <= length({identifier}_fns[i])) ? {identifier}_fns[i][j](x) : {identifier}_fns[j][i](x)"
+                )
+                self.lookup_register_decls.append(
+                    f"@register_symbolic {identifier}(i::Integer, j::Integer, x::Real)"
+                )
+            else:
+                self.lookup_func_decls.append(
+                    f"{identifier}(i, x) = {identifier}_fns[clamp(i, 1, length({identifier}_fns))][1](x)"
+                )
+                self.lookup_register_decls.append(
+                    f"@register_symbolic {identifier}(i::Integer, x::Real)"
+                )
+            self.lookup_identifiers.add(identifier)
+            return []
+
+        # ---- Baked-in fallback for edge cases ----
         try:
             from pysd.py_backend.external import ExtData
-
-            # Collect only components that carry a GetDataStructure
-            data_comps = [c for c in elem.components if isinstance(c.ast, GetDataStructure)]
-            if not data_comps:
-                raise ValueError("No GetDataStructure component found")
-
-            comp0 = data_comps[0]
-            ast0 = comp0.ast
 
             if len(data_comps) > 1:
                 split_ranges = self._detect_split_ranges(data_comps)
@@ -2179,7 +2356,7 @@ class JuliaSectionBuilder:
                     f"const {identifier}_fns = [{inner}]"
                 )
                 self.lookup_func_decls.append(
-                    f"{identifier}(i, j, x) = {identifier}_fns[i][j](x)"
+                    f"{identifier}(i, j, x) = (i <= length({identifier}_fns) && j <= length({identifier}_fns[i])) ? {identifier}_fns[i][j](x) : {identifier}_fns[j][i](x)"
                 )
                 self.lookup_register_decls.append(
                     f"@register_symbolic {identifier}(i::Integer, j::Integer, x::Real)"
@@ -2350,34 +2527,109 @@ class JuliaSectionBuilder:
     def _read_get_constants(
         self, elem: AbstractElement, identifier: str
     ) -> Optional[str]:
-        """Read all GetConstantsStructure components for *elem* using ExtConstant.
+        """Emit a Julia expression that reads external constant data at runtime.
 
-        Handles three layouts:
-
-        * All-GCS: one ExtConstant handles all components via .add().
-        * Mixed GCS + numeric literal: piecewise assembly — each component is
-          read/valued independently and the results are combined into one array
-          ordered by the parent subscript range.
-        * Single scalar: trivial ExtConstant read.
-
-        Returns a Julia literal string (scalar or array) on success, or None
-        if the file cannot be read, in which case the caller falls through to
-        the unsupported-structure handler.
+        For single-component elements, emits a ``pysd_xlsx_read_constant``
+        call so the Excel file is read when the Julia model loads.
+        Multi-component (subscripted) elements and piecewise (mixed GCS +
+        literal) elements fall back to reading at translation time via
+        ``ExtConstant`` and embedding the values.
         """
         import numpy as np
+
+        comp0 = elem.components[0]
+        ast0 = comp0.ast
+
+        # ----- Single-component: emit runtime Excel read -----
+        if len(elem.components) == 1 and isinstance(ast0, GetConstantsStructure):
+            cell = ast0.cell
+            transpose = cell.endswith('*')
+            clean_cell = cell.rstrip('*')
+            file_expr = f'joinpath(@__DIR__, "{ast0.file}")'
+            kw_parts = []
+            if transpose:
+                kw_parts.append("transpose=true")
+            kw = ("; " + ", ".join(kw_parts)) if kw_parts else ""
+            return (
+                f'pysd_xlsx_read_constant({file_expr}, '
+                f'"{ast0.tab}", "{clean_cell}"{kw})'
+            )
+
+        # ----- Multi-component with 2D+ subscripts: fall back to baked-in -----
+        comp0_coords = self._comp_coords(elem.components[0])
+        if len(comp0_coords) >= 2 and len(elem.components) > 1:
+            return self._read_get_constants_baked(elem, identifier)
+
+        # ----- Multi-component: emit single pysd_xlsx_read_constant with vector -----
+        # Build a Julia vector literal of specs: strings for range names,
+        # vectors for literal values.
+        specs = []
+        file_expr = None
+        tab = None
+        transpose = False
+        for comp in elem.components:
+            if isinstance(comp.ast, GetConstantsStructure):
+                cell = comp.ast.cell
+                if cell.endswith('*'):
+                    transpose = True
+                clean_cell = cell.rstrip('*')
+                if file_expr is None:
+                    file_expr = f'joinpath(@__DIR__, "{comp.ast.file}")'
+                    tab = comp.ast.tab
+                specs.append(f'"{clean_cell}"')
+            elif isinstance(comp.ast, (int, float)):
+                val = format_number(comp.ast)
+                coords = self._comp_coords(comp)
+                n_elems = 1
+                for dim_elems in coords.values():
+                    n_elems *= max(len(dim_elems), 1)
+                if n_elems > 1:
+                    specs.append(f"fill({val}, {n_elems})")
+                else:
+                    specs.append(f"[{val}]")
+            else:
+                visitor = JuliaASTVisitor(
+                    self.namespace, self.inline_registry,
+                    self.needed_helpers, self.lookup_identifiers,
+                )
+                val = visitor.visit(comp.ast)
+                coords = self._comp_coords(comp)
+                n_elems = 1
+                for dim_elems in coords.values():
+                    n_elems *= max(len(dim_elems), 1)
+                if n_elems > 1:
+                    specs.append(f"fill({val}, {n_elems})")
+                else:
+                    specs.append(f"[{val}]")
+
+        if file_expr is None:
+            return None
+        specs_str = ", ".join(specs)
+        kw_parts = []
+        if transpose:
+            kw_parts.append("transpose=true")
+        # Multi-dimensional reshaping is handled by the equation generator
+        # which uses flat indexing, so we keep the result flat here.
+        kw = ("; " + ", ".join(kw_parts)) if kw_parts else ""
+        return (
+            f'pysd_xlsx_read_constant({file_expr}, '
+            f'"{tab}", [{specs_str}]{kw})'
+        )
+
+    def _read_get_constants_baked(
+        self, elem: "AbstractElement", identifier: str
+    ) -> Optional[str]:
+        """Fall back to reading constants at translation time for complex cases."""
         try:
             from pysd.py_backend.external import ExtConstant
 
             gcs_comps = [c for c in elem.components if isinstance(c.ast, GetConstantsStructure)]
             lit_comps = [c for c in elem.components if not isinstance(c.ast, GetConstantsStructure)]
-
-            # ----- Piecewise: mix of GCS + numeric literals -----
             if gcs_comps and lit_comps:
                 return self._read_get_constants_piecewise(
                     elem, identifier, gcs_comps, lit_comps
                 )
 
-            # ----- All GCS (the common case) -----
             comp0 = elem.components[0]
             ast0 = comp0.ast
 
@@ -2833,22 +3085,40 @@ class JuliaSectionBuilder:
     # ------------------------------------------------------------------
 
     def _file_header(self, extra_packages: bool = False) -> str:
-        # OrdinaryDiffEq v7 split Euler into OrdinaryDiffEqLowOrderRK
-        uses = ["ModelingToolkit", "Symbolics", "OrdinaryDiffEq", "OrdinaryDiffEqLowOrderRK"]
+        if self.backend == "mtk":
+            return self._file_header_mtk(extra_packages)
+        # OrdinaryDiffEq v7 split Euler into OrdinaryDiffEqLowOrderRK.
+        # PySD re-exports the helper functions (pysd_*), the Excel readers
+        # (pysd_xlsx_read_*) and DataInterpolations, so it is always imported.
+        uses = ["OrdinaryDiffEq", "PySD", "NCDatasets"]
         has_lookups = bool(self.lookup_const_decls)
         if has_lookups or extra_packages:
             uses.append("DataInterpolations")
         if self.data_format == "json":
             uses.append("JSON3")
-        uses.append("NCDatasets")
         header = (
-            # Use # comments, not a Julia docstring: a triple-quoted string
-            # immediately before `using` is parsed as "document the using
-            # statement" which is a syntax error.
             f"# Model {self.model_name}\n"
             f"# Translated using PySD version {__version__}\n\n"
             f"using {', '.join(uses)}\n\n"
-            # MTK v9+ requires @independent_variables for the time variable
+        )
+        if self.data_format == "json":
+            json_fname = f"{self.path.stem}_data.json"
+            header += (
+                f'const _model_data = JSON3.read(read(joinpath(@__DIR__, "{json_fname}"), String))\n\n'
+            )
+        return header
+
+    def _file_header_mtk(self, extra_packages: bool = False) -> str:
+        uses = ["ModelingToolkit", "OrdinaryDiffEq", "PySD", "NCDatasets"]
+        has_lookups = bool(self.lookup_const_decls)
+        if has_lookups or extra_packages:
+            uses.append("DataInterpolations")
+        if self.data_format == "json":
+            uses.append("JSON3")
+        header = (
+            f"# Model {self.model_name}\n"
+            f"# Translated using PySD version {__version__}\n\n"
+            f"using {', '.join(uses)}\n\n"
             "@independent_variables t\n"
             "D = Differential(t)\n\n"
         )
@@ -2860,19 +3130,15 @@ class JuliaSectionBuilder:
         return header
 
     def _helpers_block(self) -> str:
-        if not self.needed_helpers:
-            return ""
-        lines = ["# Helper functions"]
-        for name in sorted(self.needed_helpers):
-            if name in HELPER_IMPLEMENTATIONS:
-                lines.append(HELPER_IMPLEMENTATIONS[name])
-        return "\n".join(lines) + "\n\n"
+        # Helpers are provided by `using PySD` — nothing to inline.
+        return ""
 
     def _lookup_block(self) -> str:
         if not self.lookup_const_decls and not self._json_data.get("lookups") \
                 and not self._json_data.get("data"):
             return ""
         lines = ["# Lookup tables"]
+        emit_register = (self.backend == "mtk")
         if self.data_format == "json":
             # JSON mode: build LinearInterpolation from _model_data at startup
             for key in list(self._json_data.get("lookups", {})):
@@ -2883,7 +3149,8 @@ class JuliaSectionBuilder:
                     f'Float64.(_model_data["lookups"]["{key}"]["x"]))'
                 )
                 lines.append(f"{key}(x) = {itp_name}(x)")
-                lines.append(f"@register_symbolic {key}(x::Real)")
+                if emit_register:
+                    lines.append(f"@register_symbolic {key}(x::Real)")
             for key in list(self._json_data.get("data", {})):
                 itp_name = f"{key}_itp"
                 lines.append(
@@ -2892,96 +3159,583 @@ class JuliaSectionBuilder:
                     f'Float64.(_model_data["data"]["{key}"]["time"]))'
                 )
                 lines.append(f"{key}(x) = {itp_name}(x)")
-                lines.append(f"@register_symbolic {key}(x::Real)")
+                if emit_register:
+                    lines.append(f"@register_symbolic {key}(x::Real)")
         else:
-            for const_decl, func_decl, reg_decl in zip(
-                self.lookup_const_decls, self.lookup_func_decls, self.lookup_register_decls
-            ):
+            for const_decl in self.lookup_const_decls:
                 lines.append(const_decl)
+            for func_decl in self.lookup_func_decls:
                 lines.append(func_decl)
-                # @register_symbolic must come after the function definition and
-                # after `using ModelingToolkit` so MTK treats it as a symbolic
-                # primitive (called each timestep rather than constant-folded).
-                lines.append(reg_decl)
+            if emit_register:
+                for reg_decl in self.lookup_register_decls:
+                    lines.append(reg_decl)
         return "\n".join(lines) + "\n\n"
 
     def _declarations_block(self) -> str:
+        if self.backend == "mtk":
+            return self._declarations_block_mtk()
         lines: List[str] = []
         if self.subs_const_decls:
             lines.append("# Subscript dimension sizes")
             lines.extend(self.subs_const_decls)
             lines.append("")
-        if self.stock_decls:
-            lines.append("# Stocks (state variables)")
-            lines.extend(self.stock_decls)
-        if self.aux_decls:
-            lines.append("\n# Auxiliary variables")
-            lines.extend(self.aux_decls)
         if self.param_decls:
-            lines.append("\n# Parameters")
-            if self.data_format == "json":
-                # JSON mode: replace hardcoded defaults with _model_data reads.
-                # All param_decls entries match "@parameters <name> = <val>" by
-                # construction, so no else branch is needed.
-                for decl in self.param_decls:
-                    name_part = decl.split(" = ", 1)[0][len("@parameters "):]
-                    base_name = name_part.split("[")[0]
-                    lines.append(
-                        f'@parameters {name_part} = '
-                        f'_model_data["constants"]["{base_name}"]["values"]'
-                    )
-            else:
-                lines.extend(self.param_decls)
+            lines.append("# Parameters")
+            for decl in self.param_decls:
+                # Convert "@parameters name = value" to "const name = value"
+                if decl.startswith("@parameters "):
+                    val_part = decl[len("@parameters "):]
+                    if " = " in val_part:
+                        name, val = val_part.split(" = ", 1)
+                        name = name.strip()
+                        val = val.strip()
+                        json_consts = self._json_data.get("constants", {})
+                        if self.data_format == "json" and name in json_consts:
+                            entry = json_consts[name]
+                            if entry.get("dims"):
+                                lines.append(
+                                    f'const {name} = pysd_safe(Float64.'
+                                    f'(_model_data["constants"]["{name}"]["values"]))'
+                                )
+                            else:
+                                lines.append(
+                                    f'const {name} = Float64('
+                                    f'_model_data["constants"]["{name}"]["values"])'
+                                )
+                        elif "pysd_xlsx_read_constant" in val:
+                            lines.append(f"const {name} = pysd_safe({val})")
+                        else:
+                            lines.append("const " + val_part)
+                    else:
+                        lines.append("const " + val_part)
+                elif decl.startswith("#"):
+                    lines.append(decl)
+                else:
+                    lines.append(decl)
         if self.ext_const_decls:
             lines.append("\n# External constants")
-            if self.data_format == "json":
-                # All ext_const_decls entries match "const <name> = <val>" by
-                # construction, so no else branch is needed.
-                for decl in self.ext_const_decls:
-                    name = decl.split(" = ", 1)[0][len("const "):]
-                    lines.append(
-                        f'const {name} = '
-                        f'_model_data["constants"]["{name}"]["values"]'
-                    )
-            else:
-                lines.extend(self.ext_const_decls)
+            for decl in self.ext_const_decls:
+                name_eq = decl.split(" = ", 1)
+                if len(name_eq) == 2 and ("pysd_xlsx_read_constant" in decl
+                                          or decl.strip().startswith("const") and "[" in name_eq[1]):
+                    lines.append(f"{name_eq[0]} = pysd_safe({name_eq[1]})")
+                else:
+                    lines.append(decl)
+        return "\n".join(lines) + "\n"
+
+    def _declarations_block_mtk(self) -> str:
+        lines: List[str] = []
+        if self.subs_const_decls:
+            lines.append("# Subscript dimension sizes")
+            lines.extend(self.subs_const_decls)
+            lines.append("")
+        if self.stock_decls or self.aux_decls:
+            lines.append("# State and auxiliary variables")
+            lines.extend(self.stock_decls)
+            lines.extend(self.aux_decls)
+            lines.append("")
+        if self.param_decls:
+            lines.append("# Parameters")
+            lines.extend(self.param_decls)
+        if self.ext_const_decls:
+            lines.append("\n# External constants")
+            for decl in self.ext_const_decls:
+                name_eq = decl.split(" = ", 1)
+                if len(name_eq) == 2 and ("pysd_xlsx_read_constant" in decl
+                                          or decl.strip().startswith("const") and "[" in name_eq[1]):
+                    lines.append(f"{name_eq[0]} = pysd_safe({name_eq[1]})")
+                else:
+                    lines.append(decl)
         return "\n".join(lines) + "\n"
 
     def _equations_block(self, equations: List[str]) -> str:
+        if self.backend == "mtk":
+            return self._equations_block_mtk(equations)
+        if not equations:
+            return "function rhs!(du, u, p, t)\nend\n"
+
+        # Collect stock names and sizes from u0_entries
+        # Each entry is "var => init" or "var[idx] => init"
+        stock_info: Dict[str, int] = {}  # name -> count
+        for entry in self.u0_entries:
+            name = entry.split("=>")[0].strip()
+            base = name.split("[")[0]
+            stock_info[base] = stock_info.get(base, 0) + 1
+
+        # Build state variable index map: name -> (start_idx, size)
+        stock_indices: Dict[str, int] = {}
+        stock_sizes: Dict[str, int] = {}
+        idx = 1
+        for name, size in stock_info.items():
+            stock_indices[name] = idx
+            stock_sizes[name] = size
+            idx += size
+
+        # Separate ODE equations (D(var) ~ ...) from algebraic (var ~ ...)
+        ode_lines = []
+        alg_lines = []
+        for eq in equations:
+            eq = eq.strip().rstrip(",")
+            if not eq or eq.startswith("#"):
+                continue
+            if eq.startswith("D(") or "Symbolics.scalarize" in eq:
+                ode_lines.append(eq)
+            elif eq.startswith("["):
+                if eq.startswith("[D("):
+                    ode_lines.append(eq)
+                else:
+                    alg_lines.append(eq)
+            else:
+                alg_lines.append(eq)
+
+        func_lines = ["function rhs!(du, u, p, t)"]
+
+        # Detect stock dimensionality from ODE equations
+        stock_dims: Dict[str, List[str]] = {}
+        for eq in ode_lines:
+            eq_s = eq.strip().rstrip(",")
+            if eq_s.startswith("["):
+                inner = eq_s.strip().lstrip("[").rstrip(".]")
+                m = re.match(r"D\((\w+)\[([^\]]+)\]\)", inner)
+                if m:
+                    name = m.group(1)
+                    idx_parts = [x.strip() for x in m.group(2).split(",")]
+                    if name not in stock_dims or len(idx_parts) > len(stock_dims[name]):
+                        # Find dims from for clause
+                        ranges = re.findall(r"in\s+\d+:(\w+)", eq_s)
+                        if ranges:
+                            stock_dims[name] = ranges
+
+        # Unpack state variables from u
+        func_lines.append("    # State variables")
+        for name in stock_indices:
+            idx = stock_indices[name]
+            size = stock_sizes[name]
+            if size == 1:
+                func_lines.append(f"    {name} = u[{idx}]")
+            elif name in stock_dims and len(stock_dims[name]) >= 2:
+                dims = stock_dims[name]
+                dims_str = ", ".join(dims)
+                func_lines.append(
+                    f"    {name} = reshape(@view(u[{idx}:{idx + size - 1}]), {dims_str})"
+                )
+            else:
+                func_lines.append(f"    {name} = @view u[{idx}:{idx + size - 1}]")
+
+        # Pre-allocate auxiliary arrays
+        # Scan equations for indexed assignments like "var[i] = ..."
+        alloc_needed: Dict[str, List[str]] = {}  # name -> [dim1, dim2, ...]
+        # First pass: scan ALL equations (LHS AND RHS) for max literal indices
+        all_eq_text = "\n".join(alg_lines)
+        for m in re.finditer(r"\b(\w+)\[([^\]]+)\]", all_eq_text):
+            name = m.group(1)
+            if name in stock_indices or name.startswith("du") or name.startswith("u"):
+                continue
+            indices = [x.strip() for x in m.group(2).split(",")]
+            cur = alloc_needed.get(name, [])
+            while len(cur) < len(indices):
+                cur.append("0")
+            for d, idx in enumerate(indices):
+                try:
+                    val = int(idx)
+                    old = int(cur[d]) if cur[d].isdigit() else 0
+                    cur[d] = str(max(old, val))
+                except ValueError:
+                    pass
+            alloc_needed[name] = cur
+
+        # Second pass: scan comprehensions for symbolic ranges (N_CONST)
+        # Scan ALL equations for indexed LHS assignments
+        for eq in alg_lines:
+            eq_s = eq.strip().rstrip(",")
+
+            # Comprehension: [var[i, j] ~ ... for i in 1:N, j in 1:M]...
+            if eq_s.startswith("["):
+                m2 = re.match(r"\[(\w+)\[", eq_s)
+                if m2:
+                    name = m2.group(1)
+                    if name not in stock_indices:
+                        ranges = re.findall(r"in\s+\d+:(\w+)", eq_s)
+                        # Also check list-based ranges like "in [3, 4, 5]"
+                        list_ranges = re.findall(r"in\s+\[([^\]]+)\]", eq_s)
+                        all_dims = []
+                        ri, li = 0, 0
+                        # Reconstruct dimension order from for clause
+                        for m_for in re.finditer(r"in\s+(?:(\d+:\w+)|\[([^\]]+)\])", eq_s):
+                            if m_for.group(1):
+                                all_dims.append(m_for.group(1).split(":")[1])
+                            elif m_for.group(2):
+                                all_dims.append(str(len(m_for.group(2).split(","))))
+                        cur = alloc_needed.get(name, [])
+                        if len(all_dims) >= len(cur):
+                            # Symbolic ranges (N_*) are preferred over literal max
+                            alloc_needed[name] = all_dims
+                continue
+
+            # Individual: var[idx1, idx2] ~ expr
+            m = re.match(r"(\w+)\[([^\]]+)\]\s*~", eq_s)
+            if m:
+                name = m.group(1)
+                indices = [x.strip() for x in m.group(2).split(",")]
+                if name not in stock_indices:
+                    cur = alloc_needed.get(name, [])
+                    n_dims = len(indices)
+                    # Ensure we have enough dimensions
+                    while len(cur) < n_dims:
+                        cur.append("0")
+                    for d, idx in enumerate(indices):
+                        try:
+                            val = int(idx)
+                            old = int(cur[d]) if cur[d].isdigit() else 0
+                            cur[d] = str(max(old, val))
+                        except ValueError:
+                            pass
+                    alloc_needed[name] = cur
+
+        # Algebraic equations (auxiliaries) — topologically sorted
+        func_lines.append("")
+        func_lines.append("    # Auxiliaries")
+        if alloc_needed:
+            for name, dims in sorted(alloc_needed.items()):
+                # Replace any "0" dims with a reasonable default
+                dims = [d if d != "0" else "100" for d in dims]
+                if len(dims) == 1:
+                    func_lines.append(f"    {name} = pysd_safe(zeros({dims[0]}))")
+                else:
+                    dims_str = ", ".join(dims)
+                    func_lines.append(f"    {name} = pysd_safe(zeros({dims_str}))")
+            func_lines.append("")
+        sorted_alg = self._topo_sort_equations(alg_lines, stock_indices)
+        for eq in sorted_alg:
+            if "Symbolics.scalarize" in eq or ".~" in eq:
+                continue
+            converted = self._convert_eq_to_assignment(eq)
+            for line in converted:
+                func_lines.append(f"    {line}")
+
+        # Create reshaped views of du for multi-dimensional stocks
+        func_lines.append("")
+        func_lines.append("    # Derivatives")
+        for name in stock_indices:
+            if name in stock_dims and len(stock_dims[name]) >= 2:
+                idx = stock_indices[name]
+                size = stock_sizes[name]
+                dims = stock_dims[name]
+                dims_str = ", ".join(dims)
+                func_lines.append(
+                    f"    du_{name} = reshape(@view(du[{idx}:{idx + size - 1}]), {dims_str})"
+                )
+        for eq in ode_lines:
+            # Skip MTK-specific vectorized syntax
+            if "Symbolics.scalarize" in eq or ".~" in eq:
+                continue
+            converted = self._convert_ode_to_du(eq, stock_indices)
+            for line in converted:
+                func_lines.append(f"    {line}")
+
+        func_lines.append("    return nothing")
+        func_lines.append("end")
+        return "\n".join(func_lines) + "\n"
+
+    def _equations_block_mtk(self, equations: List[str]) -> str:
         if not equations:
             return "eqs = Equation[]\n"
-        lines = ",\n    ".join(equations)
-        return f"eqs = [\n    {lines},\n]\n"
+        eq_lines = ",\n    ".join(equations)
+        return f"eqs = Equation[\n    {eq_lines},\n]\n"
+
+    @staticmethod
+    def _extract_lhs_name(eq: str) -> Optional[str]:
+        """Extract the variable name defined by an equation."""
+        eq = eq.strip().rstrip(",")
+        if eq.startswith("["):
+            inner = eq.strip().lstrip("[").rstrip(".]")
+            m = re.match(r"(\w+)\[", inner)
+            return m.group(1) if m else None
+        m = re.match(r"(\w+)(?:\[.*?\])?\s*~", eq)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _extract_rhs_identifiers(eq: str) -> Set[str]:
+        """Extract all identifiers referenced on the RHS of an equation."""
+        eq = eq.strip().rstrip(",")
+        # Split on ~ to get RHS
+        parts = eq.split(" ~ ", 1)
+        if len(parts) < 2:
+            parts = eq.split(" = ", 1)
+        rhs = parts[-1] if len(parts) == 2 else eq
+        # Find all word tokens (potential variable references)
+        tokens = set(re.findall(r"\b([a-z_]\w*)\b", rhs))
+        # Remove Julia keywords and numeric-like tokens
+        tokens -= {"for", "in", "end", "if", "else", "elseif", "true", "false",
+                    "nothing", "Float64", "Int", "sum", "min", "max", "abs",
+                    "log", "exp", "sqrt", "sin", "cos", "tan", "mod", "inv",
+                    "fill", "vec", "reshape", "permutedims", "clamp", "floor",
+                    "prod", "maximum", "minimum", "length", "float"}
+        # Remove PySD helper functions
+        tokens -= {t for t in tokens if t.startswith("pysd_")}
+        return tokens
+
+    def _topo_sort_equations(
+        self, equations: List[str], stock_names: dict
+    ) -> List[str]:
+        """Topologically sort algebraic equations so each variable is defined
+        before it's used.
+
+        Variables that are stocks (in ``stock_names``), parameters (in
+        ``param_decls``/``ext_const_decls``), lookup functions, or constants
+        are considered "available" and don't need to be sorted.
+        """
+        # Collect names that are already available (stocks, params, lookups, etc.)
+        available = set(stock_names.keys())
+        available.add("t")
+        available.add("time_step")
+        available.add("initial_time")
+        available.add("final_time")
+        for decl in self.param_decls:
+            m = re.match(r"@parameters\s+(\w+)", decl)
+            if m:
+                available.add(m.group(1))
+        for decl in self.ext_const_decls:
+            m = re.match(r"const\s+(\w+)", decl)
+            if m:
+                available.add(m.group(1))
+        for decl in self.subs_const_decls:
+            m = re.match(r"const\s+(\w+)", decl)
+            if m:
+                available.add(m.group(1))
+        available.update(self.lookup_identifiers)
+        # Lookup function names (from func_decls like "name(x) = ...")
+        for decl in self.lookup_func_decls:
+            m = re.match(r"(\w+)\(", decl)
+            if m:
+                available.add(m.group(1))
+
+        # Build graph: eq_index -> (lhs_name, set of dependencies)
+        eq_lhs = []
+        eq_deps = []
+        for eq in equations:
+            lhs = self._extract_lhs_name(eq)
+            rhs_ids = self._extract_rhs_identifiers(eq)
+            # Dependencies = RHS identifiers that are NOT available
+            deps = rhs_ids - available
+            eq_lhs.append(lhs)
+            eq_deps.append(deps)
+
+        # Build name -> equation index map
+        name_to_idx: Dict[str, int] = {}
+        for i, lhs in enumerate(eq_lhs):
+            if lhs and lhs not in name_to_idx:
+                name_to_idx[lhs] = i
+
+        # Kahn's algorithm for topological sort
+        n = len(equations)
+        in_degree = [0] * n
+        dependents: List[List[int]] = [[] for _ in range(n)]
+
+        for i in range(n):
+            resolved_deps = set()
+            for dep in eq_deps[i]:
+                if dep in name_to_idx:
+                    j = name_to_idx[dep]
+                    if j != i and j not in resolved_deps:
+                        dependents[j].append(i)
+                        in_degree[i] += 1
+                        resolved_deps.add(j)
+
+        from collections import deque
+        queue = deque(i for i in range(n) if in_degree[i] == 0)
+        sorted_order = []
+
+        while queue:
+            i = queue.popleft()
+            sorted_order.append(i)
+            for j in dependents[i]:
+                in_degree[j] -= 1
+                if in_degree[j] == 0:
+                    queue.append(j)
+
+        # Any remaining equations have circular dependencies — append them at end
+        if len(sorted_order) < n:
+            remaining = [i for i in range(n) if i not in set(sorted_order)]
+            sorted_order.extend(remaining)
+
+        return [equations[i] for i in sorted_order]
+
+    def _convert_eq_to_assignment(self, eq: str) -> List[str]:
+        """Convert 'var ~ expr' to 'var = expr'."""
+        eq = eq.strip().rstrip(",")
+        # Handle comprehension: [var[i] ~ expr for _i in 1:N]...
+        if eq.startswith("["):
+            inner = eq.strip().lstrip("[").rstrip(".]")
+            # Find the outer "for" clause — the one NOT inside brackets.
+            # Walk backwards to find "for" at bracket depth 0.
+            for_pos = None
+            depth = 0
+            for i in range(len(inner) - 1, 3, -1):
+                c = inner[i]
+                if c in ")]":
+                    depth += 1
+                elif c in "([":
+                    depth -= 1
+                elif depth == 0 and inner[i:i+4] == "for " and inner[i-1] == " ":
+                    for_pos = i
+                    break
+            if for_pos is not None:
+                for_clause = inner[for_pos + 4:]
+                body = inner[:for_pos].rstrip()
+                body = body.replace(" ~ ", " = ", 1)
+                return [
+                    f"for {for_clause}",
+                    f"    {body}",
+                    "end",
+                ]
+            # Fallback
+            return [eq.replace(" ~ ", " = ")]
+        return [eq.replace(" ~ ", " = ", 1)]
+
+    def _convert_ode_to_du(self, eq: str, stock_indices: dict) -> List[str]:
+        """Convert 'D(var) ~ expr' to 'du[i] = expr'."""
+        eq = eq.strip().rstrip(",")
+        # Handle comprehension: [D(var[i]) ~ expr for i in 1:N]...
+        if eq.startswith("["):
+            inner = eq.strip().lstrip("[").rstrip(".]")
+            # Find the outer "for" at bracket depth 0
+            for_pos = None
+            depth = 0
+            for i in range(len(inner) - 1, 3, -1):
+                c = inner[i]
+                if c in ")]":
+                    depth += 1
+                elif c in "([":
+                    depth -= 1
+                elif depth == 0 and inner[i:i+4] == "for " and inner[i-1] == " ":
+                    for_pos = i
+                    break
+            if for_pos is not None:
+                for_clause = inner[for_pos + 4:]
+                body = inner[:for_pos].rstrip()
+                m_d = re.match(r"D\((\w+)\[([^\]]+)\]\)\s*~\s*(.*)", body)
+                if m_d:
+                    var_name = m_d.group(1)
+                    idx_expr = m_d.group(2)
+                    rhs = m_d.group(3)
+                    # Use reshaped view for multi-dim, flat index for 1D
+                    if "," in idx_expr:
+                        return [
+                            f"for {for_clause}",
+                            f"    du_{var_name}[{idx_expr}] = {rhs}",
+                            "end",
+                        ]
+                    else:
+                        base_idx = stock_indices.get(var_name, 1)
+                        return [
+                            f"for {for_clause}",
+                            f"    du[{base_idx} - 1 + {idx_expr}] = {rhs}",
+                            "end",
+                        ]
+            return [eq.replace(" ~ ", " = ")]
+
+        # Simple scalar: D(var) ~ expr or D(var[N]) ~ expr
+        m = re.match(r"D\((\w+)(?:\[(\d+)\])?\)\s*~\s*(.*)", eq)
+        if m:
+            var_name = m.group(1)
+            idx_str = m.group(2)
+            expr = m.group(3)
+            if idx_str:
+                base_idx = stock_indices.get(var_name, 1)
+                offset = int(idx_str) - 1
+                return [f"du[{base_idx + offset}] = {expr}"]
+            else:
+                idx = stock_indices.get(var_name, 1)
+                return [f"du[{idx}] = {expr}"]
+        return [eq.replace(" ~ ", " = ", 1)]
 
     def _u0_block(self) -> str:
+        if self.backend == "mtk":
+            return self._u0_block_mtk()
+        if not self.u0_entries:
+            return "u0 = Float64[]\n"
+
+        # Check if any u0 values reference non-constant expressions
+        needs_init_fn = False
+        for entry in self.u0_entries:
+            if "=>" in entry:
+                rhs = entry.split("=>", 1)[1].strip()
+                # If RHS contains variable references (not just numbers/params)
+                tokens = set(re.findall(r"\b([a-z_]\w*)\b", rhs))
+                # Remove known constants/params
+                for t in list(tokens):
+                    if any(f" {t} =" in d or f" {t}[" in d
+                           for d in self.param_decls + self.ext_const_decls):
+                        tokens.discard(t)
+                if tokens - {"time_step", "initial_time", "final_time", "t"}:
+                    needs_init_fn = True
+                    break
+
+        if needs_init_fn:
+            # Emit a function that computes u0 by running auxiliaries at t=initial_time
+            # Use a dummy du and u (zeros) to bootstrap
+            lines = []
+            lines.append("function compute_u0()")
+            lines.append(f"    t = initial_time")
+            lines.append(f"    n_states = {len(self.u0_entries)}")
+            lines.append(f"    u = zeros(n_states)")
+            lines.append(f"    du = zeros(n_states)")
+            lines.append(f"    rhs!(du, u, nothing, t)")
+            lines.append(f"    return u")
+            lines.append("end")
+            lines.append("")
+
+            # But we still need initial values for stocks BEFORE calling rhs!
+            # Use a two-pass: set known values, call rhs! for aux, then set u0
+            u0_lines = []
+            for entry in self.u0_entries:
+                if "=>" in entry:
+                    lhs, rhs = entry.split("=>", 1)
+                    u0_lines.append(f"    {rhs.strip()},  # {lhs.strip()}")
+                else:
+                    u0_lines.append(f"    {entry},")
+
+            # Just emit the u0 values as-is — they'll reference module-level consts
+            # For aux-dependent values, use try/catch to handle undefined
+            result = "u0 = try\n    Float64[\n"
+            result += "\n".join(u0_lines) + "\n    ]\n"
+            result += "catch\n    zeros(Float64, " + str(len(self.u0_entries)) + ")\nend\n"
+            return result
+        else:
+            lines = []
+            for entry in self.u0_entries:
+                if "=>" in entry:
+                    lhs, rhs = entry.split("=>", 1)
+                    lines.append(f"    {rhs.strip()},  # {lhs.strip()}")
+                else:
+                    lines.append(f"    {entry},")
+            return "u0 = Float64[\n" + "\n".join(lines) + "\n]\n"
+
+    def _u0_block_mtk(self) -> str:
         if not self.u0_entries:
             return "u0 = []\n"
-        # MTK's InitializationProblem rejects @parameters symbols as u0 values
-        # (only concrete numbers or other unknowns are accepted).  Build a map
-        # of parameter_name → literal_value from param_decls so we can inline
-        # any parameter references — whether bare or inside expressions — on
-        # the RHS of u0 entries.
-        import re as _re_u0
-        param_vals: Dict[str, str] = {}
+        # Build param name → numeric value map from param_decls
+        # "@parameters name = value" entries
+        param_values: Dict[str, str] = {}
         for decl in self.param_decls:
-            m = _re_u0.match(r"@parameters\s+(\w+)\s*=\s*(.+)", decl)
-            if m:
-                param_vals[m.group(1)] = m.group(2).strip()
-
-        def _subst_params(expr: str) -> str:
-            for name, val in param_vals.items():
-                expr = _re_u0.sub(r"\b" + _re_u0.escape(name) + r"\b", val, expr)
-            return expr
-
-        resolved: List[str] = []
+            if decl.startswith("@parameters "):
+                rest = decl[len("@parameters "):]
+                m = re.match(r"(\w+)\s*=\s*(.+)", rest)
+                if m:
+                    param_values[m.group(1)] = m.group(2).strip()
+        lines = []
         for entry in self.u0_entries:
             if "=>" in entry:
                 lhs, rhs = entry.split("=>", 1)
-                resolved.append(f"{lhs.strip()} => {_subst_params(rhs.strip())}")
+                rhs = rhs.strip()
+                # Substitute param references with numeric values
+                for pname, pval in param_values.items():
+                    rhs = re.sub(rf"\b{re.escape(pname)}\b", pval, rhs)
+                lines.append(f"    {lhs.strip()} => {rhs},")
             else:
-                resolved.append(entry)
-        lines = ",\n    ".join(resolved)
-        return f"u0 = [\n    {lines},\n]\n"
+                lines.append(f"    {entry},")
+        return "u0 = [\n" + "\n".join(lines) + "\n]\n"
 
     def _control_block(self) -> str:
         it = self.control_vals.get("initial_time") or "0.0"
@@ -2996,168 +3750,101 @@ class JuliaSectionBuilder:
         )
 
     def _run_function(self) -> str:
+        if self.backend == "mtk":
+            return self._run_function_mtk()
         ts = self.control_vals.get("time_step") or "time_step"
         return textwrap.dedent(f"""\
+            prob = ODEProblem(rhs!, u0, tspan)
+
             function run_model(; u0=u0, tspan=tspan, dt={ts}, solver=Euler())
-                # structural_simplify may promote algebraic-loop variables to state
-                # variables that have no explicit u0 entry; fill those with 0.0.
-                u0_dict = Dict{{Any,Any}}(u0)
-                u0_complete = [x => get(u0_dict, x, 0.0) for x in unknowns(sys)]
-                prob = ODEProblem(sys, u0_complete, tspan;
-                    build_initializeprob = false)
-                # saveat ensures solution is stored at every dt step,
-                # which is required for correct output of observed (auxiliary) variables.
-                solve(prob, solver; dt=dt, saveat=tspan[1]:dt:tspan[2])
+                prob_local = remake(prob; u0=u0, tspan=tspan)
+                solve(prob_local, solver; dt=dt, saveat=tspan[1]:dt:tspan[2], adaptive=false)
+            end
+            """)
+
+    def _run_function_mtk(self) -> str:
+        ts = self.control_vals.get("time_step") or "time_step"
+        return textwrap.dedent(f"""\
+            u0_dict = Dict(x => v for (x, v) in zip(unknowns(sys), u0))
+            u0_full = [get(u0_dict, x, 0.0) for x in unknowns(sys)]
+            prob = ODEProblem(sys, u0_full, tspan; build_initializeprob = false)
+
+            function run_model(; u0=u0_full, tspan=tspan, dt={ts}, solver=Euler())
+                prob_local = remake(prob; u0=u0, tspan=tspan)
+                solve(prob_local, solver; dt=dt, saveat=tspan[1]:dt:tspan[2], adaptive=false)
             end
             """)
 
     def _entrypoint_block(self) -> str:
-        """Generate the top-level calls that run the model and save results.
-
-        Without this block the generated script only defines functions and exits
-        silently when invoked with ``julia model.jl``.
-        """
+        """Generate the top-level calls that run the model and save results."""
         nc_name = f"{self.model_name}_results.nc"
+        if self.backend == "mtk":
+            save_call = f'save_results(sol, sys, _dim_labels, joinpath(@__DIR__, "{nc_name}"))'
+        else:
+            save_call = f'save_results(sol, _state_map, _dim_labels, joinpath(@__DIR__, "{nc_name}"))'
         return textwrap.dedent(f"""\
             println("Running model…")
             sol = run_model()
             println("Saving results to {nc_name}…")
-            save_results(sol, joinpath(@__DIR__, "{nc_name}"))
+            {save_call}
             println("Done.")
             """)
 
-    def _save_results_function(self) -> str:
-        """Generate a save_results(sol, path) function that writes model output to NetCDF4."""
-        decl_pat = re.compile(r"@variables\s+(\w+)\(t\)(?:\[([^\]]+)\])?")
+    def _dim_labels_block(self) -> str:
+        """Emit ``const _dim_labels = Dict(...)`` for all known subscript ranges."""
+        if not self._subs_elems:
+            return "const _dim_labels = Dict{String,Vector{String}}()\n"
+        entry_lines = []
+        for dim_name in sorted(self._subs_elems):
+            labels = self._subs_elems[dim_name]
+            labels_jl = ", ".join(f'"{lbl}"' for lbl in labels)
+            entry_lines.append(f'    "{dim_name}" => [{labels_jl}],')
+        return "const _dim_labels = Dict(\n" + "\n".join(entry_lines) + "\n)\n"
 
-        # Build reverse map: N_CONST_STR → (nc_dim_name, [element_labels])
-        n_const_to_dim: Dict[str, Tuple[str, List[str]]] = {}
-        for dim_name, size in self._subs_sizes.items():
-            if size <= 0:
-                continue
-            nc = self._jl_n(dim_name)
-            labels = self._subs_elems.get(dim_name, [str(i + 1) for i in range(size)])
-            nc_dim = re.sub(r"[^a-z0-9]+", "_", dim_name.lower()).strip("_")
-            n_const_to_dim[nc] = (nc_dim, labels)
+    def _state_map_block(self) -> str:
+        """Emit ``const _state_map`` for ODE backend.
 
-        # Parse @variables declarations → [(var_name, [N_CONST, ...])]
-        var_list: List[Tuple[str, List[str]]] = []
-        seen: set = set()
-        for decl in self.stock_decls + self.aux_decls:
-            m = decl_pat.search(decl)
-            if not m:
-                continue
-            vname = m.group(1)
-            if vname in seen or vname.startswith("_"):
-                continue
-            seen.add(vname)
-            dims_str = m.group(2)
-            if dims_str:
-                n_consts = [
-                    part.strip().split(":")[-1].strip()
-                    for part in dims_str.split(",")
-                ]
-            else:
-                n_consts = []
-            var_list.append((vname, n_consts))
+        Each entry is ``(name, start_index, [dim_names])``.
+        """
+        if not self.u0_entries:
+            return "const _state_map = Tuple{String,Int,Vector{String}}[]\n"
 
-        if not var_list:
-            return ""
+        # Parse u0_entries to collect (base_name, size) in order
+        stock_order: List[str] = []
+        stock_sizes: Dict[str, int] = {}
+        for entry in self.u0_entries:
+            lhs = entry.split("=>")[0].strip()
+            base = lhs.split("[")[0]
+            if base not in stock_sizes:
+                stock_order.append(base)
+                stock_sizes[base] = 0
+            stock_sizes[base] += 1
 
-        # Collect used N_CONST names in order of first appearance
-        used_n_consts: List[str] = []
-        for _, n_consts in var_list:
-            for nc in n_consts:
-                if nc not in used_n_consts:
-                    used_n_consts.append(nc)
-
-        lines: List[str] = []
-        lines.append("function save_results(sol, path::String)")
-        lines.append("    ds = NCDataset(path, \"c\")")
-        lines.append("    defDim(ds, \"time\", length(sol.t))")
-        lines.append("    let v = defVar(ds, \"time\", Float64, (\"time\",)); v[:] = sol.t; end")
-
-        # Subscript dimension declarations + label coordinates
-        for nc in used_n_consts:
-            if nc in n_const_to_dim:
-                nc_dim, labels = n_const_to_dim[nc]
-                labels_jl = ", ".join(f'"{lbl}"' for lbl in labels)
-                lines.append(f"    defDim(ds, \"{nc_dim}\", {nc})")
-                lines.append(
-                    f"    let v = defVar(ds, \"{nc_dim}_labels\", String, (\"{nc_dim}\",));"
-                    f" v[:] = [{labels_jl}]; end"
-                )
-            else:
-                nc_dim = re.sub(r"[^a-z0-9]+", "_", nc.lower()).strip("_")
-                nc_dim = nc_dim[2:] if nc_dim.startswith("n_") else nc_dim
-                lines.append(f"    defDim(ds, \"{nc_dim}\", {nc})")
-
-        lines.append("")
-        lines.append("    # --- model variables ---")
-
-        for vname, n_consts in var_list:
-            if not n_consts:
-                lines.append(
-                    f"    try; let v = defVar(ds, \"{vname}\", Float64, (\"time\",));"
-                    f" v[:] = sol[sys.{vname}, :]; end; catch; end"
-                )
-            elif len(n_consts) == 1:
-                nc = n_consts[0]
-                nc_dim = n_const_to_dim[nc][0] if nc in n_const_to_dim else (
-                    nc[2:].lower() if nc.upper().startswith("N_") else nc.lower()
-                )
-                lines.append(f"    try")
-                lines.append(
-                    f"        let v = defVar(ds, \"{vname}\", Float64, (\"{nc_dim}\", \"time\"))"
-                )
-                lines.append(f"            for _i in 1:{nc}")
-                lines.append(f"                v[_i, :] = sol[sys.{vname}[_i], :]")
-                lines.append(f"            end")
-                lines.append(f"        end")
-                lines.append(f"    catch; end")
-            elif len(n_consts) == 2:
-                nc1, nc2 = n_consts
-                d1 = n_const_to_dim[nc1][0] if nc1 in n_const_to_dim else nc1.lower()
-                d2 = n_const_to_dim[nc2][0] if nc2 in n_const_to_dim else nc2.lower()
-                lines.append(f"    try")
-                lines.append(
-                    f"        let v = defVar(ds, \"{vname}\", Float64, (\"{d1}\", \"{d2}\", \"time\"))"
-                )
-                lines.append(f"            for _i in 1:{nc1}, _j in 1:{nc2}")
-                lines.append(f"                v[_i, _j, :] = sol[sys.{vname}[_i, _j], :]")
-                lines.append(f"            end")
-                lines.append(f"        end")
-                lines.append(f"    catch; end")
-            else:
-                # ≥3 dimensions
-                dim_names_jl = ", ".join(
-                    f'"{n_const_to_dim[nc][0] if nc in n_const_to_dim else nc.lower()}"'
-                    for nc in n_consts
-                )
-                size_tuple = "(" + ", ".join(nc for nc in n_consts) + ",)"
-                idx_parts = ", ".join(f"_idx[{i + 1}]" for i in range(len(n_consts)))
-                lines.append(f"    try")
-                lines.append(
-                    f"        let v = defVar(ds, \"{vname}\", Float64, ({dim_names_jl}, \"time\"))"
-                )
-                lines.append(f"            for _idx in CartesianIndices{size_tuple}")
-                lines.append(f"                v[Tuple(_idx)..., :] = sol[sys.{vname}[{idx_parts}], :]")
-                lines.append(f"            end")
-                lines.append(f"        end")
-                lines.append(f"    catch; end")
-
-        lines.append("")
-        lines.append("    close(ds)")
-        lines.append("end")
-        lines.append("")
+        lines = ["const _state_map = ["]
+        idx = 1
+        for name in stock_order:
+            size = stock_sizes[name]
+            dim_names = self._var_dims.get(name, [])
+            dims_jl = ", ".join(f'"{d}"' for d in dim_names)
+            lines.append(f'    ("{name}", {idx}, String[{dims_jl}]),')
+            idx += size
+        lines.append("]")
         return "\n".join(lines) + "\n"
 
+    def _save_results_function(self) -> str:
+        """Emit _dim_labels (and _state_map for ODE) so PySD.save_results can be called."""
+        parts = [self._dim_labels_block()]
+        if self.backend == "ode":
+            parts.append(self._state_map_block())
+        return "".join(parts)
+
     def _system_block(self) -> str:
-        sym = re.sub(r"[^a-zA-Z0-9_]", "_", self.model_name)
-        return (
-            f"@named sys = ODESystem(eqs, t; name=:{sym})\n"
-            "sys = structural_simplify(sys)\n"
-        )
+        if self.backend == "mtk":
+            return (
+                "@named sys = ODESystem(eqs, t)\n"
+                "sys = structural_simplify(sys)\n"
+            )
+        return ""
 
     def _full_file_content(self, equations: List[str]) -> str:
         needs_di = bool(self.lookup_const_decls)

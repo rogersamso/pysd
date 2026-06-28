@@ -155,11 +155,11 @@ def _make_data_element(name, ast):
 
 
 def _section_builder_from_elements(elements, path=None, split=False, views_dict=None,
-                                   subscripts=()):
+                                   subscripts=(), backend="ode"):
     section = _make_section(elements, path=path or Path("test_model.mdl"),
                             split=split, views_dict=views_dict,
                             subscripts=subscripts)
-    return JuliaSectionBuilder(section)
+    return JuliaSectionBuilder(section, backend=backend)
 
 
 def _visitor_with_namespace(names=None):
@@ -388,7 +388,7 @@ class TestJuliaASTVisitor:
         (["-"], [5.0, 3.0], "(5.0 - 3.0)"),
         (["*"], [2.0, 4.0], "(2.0 * 4.0)"),
         (["/"], [6.0, 3.0], "(6.0 / 3.0)"),
-        (["^"], [2.0, 8.0], "(2.0 ^ 8.0)"),
+        (["^"], [2.0, 8.0], "pysd_power(2.0, 8.0)"),
     ])
     def test_binary_arithmetic(self, ops, args, expected):
         v, *_ = _visitor_with_namespace()
@@ -422,28 +422,28 @@ class TestJuliaASTVisitor:
         assert julia_op in v.visit(node)
 
     def test_and_uses_helper_function(self):
-        """AND maps to _logical_and helper (not &&) for symbolic MTK compatibility."""
+        """AND maps to pysd_logical_and helper (not &&) for symbolic MTK compatibility."""
         v, _, _, needed = _visitor_with_namespace()
         node = LogicStructure(operators=[":AND:"], arguments=[1.0, 0.0])
         result = v.visit(node)
-        assert "_logical_and(" in result
-        assert "_logical_and" in needed
+        assert "pysd_logical_and(" in result
+        assert "pysd_logical_and" in needed
 
     def test_or_uses_helper_function(self):
-        """OR maps to _logical_or helper (not ||) for symbolic MTK compatibility."""
+        """OR maps to pysd_logical_or helper (not ||) for symbolic MTK compatibility."""
         v, _, _, needed = _visitor_with_namespace()
         node = LogicStructure(operators=[":OR:"], arguments=[1.0, 0.0])
         result = v.visit(node)
-        assert "_logical_or(" in result
-        assert "_logical_or" in needed
+        assert "pysd_logical_or(" in result
+        assert "pysd_logical_or" in needed
 
     def test_unary_not_uses_helper_function(self):
-        """NOT maps to _logical_not helper for symbolic MTK compatibility."""
+        """NOT maps to pysd_logical_not helper for symbolic MTK compatibility."""
         v, _, _, needed = _visitor_with_namespace()
         node = LogicStructure(operators=[":NOT:"], arguments=[1.0])
         result = v.visit(node)
-        assert "_logical_not(" in result
-        assert "_logical_not" in needed
+        assert "pysd_logical_not(" in result
+        assert "pysd_logical_not" in needed
 
     # --- references ---------------------------------------------------------
 
@@ -509,8 +509,8 @@ class TestJuliaASTVisitor:
             arguments=(10.0, 1.0, 5.0, 100.0),
         )
         result = v.visit(node)
-        assert "_pulse_train" in result
-        assert "_pulse_train" in needed
+        assert "pysd_pulse_train" in result
+        assert "pysd_pulse_train" in needed
 
     def test_unknown_function_warns(self):
         v, *_ = _visitor_with_namespace()
@@ -532,7 +532,7 @@ class TestJuliaASTVisitor:
             arguments=(1.0, 2.0, 3.0),
         )
         v.visit(node)
-        helper_name = f"_{func_name.lower()}"
+        helper_name = f"pysd_{func_name.lower()}"
         assert helper_name in needed
 
     def test_pulse_prepends_t(self):
@@ -542,7 +542,7 @@ class TestJuliaASTVisitor:
             arguments=(10.0, 1.0),
         )
         result = v.visit(node)
-        assert result.startswith("_pulse(t,")
+        assert result.startswith("pysd_pulse(t,")
 
     def test_ramp_prepends_t(self):
         v, *_ = _visitor_with_namespace()
@@ -551,7 +551,7 @@ class TestJuliaASTVisitor:
             arguments=(0.1, 5.0),
         )
         result = v.visit(node)
-        assert result.startswith("_ramp(t,")
+        assert result.startswith("pysd_ramp(t,")
 
     # --- newly added functions -----------------------------------------------
 
@@ -562,8 +562,8 @@ class TestJuliaASTVisitor:
             arguments=(2.0, 3.0),
         )
         result = v.visit(node)
-        assert "_power" in result
-        assert "_power" in needed
+        assert "pysd_power" in result
+        assert "pysd_power" in needed
 
     def test_sinh_maps_directly(self):
         v, *_ = _visitor_with_namespace()
@@ -599,9 +599,9 @@ class TestJuliaASTVisitor:
             arguments=(10.0, 3.0),
         )
         result = v.visit(node)
-        assert "_quantum" in result
-        assert "_quantum" in needed
-        assert "_trunc" in needed
+        assert "pysd_quantum" in result
+        assert "pysd_quantum" in needed
+        assert "pysd_trunc" in needed
 
     def test_random_uniform_registered(self):
         v, _, _, needed = _visitor_with_namespace()
@@ -610,8 +610,8 @@ class TestJuliaASTVisitor:
             arguments=(0.0, 1.0, 42.0),
         )
         result = v.visit(node)
-        assert "_random_uniform" in result
-        assert "_random_uniform" in needed
+        assert "pysd_random_uniform" in result
+        assert "pysd_random_uniform" in needed
 
     def test_vector_sort_order_registered(self):
         v, _, _, needed = _visitor_with_namespace()
@@ -620,8 +620,8 @@ class TestJuliaASTVisitor:
             arguments=(1.0, 1.0),
         )
         result = v.visit(node)
-        assert "_vector_sort_order" in result
-        assert "_vector_sort_order" in needed
+        assert "pysd_vector_sort_order" in result
+        assert "pysd_vector_sort_order" in needed
 
     def test_get_time_value_prepends_t(self):
         v, *_ = _visitor_with_namespace()
@@ -630,7 +630,7 @@ class TestJuliaASTVisitor:
             arguments=(1.0, 2.0, 3.0),
         )
         result = v.visit(node)
-        assert result.startswith("_get_time_value(t,")
+        assert result.startswith("pysd_get_time_value(t,")
 
     def test_xpulse_prepends_t(self):
         v, *_ = _visitor_with_namespace()
@@ -639,7 +639,7 @@ class TestJuliaASTVisitor:
             arguments=(10.0, 5.0),
         )
         result = v.visit(node)
-        assert result.startswith("_xpulse(t,")
+        assert result.startswith("pysd_xpulse(t,")
 
     def test_xramp_prepends_t(self):
         v, *_ = _visitor_with_namespace()
@@ -648,7 +648,7 @@ class TestJuliaASTVisitor:
             arguments=(0.5, 10.0),
         )
         result = v.visit(node)
-        assert result.startswith("_xramp(t,")
+        assert result.startswith("pysd_xramp(t,")
 
     # --- InitialStructure / GameStructure -----------------------------------
 
@@ -887,37 +887,37 @@ class TestJuliaModelBuilder:
 
     def test_output_contains_using_mtk(self, tmp_path):
         model = self._minimal_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "using ModelingToolkit" in content
 
     def test_output_contains_stock_declaration(self, tmp_path):
         model = self._minimal_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "@variables population(t)" in content
 
     def test_output_contains_parameter_declaration(self, tmp_path):
         model = self._minimal_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "@parameters birth_rate = 0.03" in content
 
     def test_output_contains_ode_equation(self, tmp_path):
         model = self._minimal_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "D(population)" in content
 
     def test_output_contains_u0(self, tmp_path):
         model = self._minimal_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "population => 1000.0" in content
 
     def test_output_contains_ode_system(self, tmp_path):
         model = self._minimal_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "ODESystem" in content
         assert "structural_simplify" in content
@@ -935,7 +935,7 @@ class TestJuliaModelBuilder:
         variables with no explicit u0 entry; iterating unknowns(sys) ensures all
         are covered. The initialization system itself OOMs on large models."""
         model = self._minimal_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "build_initializeprob = false" in content
         assert "unknowns(sys)" in content
@@ -995,7 +995,7 @@ class TestJuliaModelBuilder:
             original_path=tmp_path / "param_u0_model.mdl",
             sections=(section,),
         )
-        content = JuliaModelBuilder(model).build_model().read_text()
+        content = JuliaModelBuilder(model, backend="mtk").build_model().read_text()
         # bare param reference → inlined
         assert "s => 5.0" in content
         assert "s => k" not in content
@@ -1134,7 +1134,7 @@ class TestModularBuild:
     def test_all_declarations_in_main_file(self, tmp_path):
         """Variable declarations must be in main file so modules can reference them."""
         model = self._two_view_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "@variables population(t)" in content
         assert "@variables capital(t)" in content
@@ -1181,14 +1181,12 @@ class TestTranslateToJulia:
         shutil.copy(src, dst)
 
         from pysd import translate_to_julia
-        # The model uses GET DIRECT CONSTANTS which emits an expected warning
-        with pytest.warns(UserWarning):
-            path = translate_to_julia(dst)
+        path = translate_to_julia(dst)
         assert path.exists()
         assert path.suffix == ".jl"
         content = path.read_text()
-        assert "using ModelingToolkit" in content
-        assert "ODESystem" in content
+        assert "using OrdinaryDiffEq" in content
+        assert "function rhs!" in content
         assert "run_model" in content
 
 
@@ -1297,7 +1295,7 @@ class TestJuliaASTVisitorExtended:
             arguments=(10.0, 2.0),
         )
         result = v.visit(node)
-        assert result.startswith("_pulse(t,")
+        assert result.startswith("pysd_pulse(t,")
 
     def test_model_variable_lookup_call(self):
         """A function call whose name is a model variable → emit as-is."""
@@ -1680,47 +1678,36 @@ class TestJuliaSectionBuilderUnsupported:
 
 class TestJuliaSectionBuilderExternal:
 
-    def test_read_get_constants_scalar_success(self, mocker, tmp_path):
-        import numpy as np
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = np.float64(3.14)
-        mocker.patch(
-            "pysd.py_backend.external.ExtConstant",
-            return_value=mock_ext,
-        )
+    def test_read_get_constants_scalar_success(self, tmp_path):
+        # Single-component GCS: runtime read path emits pysd_xlsx_read_constant
+        # without calling ExtConstant at translation time.
         ast = GetConstantsStructure(file="data.xlsx", tab="Sheet1", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Rate", components=[comp])
         sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
         sb.build_section()
-        assert any("@parameters rate = 3.14" in d for d in sb.param_decls)
+        assert any("@parameters rate = pysd_xlsx_read_constant" in d for d in sb.param_decls)
 
-    def test_read_get_constants_array_success(self, mocker, tmp_path):
-        import numpy as np
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = np.array([1.0, 2.0, 3.0])
-        mocker.patch(
-            "pysd.py_backend.external.ExtConstant",
-            return_value=mock_ext,
-        )
+    def test_read_get_constants_array_success(self, tmp_path):
+        # Single-component GCS with no declared subscripts: runtime read path,
+        # ends up in param_decls (not ext_const_decls) as pysd_xlsx_read_constant.
         ast = GetConstantsStructure(file="data.xlsx", tab="Sheet1", cell="B1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Costs", components=[comp])
         sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
         sb.build_section()
-        assert any("const costs = [1.0" in d for d in sb.ext_const_decls)
+        assert any("@parameters costs = pysd_xlsx_read_constant" in d for d in sb.param_decls)
 
-    def test_read_get_constants_failure_falls_through(self, mocker, tmp_path):
-        mocker.patch(
-            "pysd.py_backend.external.ExtConstant",
-            side_effect=FileNotFoundError("no such file"),
-        )
+    def test_read_get_constants_failure_falls_through(self, tmp_path):
+        # With runtime reading, missing Excel files are NOT detected at translation
+        # time — the pysd_xlsx_read_constant call is emitted unconditionally and
+        # will raise at Julia load time. No UserWarning is raised here.
         ast = GetConstantsStructure(file="missing.xlsx", tab="Sheet1", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Bad Const", components=[comp])
-        with pytest.warns(UserWarning):
-            sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
-            sb.build_section()
+        sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
+        sb.build_section()
+        assert any("pysd_xlsx_read_constant" in d for d in sb.param_decls)
 
     def test_get_lookups_scalar_success(self, mocker, tmp_path):
         import numpy as np
@@ -1742,96 +1729,54 @@ class TestJuliaSectionBuilderExternal:
         sb.build_section()
         assert any("effect_table_itp" in d for d in sb.lookup_const_decls)
 
-    def test_get_lookups_2d_success(self, mocker, tmp_path):
-        import numpy as np
-        import xarray as xr
-        n_pts, n_subs = 3, 2
-        xs = np.array([0.0, 1.0, 2.0])
-        ys = np.ones((n_pts, n_subs))
-        da = xr.DataArray(ys, coords={"lookup_dim": xs}, dims=["lookup_dim", "sub"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-        mocker.patch(
-            "pysd.py_backend.external.ExtLookup",
-            return_value=mock_ext,
-        )
+    def test_get_lookups_2d_success(self, tmp_path):
+        # Single-component lookup with no declared subscripts uses the runtime
+        # scalar path (pysd_xlsx_read_series) regardless of actual data shape.
+        # Data dimensionality is unknown at translation time.
         ast = GetLookupsStructure(file="data.xlsx", tab="Sheet1",
                                   x_row_or_col="x_col", cell="B1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Sub Table", components=[comp])
         sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
         sb.build_section()
-        assert any("sub_table_fns" in d for d in sb.lookup_const_decls)
-        assert any("sub_table(i, x)" in d for d in sb.lookup_func_decls)
+        assert any("sub_table_itp" in d for d in sb.lookup_const_decls)
+        assert any("sub_table(x)" in d for d in sb.lookup_func_decls)
 
-    def test_get_lookups_3d_emits_2d_dispatch(self, mocker, tmp_path):
-        # 3D data (n_points × n_dim1 × n_dim2) is now handled correctly:
-        # emits one sub-function per (i, j) pair and a 2-index dispatch.
-        import numpy as np
-        import xarray as xr
-        xs = np.array([0.0, 1.0])
-        ys = np.ones((2, 2, 3))
-        da = xr.DataArray(ys, coords={"lookup_dim": xs},
-                          dims=["lookup_dim", "d1", "d2"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-        mocker.patch(
-            "pysd.py_backend.external.ExtLookup",
-            return_value=mock_ext,
-        )
+    def test_get_lookups_3d_emits_2d_dispatch(self, tmp_path):
+        # Single-component lookup with no declared subscripts uses the runtime
+        # scalar path. Data dimensionality (3D) is irrelevant at translation
+        # time — no ExtLookup is called, no warnings are emitted.
         ast = GetLookupsStructure(file="data.xlsx", tab="Sheet1",
                                   x_row_or_col="x", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Hd Table", components=[comp])
-        import warnings
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
-            sb.build_section()
-        assert not [x for x in w if "> 1D subs" in str(x.message) or "> 2D" in str(x.message)]
-        # 2×3 = 6 sub-functions + fns array + dispatch
-        assert any("hd_table_1_1" in d for d in sb.lookup_const_decls)
-        assert any("hd_table_2_3" in d for d in sb.lookup_const_decls)
-        assert any("hd_table(i, j, x)" in d for d in sb.lookup_func_decls)
+        sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
+        sb.build_section()
+        assert any("hd_table_itp" in d for d in sb.lookup_const_decls)
+        assert any("hd_table(x)" in d for d in sb.lookup_func_decls)
 
-    def test_get_lookups_4d_warns_and_flattens(self, mocker, tmp_path):
-        # Arrays with >3 dimensions still emit a warning and fall back to
-        # first-column approximation.
-        import numpy as np
-        import xarray as xr
-        xs = np.array([0.0, 1.0])
-        ys = np.ones((2, 2, 2, 2))
-        da = xr.DataArray(ys, coords={"lookup_dim": xs},
-                          dims=["lookup_dim", "d1", "d2", "d3"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-        mocker.patch(
-            "pysd.py_backend.external.ExtLookup",
-            return_value=mock_ext,
-        )
+    def test_get_lookups_4d_warns_and_flattens(self, tmp_path):
+        # Single-component no-subscript lookup: runtime scalar path is used.
+        # No warning is emitted (ExtLookup not called at translation time).
         ast = GetLookupsStructure(file="data.xlsx", tab="Sheet1",
                                   x_row_or_col="x", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Hd Table", components=[comp])
-        with pytest.warns(UserWarning, match="> 2D"):
-            sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
-            sb.build_section()
+        sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
+        sb.build_section()
         assert any("hd_table_itp" in d for d in sb.lookup_const_decls)
 
-    def test_get_lookups_read_failure_warns(self, mocker, tmp_path):
-        mocker.patch(
-            "pysd.py_backend.external.ExtLookup",
-            side_effect=FileNotFoundError("no such file"),
-        )
+    def test_get_lookups_read_failure_warns(self, tmp_path):
+        # Runtime path: ExtLookup is never called at translation time, so
+        # no warning is raised even for missing files. The lookup declaration
+        # is always emitted (file read happens at Julia load time).
         ast = GetLookupsStructure(file="bad.xlsx", tab="Sheet1",
                                   x_row_or_col="x", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Bad Lut", components=[comp])
-        with pytest.warns(UserWarning, match="Could not read GET LOOKUPS"):
-            sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
-            sb.build_section()
-        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("GET_LOOKUPS_FAILED" in e for e in all_eqs)
+        sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
+        sb.build_section()
+        assert any("bad_lut" in d for d in sb.lookup_const_decls)
 
     def test_get_data_scalar_success(self, mocker, tmp_path):
         import numpy as np
@@ -1853,61 +1798,37 @@ class TestJuliaSectionBuilderExternal:
         sb.build_section()
         assert any("historic_eff_itp" in d for d in sb.lookup_const_decls)
 
-    def test_get_data_2d_success(self, mocker, tmp_path):
-        import numpy as np
-        import xarray as xr
-        ts = np.array([1995.0, 2000.0])
-        vals = np.ones((2, 3))
-        da = xr.DataArray(vals, coords={"time": ts}, dims=["time", "sub"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-        mocker.patch(
-            "pysd.py_backend.external.ExtData",
-            return_value=mock_ext,
-        )
+    def test_get_data_2d_success(self, tmp_path):
+        # Single-component GET DATA with no declared subscripts: runtime scalar
+        # path emits _itp regardless of actual data shape (unknown at translate time).
         ast = GetDataStructure(file="data.xlsx", tab="Sheet1",
                                time_row_or_col="time_col", cell="B1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Sub Series", components=[comp])
         sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
         sb.build_section()
-        assert any("sub_series_fns" in d for d in sb.lookup_const_decls)
+        assert any("sub_series_itp" in d for d in sb.lookup_const_decls)
 
-    def test_get_data_read_failure_warns(self, mocker, tmp_path):
-        mocker.patch(
-            "pysd.py_backend.external.ExtData",
-            side_effect=FileNotFoundError("no such file"),
-        )
+    def test_get_data_read_failure_warns(self, tmp_path):
+        # Runtime path: ExtData is never called at translation time, so no
+        # warning is raised even for missing files. The _itp declaration is
+        # always emitted (file read happens at Julia load time).
         ast = GetDataStructure(file="bad.xlsx", tab="Sheet1",
                                time_row_or_col="t_col", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Bad Data", components=[comp])
-        with pytest.warns(UserWarning, match="Could not read GET DATA"):
-            sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
-            sb.build_section()
-        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("GET_DATA_FAILED" in e for e in all_eqs)
+        sb = _section_builder_from_elements([elem], path=tmp_path / "m.mdl")
+        sb.build_section()
+        assert any("bad_data" in d for d in sb.lookup_const_decls)
 
     # ------------------------------------------------------------------
     # Per-element-component GET LOOKUPS / GET DATA (Task B fix)
     # ------------------------------------------------------------------
 
-    def test_get_lookups_per_element_component_coords_built_correctly(self, mocker, tmp_path):
+    def test_get_lookups_per_element_component_coords_built_correctly(self, tmp_path):
         """When a GET LOOKUPS element has per-sector-element components (each
-        comp specifies a single element name rather than a range name), _coords
-        must map the element back to its parent range with a single-element list.
-        ExtLookup should be called with coords={'sector': ['A']}, not {'A': []}."""
-        import numpy as np
-        import xarray as xr
-
-        xs = np.array([0.0, 1.0])
-        ys = np.ones((2, 1))  # shape (n_pts, 1) — scalar per element
-        da = xr.DataArray(ys, coords={"lookup_dim": xs}, dims=["lookup_dim", "sector"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-
-        ext_cls = mocker.patch("pysd.py_backend.external.ExtLookup", return_value=mock_ext)
-
+        comp specifies a single element name rather than a range name), the
+        multi-component runtime dispatch path emits per-component _fns entries."""
         sr_sector = _make_subscript_range("sector", ["A", "B"])
 
         # Two components: one per element of 'sector'
@@ -1920,14 +1841,9 @@ class TestJuliaSectionBuilderExternal:
         sb = _section_builder_from_elements([elem], subscripts=[sr_sector], path=tmp_path / "m.mdl")
         sb.build_section()
 
-        # ExtLookup must have been constructed
-        assert ext_cls.called
-        init_call_kwargs = ext_cls.call_args
-        coords_arg = init_call_kwargs[1].get("coords") or (init_call_kwargs[0][4] if len(init_call_kwargs[0]) > 4 else None)
-        # coords must map the parent range name 'sector' to ['A'], not '' to []
-        if coords_arg is not None:
-            assert "sector" in coords_arg, f"Expected 'sector' in coords, got {coords_arg}"
-            assert coords_arg["sector"] == ["A"], f"Expected ['A'], got {coords_arg['sector']}"
+        # Runtime multi-component path: emits _1_fns and _2_fns entries
+        assert any("my_lookup_1_fns" in d for d in sb.lookup_const_decls)
+        assert any("my_lookup_2_fns" in d for d in sb.lookup_const_decls)
 
     def test_get_lookups_per_element_no_placeholder_emitted(self, mocker, tmp_path):
         """Per-element GET LOOKUPS components must NOT emit a GET_LOOKUPS_FAILED
@@ -1960,18 +1876,9 @@ class TestJuliaSectionBuilderExternal:
         # A lookup interpolation constant must have been declared
         assert sb.lookup_const_decls, "No lookup constant declarations emitted"
 
-    def test_get_data_per_element_coords_uses_parent_range(self, mocker, tmp_path):
-        """GET DATA with per-element components: coords must use parent range name."""
-        import numpy as np
-        import xarray as xr
-
-        xs = np.array([1995.0, 2000.0])
-        ys = np.ones((2, 1))
-        da = xr.DataArray(ys, coords={"time": xs}, dims=["time", "fuel"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-        ext_cls = mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
-
+    def test_get_data_per_element_coords_uses_parent_range(self, tmp_path):
+        """GET DATA with per-element components: multi-component runtime dispatch
+        emits per-component _fns entries without calling ExtData at translate time."""
         sr_fuel = _make_subscript_range("fuel", ["coal", "gas", "oil"])
 
         ast_c = GetDataStructure(file="e.xlsx", tab="W", time_row_or_col="yr", cell="coal_c")
@@ -1986,11 +1893,8 @@ class TestJuliaSectionBuilderExternal:
         sb = _section_builder_from_elements([elem], subscripts=[sr_fuel], path=tmp_path / "m.mdl")
         sb.build_section()
 
-        assert ext_cls.called
-        init_kwargs = ext_cls.call_args[1] if ext_cls.call_args[1] else {}
-        coords_arg = init_kwargs.get("coords")
-        if coords_arg:
-            assert "fuel" in coords_arg, f"Expected parent range 'fuel' in coords, got {coords_arg}"
+        # Runtime multi-component path: emits per-component _fns entries
+        assert any("historic_share_1_fns" in d for d in sb.lookup_const_decls)
 
 
 # ===========================================================================
@@ -2018,11 +1922,12 @@ class TestJuliaFileGeneration:
         sb.needed_helpers.clear()
         assert sb._helpers_block() == ""
 
-    def test_helpers_block_contains_implementation(self, tmp_path):
+    def test_helpers_block_always_empty_with_pysd_jl(self, tmp_path):
         sb = self._minimal_sb(tmp_path)
-        sb.needed_helpers.add("_xidz")
+        sb.needed_helpers.add("pysd_xidz")
         block = sb._helpers_block()
-        assert "_xidz" in block
+        # Helpers are provided by `using PySD` — no inlining needed
+        assert block == ""
 
     def test_lookup_block_empty_when_none(self, tmp_path):
         sb = self._minimal_sb(tmp_path)
@@ -2059,10 +1964,41 @@ class TestJuliaFileGeneration:
     def test_equations_block_empty(self, tmp_path):
         sb = self._minimal_sb(tmp_path)
         block = sb._equations_block([])
+        assert "function rhs!" in block
+
+    def test_equations_block_empty_mtk(self, tmp_path):
+        stock = _make_stock_element("S", 1.0, 10.0)
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        sb = _section_builder_from_elements(
+            [stock] + controls, path=tmp_path / "m.mdl", backend="mtk"
+        )
+        sb.build_section()
+        block = sb._equations_block([])
         assert block == "eqs = Equation[]\n"
 
     def test_u0_block_empty(self, tmp_path):
         sb = self._minimal_sb(tmp_path)
+        sb.u0_entries.clear()
+        block = sb._u0_block()
+        assert block == "u0 = Float64[]\n"
+
+    def test_u0_block_empty_mtk(self, tmp_path):
+        stock = _make_stock_element("S", 1.0, 10.0)
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        sb = _section_builder_from_elements(
+            [stock] + controls, path=tmp_path / "m.mdl", backend="mtk"
+        )
+        sb.build_section()
         sb.u0_entries.clear()
         block = sb._u0_block()
         assert block == "u0 = []\n"
@@ -2629,7 +2565,7 @@ class TestCoverageGaps:
         assert "!= 0" in result, (
             f"Expected '!= 0' in ifelse condition for bare reference, got: {result}"
         )
-        assert result.startswith("ifelse("), f"Expected ifelse call, got: {result}"
+        assert "pysd_ifelse(" in result, f"Expected pysd_ifelse call, got: {result}"
 
     def test_ifelse_logic_condition_not_double_wrapped(self):
         """IF THEN ELSE with a comparison condition must NOT add != 0.
@@ -2741,12 +2677,8 @@ class TestCoverageGaps:
         assert any("_i0" in e and "_i1" in e for e in eqs)
         assert any("D(matrix_stock" in e for e in eqs)
 
-    def test_get_constants_control_element(self, mocker, tmp_path):
-        """GetConstantsStructure for a control element updates control_vals."""
-        import numpy as np
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = np.float64(100.0)
-        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+    def test_get_constants_control_element(self, tmp_path):
+        """GetConstantsStructure for a control element stores runtime expression."""
         ast = GetConstantsStructure(file="d.xlsx", tab="Sheet1", cell="A1")
         comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=ast)
         final_time = AbstractControlElement(name="FINAL TIME", components=[comp])
@@ -2759,7 +2691,7 @@ class TestCoverageGaps:
             [final_time] + other_controls, path=tmp_path / "m.mdl"
         )
         sb.build_section()
-        assert sb.control_vals["final_time"] == "100.0"
+        assert "pysd_xlsx_read_constant" in sb.control_vals["final_time"]
 
     def test_subscripted_aux_1d_control_branch(self):
         """1D subscripted control aux updates control_vals."""
@@ -2812,27 +2744,18 @@ class TestCoverageGaps:
         sb.build_section()
         assert any("lut_itp" in d for d in sb.lookup_const_decls)
 
-    def test_get_lookups_multi_component(self, mocker, tmp_path):
-        """Multi-component GetLookupsStructure merges coords (exercises inner for loop)."""
-        import numpy as np
-        import xarray as xr
-        xs = np.array([0.0, 1.0])
-        ys = np.array([0.0, 1.0])
-        da = xr.DataArray(ys, coords={"lookup_dim": xs}, dims=["lookup_dim"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-        mocker.patch("pysd.py_backend.external.ExtLookup", return_value=mock_ext)
+    def test_get_lookups_multi_component(self, tmp_path):
+        """Multi-component GetLookupsStructure uses runtime per-component dispatch."""
         ast1 = GetLookupsStructure(file="d.xlsx", tab="S", x_row_or_col="x", cell="A1")
         ast2 = GetLookupsStructure(file="d.xlsx", tab="S", x_row_or_col="x", cell="B1")
         sr = _make_subscript_range("dim_a", ["X"])
-        # Give components subscripts so _coords returns non-empty dicts
         comp1 = AbstractComponent(subscripts=[["dim_a"], []], ast=ast1)
         comp2 = AbstractComponent(subscripts=[["dim_a"], []], ast=ast2)
         elem = AbstractElement(name="Multi Lut", components=[comp1, comp2])
         sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl",
                                              subscripts=[sr])
         sb.build_section()
-        assert any("multi_lut_itp" in d for d in sb.lookup_const_decls)
+        assert any("multi_lut_1_fns" in d for d in sb.lookup_const_decls)
 
     def test_get_lookups_data_without_values_attr(self, mocker, tmp_path):
         """_process_get_lookups handles data without .values (plain numpy array)."""
@@ -2882,16 +2805,8 @@ class TestCoverageGaps:
         sb.build_section()
         assert any("historic_data_itp" in d for d in sb.lookup_const_decls)
 
-    def test_get_data_multi_component(self, mocker, tmp_path):
-        """Multi-component GetDataStructure merges coords (exercises inner for loop)."""
-        import numpy as np
-        import xarray as xr
-        ts = np.array([1995.0, 2000.0])
-        vals = np.array([1.0, 2.0])
-        da = xr.DataArray(vals, coords={"time": ts}, dims=["time"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-        mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
+    def test_get_data_multi_component(self, tmp_path):
+        """Multi-component GetDataStructure uses runtime per-component dispatch."""
         ast1 = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
         ast2 = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="B1")
         sr = _make_subscript_range("dim_b", ["Y"])
@@ -2901,51 +2816,29 @@ class TestCoverageGaps:
         sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl",
                                              subscripts=[sr])
         sb.build_section()
-        assert any("multi_data_itp" in d for d in sb.lookup_const_decls)
+        assert any("multi_data_1_fns" in d for d in sb.lookup_const_decls)
 
-    def test_get_data_no_time_dimension_raises_into_fallback(self, mocker, tmp_path):
-        """Data without time dimension causes ValueError → fallback placeholder."""
-        import numpy as np
-        mock_data = mocker.MagicMock()
-        del mock_data.values
-        mock_data.__array__ = lambda *a: np.array([1.0, 2.0])
-        mock_data.coords = {}  # no "time" coord
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = mock_data
-        mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
+    def test_get_data_no_time_dimension_raises_into_fallback(self, tmp_path):
+        """GET DATA with no declared subscripts: runtime scalar path always emits _itp.
+        No warning is raised (ExtData not called at translation time)."""
         ast = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="No Time", components=[comp])
-        with pytest.warns(UserWarning, match="Could not read GET DATA"):
-            sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl")
-            sb.build_section()
+        sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl")
+        sb.build_section()
+        assert any("no_time_itp" in d for d in sb.lookup_const_decls)
 
-    def test_get_data_3d_emits_2d_dispatch(self, mocker, tmp_path):
-        """3D data (n_time × n_dim1 × n_dim2) is now handled: emits per-(i,j)
-        sub-functions and a 2-index dispatch without raising or using a placeholder."""
-        import numpy as np
-        import xarray as xr
-        import warnings
-        ts = np.array([1995.0, 2000.0])
-        vals = np.ones((2, 3, 4))
-        da = xr.DataArray(vals, coords={"time": ts}, dims=["time", "d1", "d2"])
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = da
-        mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
+    def test_get_data_3d_emits_2d_dispatch(self, tmp_path):
+        """Single-component GET DATA with no declared subscripts: runtime scalar
+        path emits _itp. No warnings, no FAILED placeholder."""
         ast = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Hfc Emissions", components=[comp])
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl")
-            sb.build_section()
-        assert not [x for x in w if "Could not read GET DATA" in str(x.message)]
+        sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl")
+        sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
         assert not any("GET_DATA_FAILED" in e for e in all_eqs)
-        # 3×4 = 12 sub-functions emitted
-        assert any("hfc_emissions_1_1" in d for d in sb.lookup_const_decls)
-        assert any("hfc_emissions_3_4" in d for d in sb.lookup_const_decls)
-        assert any("hfc_emissions(i, j, x)" in d for d in sb.lookup_func_decls)
+        assert any("hfc_emissions_itp" in d for d in sb.lookup_const_decls)
 
     def test_initial_from_literal_float(self):
         """INITIAL(5.0) resolves to literal without needing reference resolution."""
@@ -2996,12 +2889,8 @@ class TestCoverageGaps:
         result = sb._resolve_ref_initial("x", depth=3)
         assert result is None
 
-    def test_read_get_constants_multi_component(self, mocker, tmp_path):
-        """Multi-component GetConstantsStructure merges coords (exercises inner for loop)."""
-        import numpy as np
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = np.float64(5.0)
-        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+    def test_read_get_constants_multi_component(self, tmp_path):
+        """Multi-component GCS emits pysd_xlsx_read_constant vector call in ext_const_decls."""
         ast1 = GetConstantsStructure(file="d.xlsx", tab="S", cell="A1")
         ast2 = GetConstantsStructure(file="d.xlsx", tab="S", cell="B1")
         sr = _make_subscript_range("dim_c", ["Z"])
@@ -3011,7 +2900,8 @@ class TestCoverageGaps:
         sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl",
                                              subscripts=[sr])
         sb.build_section()
-        assert any("multi_const" in d for d in sb.param_decls)
+        all_decls = sb.ext_const_decls + sb.param_decls
+        assert any("multi_const" in d for d in all_decls)
 
     def test_read_get_constants_split_range_collision_resolved(self, mocker, tmp_path):
         """Multi-component where two subscript positions share the same parent
@@ -3056,24 +2946,11 @@ class TestCoverageGaps:
         assert not [x for x in w if "Could not read external constant" in str(x.message)]
         assert any("eff_rate" in d for d in sb.ext_const_decls + sb.param_decls)
 
-    def test_read_get_constants_piecewise_mixed(self, mocker, tmp_path):
+    def test_read_get_constants_piecewise_mixed(self, tmp_path):
         """Piecewise constant: one GCS component + two literal-0 components.
-        Should produce a combined array parameter without warnings."""
-        import numpy as np
-        import xarray as xr
-        import warnings
-
+        Emits pysd_xlsx_read_constant vector call (runtime Excel reading)."""
         sr_fs = _make_subscript_range("final_sources", ["elec", "heat", "liq"])
         sr_mfs = _make_subscript_range("matter_final_sources", ["liq"])
-
-        mock_ext = mocker.MagicMock()
-        da = xr.DataArray(
-            np.array([0.3]),
-            coords={"matter_final_sources": ["liq"]},
-            dims=["matter_final_sources"],
-        )
-        mock_ext.data = da
-        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
 
         ast_gcs = GetConstantsStructure(file="d.xlsx", tab="S", cell="r1")
         comp_gcs = AbstractComponent(subscripts=[["matter_final_sources"], []], ast=ast_gcs)
@@ -3084,16 +2961,11 @@ class TestCoverageGaps:
             [elem], path=tmp_path / "m.mdl",
             subscripts=[sr_fs, sr_mfs],
         )
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            sb.build_section()
-        # No "Could not read" warnings
-        assert not [x for x in w if "Could not read" in str(x.message)]
-        # The value should be a combined array [0.0, 0.0, 0.3] (ordered by final_sources)
+        sb.build_section()
         all_decls = sb.ext_const_decls + sb.param_decls
         assert any("policy_share" in d for d in all_decls)
         combined = next(d for d in all_decls if "policy_share" in d)
-        assert "0.3" in combined
+        assert "pysd_xlsx_read_constant" in combined and "r1" in combined
 
     def test_read_get_constants_piecewise_2d(self, mocker, tmp_path):
         """Piecewise 2D constant: one GCS component covering a sub-range of the
@@ -3233,13 +3105,14 @@ class TestCoverageGaps:
         assert "eqs = Equation[]" in content
 
     def test_format_julia_value_3d_array_flattened(self):
-        """3D numpy array → flattened Julia 1D vector."""
+        """3D numpy array → reshape expression (flat vector + shape dims)."""
         import numpy as np
         from pysd.builders.julia.julia_model_builder import _format_julia_value
         arr = np.ones((2, 2, 2))
         result = _format_julia_value(arr)
-        assert result.startswith("[") and result.endswith("]")
-        assert ";" not in result  # 1D, not 2D matrix syntax
+        assert "[" in result       # contains a flat vector component
+        assert "1.0" in result     # values are present
+        assert ";" not in result   # no 2D matrix row-separator syntax
 
 
 # ===========================================================================
@@ -3604,18 +3477,16 @@ class TestJSONAccumulateConstant:
         assert data["constants"]["da_const"]["values"] == pytest.approx(9.9)
 
     def test_exception_in_accumulate_uses_julia_val_fallback(self, mocker, tmp_path):
-        """If _json_accumulate_constant raises, the julia literal is stored."""
+        """If _json_accumulate_constant raises, the julia runtime-read literal is stored."""
         import json
-        import numpy as np
-        # First call to ExtConstant (from _read_get_constants) succeeds
-        # Second call (from _json_accumulate_constant) raises
-        mock_ext_good = mocker.MagicMock()
-        mock_ext_good.data = np.float64(5.0)
-        mock_ext_fail = mocker.MagicMock()
-        mock_ext_fail.initialize.side_effect = RuntimeError("second call fails")
+        # _read_get_constants now emits pysd_xlsx_read_constant (no ExtConstant call).
+        # Only _json_accumulate_constant calls ExtConstant; when it raises, the
+        # fallback stores julia_val (the runtime xlsx call string).
+        mock_ext = mocker.MagicMock()
+        mock_ext.initialize.side_effect = RuntimeError("accumulate fails")
         mocker.patch(
             "pysd.py_backend.external.ExtConstant",
-            side_effect=[mock_ext_good, mock_ext_fail],
+            return_value=mock_ext,
         )
         ast = GetConstantsStructure(file="d.xlsx", tab="S", cell="A1")
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
@@ -3632,9 +3503,9 @@ class TestJSONAccumulateConstant:
         model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
         JuliaModelBuilder(model, data_format="json").build_model()
         data = json.loads((tmp_path / "m_data.json").read_text())
-        # Fallback stores the julia literal string
+        # Fallback stores the julia runtime-read expression
         assert "fallback_const" in data["constants"]
-        assert data["constants"]["fallback_const"]["values"] == "5.0"
+        assert "pysd_xlsx_read_constant" in data["constants"]["fallback_const"]["values"]
 
 
 # ===========================================================================
@@ -4052,11 +3923,11 @@ class TestMacroSupport:
         assert "Macro my_macro" in content
 
     def test_main_file_unaffected_by_macro(self, tmp_path):
-        """Main model still contains ODESystem even with a macro section."""
+        """Main model still contains rhs! function even with a macro section."""
         model = self._two_section_model(tmp_path)
         path = JuliaModelBuilder(model).build_model()
         content = path.read_text()
-        assert "ODESystem" in content
+        assert "function rhs!" in content
         assert "population" in content
 
 
@@ -4191,7 +4062,6 @@ class TestMdlFileTranslation:
         jl_path = self._translate(mdl, tmp_path)
         content = jl_path.read_text()
         assert "_df_" in content
-        assert "D(_df_" in content
 
     def test_julia_trend_emits_smooth_stock(self, tmp_path):
         mdl = self.MORE_TESTS / "julia_trend" / "test_julia_trend.mdl"
@@ -4200,7 +4070,6 @@ class TestMdlFileTranslation:
         jl_path = self._translate(mdl, tmp_path)
         content = jl_path.read_text()
         assert "_sm_" in content
-        assert "D(_sm_" in content
 
     def test_julia_forecast_emits_smooth_stock(self, tmp_path):
         mdl = self.MORE_TESTS / "julia_forecast" / "test_julia_forecast.mdl"
@@ -4374,3 +4243,287 @@ class TestInvertMatrix:
         assert ", 2.0)" not in content and ", 3.0)" not in content, (
             "inv() should not receive a size argument in generated code"
         )
+
+
+# ===========================================================================
+# Backend dispatch — ODE (default) and MTK
+# ===========================================================================
+
+class TestBackendDispatch:
+    """Tests that verify each backend emits the right Julia code."""
+
+    # ---- helpers -----------------------------------------------------------
+
+    def _minimal_model(self, tmp_path, backend="ode"):
+        birth_rate_comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=0.03)
+        birth_rate_elem = AbstractElement(name="Birth Rate", components=[birth_rate_comp])
+
+        flow_ast = ArithmeticStructure(
+            operators=["*"],
+            arguments=[ReferenceStructure("Population"), ReferenceStructure("Birth Rate")],
+        )
+        pop_ast = IntegStructure(flow=flow_ast, initial=1000.0)
+        pop_comp = AbstractComponent(subscripts=[[], []], ast=pop_ast)
+        pop_elem = AbstractElement(name="Population", components=[pop_comp])
+
+        control_elems = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 100.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+
+        section = _make_section(
+            elements=[birth_rate_elem, pop_elem] + control_elems,
+            path=tmp_path / "my_model.mdl",
+        )
+        return AbstractModel(
+            original_path=tmp_path / "my_model.mdl",
+            sections=(section,),
+        )
+
+    def _build(self, tmp_path, backend="ode"):
+        model = self._minimal_model(tmp_path, backend)
+        path = JuliaModelBuilder(model, backend=backend).build_model()
+        return path.read_text()
+
+    # ---- invalid backend ---------------------------------------------------
+
+    def test_invalid_backend_raises(self, tmp_path):
+        model = self._minimal_model(tmp_path)
+        with pytest.raises(ValueError, match="backend"):
+            JuliaModelBuilder(model, backend="bad")
+
+    # ---- ODE backend header ------------------------------------------------
+
+    def test_ode_no_modeling_toolkit_in_header(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "ModelingToolkit" not in content
+
+    def test_ode_uses_ordinary_diffeq(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "OrdinaryDiffEq" in content
+
+    # ---- ODE backend declarations ------------------------------------------
+
+    def test_ode_parameters_become_const(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "const birth_rate = 0.03" in content
+
+    def test_ode_no_at_parameters_declaration(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "@parameters" not in content
+
+    def test_ode_no_at_variables_declaration(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "@variables" not in content
+
+    # ---- ODE backend equations ---------------------------------------------
+
+    def test_ode_uses_rhs_function(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "function rhs!(du, u, p, t)" in content
+
+    def test_ode_no_equation_array(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "Equation[" not in content
+
+    def test_ode_no_ode_system(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "ODESystem" not in content
+
+    # ---- ODE backend u0 ---------------------------------------------------
+
+    def test_ode_u0_is_float64_array(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "u0 = Float64[" in content
+
+    def test_ode_u0_has_numeric_initial(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "1000.0" in content
+        assert "population =>" not in content
+
+    # ---- ODE backend lookups -----------------------------------------------
+
+    def test_ode_lookup_has_no_register_symbolic(self, tmp_path):
+        lut_ast = LookupsStructure(
+            x=(0.0, 1.0), y=(0.0, 1.0),
+            x_limits=(0.0, 1.0), y_limits=(0.0, 1.0),
+            type="interpolate",
+        )
+        lut_comp = AbstractLookup(subscripts=[[], []], ast=lut_ast)
+        lut_elem = AbstractElement(name="Effect LUT", components=[lut_comp])
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[lut_elem] + controls, path=tmp_path / "m.mdl"
+        )
+        model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
+        content = JuliaModelBuilder(model, backend="ode").build_model().read_text()
+        assert "@register_symbolic" not in content
+
+    # ---- ODE backend save metadata ----------------------------------------
+
+    def test_ode_emits_state_map(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "_state_map" in content
+
+    def test_ode_state_map_contains_stock_name(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert '"population"' in content
+
+    def test_ode_state_map_contains_u_index(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert '("population", 1,' in content
+
+    def test_ode_emits_dim_labels(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "_dim_labels" in content
+
+    def test_ode_calls_save_results_with_state_map(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert "save_results(sol, _state_map, _dim_labels," in content
+
+    def test_ode_subscripted_state_map_has_dim_names(self, tmp_path):
+        sr = _make_subscript_range("sectors", ["A", "B", "C"])
+        stock_ast = IntegStructure(
+            flow=ReferenceStructure("Inflow"),
+            initial=0.0,
+        )
+        stock_comp = AbstractComponent(subscripts=[["sectors"], []], ast=stock_ast)
+        stock_elem = AbstractElement(name="Capital", components=[stock_comp])
+        inflow_elem = _make_subscripted_element("Inflow", 1.0, "sectors")
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[stock_elem, inflow_elem] + controls,
+            path=tmp_path / "sub_model.mdl",
+            subscripts=[sr],
+        )
+        model = AbstractModel(original_path=tmp_path / "sub_model.mdl", sections=(section,))
+        content = JuliaModelBuilder(model, backend="ode").build_model().read_text()
+        assert '"capital"' in content
+        assert '"sectors"' in content
+
+    def test_ode_dim_labels_contains_elements(self, tmp_path):
+        sr = _make_subscript_range("sectors", ["Agriculture", "Industry"])
+        elem = _make_subscripted_element("cost", 1.0, "sectors",
+                                         comp_class=AbstractUnchangeableConstant)
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[elem] + controls,
+            path=tmp_path / "m.mdl",
+            subscripts=[sr],
+        )
+        model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
+        content = JuliaModelBuilder(model, backend="ode").build_model().read_text()
+        assert '"Agriculture"' in content
+        assert '"Industry"' in content
+
+    # ---- MTK backend header ------------------------------------------------
+
+    def test_mtk_has_modeling_toolkit_in_header(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "ModelingToolkit" in content
+
+    # ---- MTK backend declarations ------------------------------------------
+
+    def test_mtk_keeps_at_variables(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "@variables population(t)" in content
+
+    def test_mtk_keeps_at_parameters(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "@parameters birth_rate = 0.03" in content
+
+    # ---- MTK backend equations ---------------------------------------------
+
+    def test_mtk_uses_equation_array(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "eqs = Equation[" in content
+
+    def test_mtk_equation_uses_tilde(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "D(population) ~" in content
+
+    def test_mtk_has_ode_system(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "ODESystem" in content
+        assert "structural_simplify" in content
+
+    # ---- MTK backend u0 ---------------------------------------------------
+
+    def test_mtk_u0_uses_pair_syntax(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "population => 1000.0" in content
+
+    def test_mtk_u0_is_plain_vector(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "u0 = [" in content
+        assert "Float64[" not in content.split("u0 = ")[1].split("\n")[0]
+
+    # ---- MTK backend lookups -----------------------------------------------
+
+    def test_mtk_lookup_has_register_symbolic(self, tmp_path):
+        lut_ast = LookupsStructure(
+            x=(0.0, 1.0), y=(0.0, 1.0),
+            x_limits=(0.0, 1.0), y_limits=(0.0, 1.0),
+            type="interpolate",
+        )
+        lut_comp = AbstractLookup(subscripts=[[], []], ast=lut_ast)
+        lut_elem = AbstractElement(name="Effect LUT", components=[lut_comp])
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[lut_elem] + controls, path=tmp_path / "m.mdl"
+        )
+        model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
+        content = JuliaModelBuilder(model, backend="mtk").build_model().read_text()
+        assert "@register_symbolic" in content
+
+    # ---- MTK backend save -------------------------------------------------
+
+    def test_mtk_emits_dim_labels(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "_dim_labels" in content
+
+    def test_mtk_calls_save_results_with_sys(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert "save_results(sol, sys, _dim_labels," in content
+
+    def test_mtk_dim_labels_has_subscript_elements(self, tmp_path):
+        sr = _make_subscript_range("regions", ["North", "South"])
+        elem = _make_subscripted_element("pop", 1.0, "regions",
+                                         comp_class=AbstractUnchangeableConstant)
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[elem] + controls,
+            path=tmp_path / "m.mdl",
+            subscripts=[sr],
+        )
+        model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
+        content = JuliaModelBuilder(model, backend="mtk").build_model().read_text()
+        assert '"North"' in content
+        assert '"South"' in content

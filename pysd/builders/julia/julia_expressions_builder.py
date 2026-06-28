@@ -80,197 +80,93 @@ BUILTIN_FUNCTIONS: dict = {
     "SINH": "sinh",
     "COSH": "cosh",
     "TANH": "tanh",
-    "INTEGER": "_trunc",
-    "INT": "_trunc",
-    "POWER": "_power",
+    "INTEGER": "pysd_trunc",
+    "INT": "pysd_trunc",
+    "POWER": "pysd_power",
     "MIN": "min",
     "MAX": "max",
     "MODULO": "mod",
-    "QUANTUM": "_quantum",
-    "PI": "_pi",
-    # Control flow — parser stores as "if_then_else" (underscores)
-    "IF THEN ELSE": "ifelse",
-    "IF_THEN_ELSE": "ifelse",
+    "QUANTUM": "pysd_quantum",
+    "PI": "pysd_pi",
+    # Control flow — parser stores as "if_then_else" (underscores).
+    # Use pysd_ifelse: Symbolics' `ifelse` has type issues with SymReal
+    # conditions, so PySD.jl provides a dispatching wrapper.
+    "IF THEN ELSE": "pysd_ifelse",
+    "IF_THEN_ELSE": "pysd_ifelse",
     # Array operations
     "SUM": "sum",
     "PROD": "prod",
     "VMAX": "maximum",
     "VMIN": "minimum",
-    "ELMCOUNT": "_elmcount",   # resolved to literal size by caller
+    "ELMCOUNT": "pysd_elmcount",   # resolved to literal size by caller
     "INVERT MATRIX": "inv",
     "INVERT_MATRIX": "inv",
     "TRANSPOSE": "transpose",
     # ACTIVE INITIAL(expr, initial) — for ODE simulation just return expr
-    "ACTIVE INITIAL": "_active_initial",
-    "ACTIVE_INITIAL": "_active_initial",
-    # SD helpers emitted into the generated file
-    "LOG": "_log_base",
-    "XIDZ": "_xidz",
-    "ZIDZ": "_zidz",
-    "PULSE": "_pulse",
-    "PULSE TRAIN": "_pulse_train",
-    "PULSE_TRAIN": "_pulse_train",
-    "RAMP": "_ramp",
-    "STEP": "_step",
-    "WITH LOOKUP": "_with_lookup",
-    "WITH_LOOKUP": "_with_lookup",
+    "ACTIVE INITIAL": "pysd_active_initial",
+    "ACTIVE_INITIAL": "pysd_active_initial",
+    # SD helpers provided by PySD.jl
+    "LOG": "pysd_log_base",
+    "XIDZ": "pysd_xidz",
+    "ZIDZ": "pysd_zidz",
+    "PULSE": "pysd_pulse",
+    "PULSE TRAIN": "pysd_pulse_train",
+    "PULSE_TRAIN": "pysd_pulse_train",
+    "RAMP": "pysd_ramp",
+    "STEP": "pysd_step",
+    "WITH LOOKUP": "pysd_with_lookup",
+    "WITH_LOOKUP": "pysd_with_lookup",
     # XMILE pulse/ramp variants
-    "XPULSE": "_xpulse",
-    "XPULSE_TRAIN": "_xpulse_train",
-    "XRAMP": "_xramp",
+    "XPULSE": "pysd_xpulse",
+    "XPULSE_TRAIN": "pysd_xpulse_train",
+    "XRAMP": "pysd_xramp",
     # Random functions
-    "RANDOM 0 1": "_random_0_1",
-    "RANDOM_0_1": "_random_0_1",
-    "RANDOM UNIFORM": "_random_uniform",
-    "RANDOM_UNIFORM": "_random_uniform",
-    "RANDOM NORMAL": "_random_normal",
-    "RANDOM_NORMAL": "_random_normal",
-    "RANDOM EXPONENTIAL": "_random_exponential",
-    "RANDOM_EXPONENTIAL": "_random_exponential",
+    "RANDOM 0 1": "pysd_random_0_1",
+    "RANDOM_0_1": "pysd_random_0_1",
+    "RANDOM UNIFORM": "pysd_random_uniform",
+    "RANDOM_UNIFORM": "pysd_random_uniform",
+    "RANDOM NORMAL": "pysd_random_normal",
+    "RANDOM_NORMAL": "pysd_random_normal",
+    "RANDOM EXPONENTIAL": "pysd_random_exponential",
+    "RANDOM_EXPONENTIAL": "pysd_random_exponential",
     # Vector operations
-    "VECTOR SELECT": "_vector_select",
-    "VECTOR_SELECT": "_vector_select",
-    "VECTOR SORT ORDER": "_vector_sort_order",
-    "VECTOR_SORT_ORDER": "_vector_sort_order",
-    "VECTOR REORDER": "_vector_reorder",
-    "VECTOR_REORDER": "_vector_reorder",
-    "VECTOR RANK": "_vector_rank",
-    "VECTOR_RANK": "_vector_rank",
+    "VECTOR SELECT": "pysd_vector_select",
+    "VECTOR_SELECT": "pysd_vector_select",
+    "VECTOR SORT ORDER": "pysd_vector_sort_order",
+    "VECTOR_SORT_ORDER": "pysd_vector_sort_order",
+    "VECTOR REORDER": "pysd_vector_reorder",
+    "VECTOR_REORDER": "pysd_vector_reorder",
+    "VECTOR RANK": "pysd_vector_rank",
+    "VECTOR_RANK": "pysd_vector_rank",
     # Time value
-    "GET TIME VALUE": "_get_time_value",
-    "GET_TIME_VALUE": "_get_time_value",
+    "GET TIME VALUE": "pysd_get_time_value",
+    "GET_TIME_VALUE": "pysd_get_time_value",
 }
 
-# One-line Julia implementations for helper functions.
-# All conditions use `ifelse` + `&`/`|` instead of `?:` / `&&` / `||` so
-# they remain valid when called with symbolic (Num) arguments inside MTK equations.
-HELPER_IMPLEMENTATIONS: dict = {
-    # Base.trunc is not available as a symbolic primitive in MTK.
-    # Register a thin wrapper so INTEGER(x) works inside equations.
-    "_trunc": "_trunc(x::Real) = Base.trunc(x)\n@register_symbolic _trunc(x::Real)",
-    "_log_base": "_log_base(x, base) = log(base, x)",
-    "_xidz": "_xidz(x, y, z) = ifelse(iszero(y), z, x / y)",
-    "_zidz": "_zidz(x, y) = ifelse(iszero(y), 0.0, x / y)",
-    "_pulse": (
-        "_pulse(t_now, start, width) = "
-        "ifelse((t_now >= start) & (t_now < start + width), 1.0, 0.0)"
-    ),
-    # NOTE: the Vensim parser reorders PULSE TRAIN(start, width, interval, end)
-    # to CallStructure arguments (start, interval, width, end).
-    "_pulse_train": (
-        "_pulse_train(t_now, start, interval, width, end_time) = "
-        "ifelse((t_now >= start) & (t_now <= end_time) & "
-        "(mod(t_now - start, interval) < width), 1.0, 0.0)"
-    ),
-    "_ramp": (
-        "_ramp(t_now, slope, start_time, end_time=Inf) = "
-        "slope * max(0.0, min(t_now - start_time, end_time - start_time))"
-    ),
-    "_step": (
-        "_step(t_now, height, step_time) = "
-        "ifelse(t_now >= step_time, float(height), 0.0)"
-    ),
-    # Vensim logical operators — values are always 0.0 (false) or 1.0 (true).
-    # Return Symbolic{Bool} via comparisons so the result can be used as the
-    # condition of a symbolic `ifelse` in MTK equations.
-    "_logical_and": "_logical_and(a, b) = (a > 0.5) & (b > 0.5)",
-    "_logical_or": "_logical_or(a, b) = (a > 0.5) | (b > 0.5)",
-    "_logical_not": "_logical_not(a) = !(a > 0.5)",
-    # ACTIVE INITIAL(expr, initial) — in ODE mode expr is always live;
-    # we just return expr (the first argument).
-    "_active_initial": "_active_initial(expr, initial) = expr",
-    # INVERT_MATRIX helpers — registered as symbolic black boxes so Symbolics
-    # does not attempt symbolic matrix algebra (which hangs for large matrices).
-    # At solve time the concrete array is passed and inv is computed numerically.
-    "_inv_mat2d_elem": (
-        "function _inv_mat2d_elem(mat::AbstractMatrix, i::Int, j::Int)\n"
-        "    return inv(mat)[i, j]\n"
-        "end\n"
-        "@register_symbolic _inv_mat2d_elem(mat::AbstractMatrix, i::Int, j::Int)"
-    ),
-    "_inv_mat3d_elem": (
-        "function _inv_mat3d_elem(mat::AbstractArray, b::Int, i::Int, j::Int)\n"
-        "    return inv(mat[b, :, :])[i, j]\n"
-        "end\n"
-        "@register_symbolic _inv_mat3d_elem(mat::AbstractArray, b::Int, i::Int, j::Int)"
-    ),
-    "_power": "_power(x, y) = x ^ y\n@register_symbolic _power(x::Real, y::Real)",
-    "_quantum": (
-        "_quantum(a, b) = ifelse(b < 1e-6, float(a), b * _trunc(a / b))\n"
-        "@register_symbolic _quantum(a::Real, b::Real)"
-    ),
-    "_pi": "_pi() = Base.MathConstants.pi",
-    # XMILE variants: Xpulse has (start, magnitude), Xramp has (slope, start)
-    "_xpulse": (
-        "_xpulse(t_now, start, magnitude) = "
-        "ifelse((t_now >= start) & (t_now < start + magnitude), magnitude, 0.0)"
-    ),
-    "_xpulse_train": (
-        "_xpulse_train(t_now, start, interval, magnitude) = "
-        "ifelse((t_now >= start) & "
-        "(mod(t_now - start, interval) < magnitude), magnitude, 0.0)"
-    ),
-    "_xramp": (
-        "_xramp(t_now, slope, start_time) = "
-        "slope * max(0.0, t_now - start_time)"
-    ),
-    # Random functions — opaque wrappers so MTK calls them at every timestep
-    "_random_0_1": (
-        "_random_0_1() = Base.rand()\n"
-        "@register_symbolic _random_0_1()"
-    ),
-    "_random_uniform": (
-        "_random_uniform(lo, hi, _seed) = lo + (hi - lo) * Base.rand()\n"
-        "@register_symbolic _random_uniform(lo::Real, hi::Real, _seed::Real)"
-    ),
-    "_random_normal": (
-        "function _random_normal(lo, hi, mean, std, _seed)\n"
-        "    x = mean + std * Base.randn()\n"
-        "    return clamp(x, lo, hi)\n"
-        "end\n"
-        "@register_symbolic _random_normal(lo::Real, hi::Real, mean::Real, std::Real, _seed::Real)"
-    ),
-    "_random_exponential": (
-        "function _random_exponential(lo, hi, mean, _seed)\n"
-        "    x = lo + mean * Base.randexp()\n"
-        "    return clamp(x, lo, hi)\n"
-        "end\n"
-        "@register_symbolic _random_exponential(lo::Real, hi::Real, mean::Real, _seed::Real)"
-    ),
-    # Vector operations
-    "_vector_select": (
-        "function _vector_select(sel_vec, expr_vec, miss_val, action)\n"
-        "    selected = [expr_vec[i] for i in eachindex(sel_vec) if sel_vec[i] != 0]\n"
-        "    isempty(selected) && return miss_val\n"
-        "    action == 0 && return selected[1]\n"
-        "    action == 1 && return sum(selected)\n"
-        "    action == 2 && return maximum(selected)\n"
-        "    action == 3 && return minimum(selected)\n"
-        "    action == 4 && return sum(selected) / length(selected)\n"
-        "    return miss_val\n"
-        "end"
-    ),
-    "_vector_sort_order": (
-        "_vector_sort_order(vec, dir) = "
-        "Float64.(ifelse(dir > 0, sortperm(vec), sortperm(vec, rev=true)))"
-    ),
-    "_vector_reorder": (
-        "_vector_reorder(vec, order) = vec[Int.(order)]"
-    ),
-    "_vector_rank": (
-        "_vector_rank(vec, dir) = "
-        "Float64.(invperm(ifelse(dir > 0, sortperm(vec), sortperm(vec, rev=true))))"
-    ),
-    "_get_time_value": (
-        "_get_time_value(t_now, lookup_fn, lo, hi) = "
-        "lookup_fn(clamp(t_now, lo, hi))"
-    ),
-}
+# Names of helper functions provided by the PySD.jl companion package.
+# These are no longer inlined into generated files — the generated model does
+# `using PySD` which re-exports every ``pysd_*`` helper.  The set is retained so
+# the AST visitor / model builder can track which helpers an equation requires
+# (e.g. to pull in ``pysd_trunc`` when ``pysd_quantum`` is used).
+HELPER_IMPLEMENTATIONS: frozenset = frozenset({
+    "pysd_trunc", "pysd_log_base", "pysd_xidz", "pysd_zidz",
+    "pysd_pulse", "pysd_pulse_train", "pysd_ramp", "pysd_step",
+    "pysd_active_initial", "pysd_ifelse",
+    "pysd_inv_mat2d_elem", "pysd_inv_mat3d_elem",
+    "pysd_power", "pysd_quantum", "pysd_pi",
+    "pysd_xpulse", "pysd_xpulse_train", "pysd_xramp",
+    "pysd_random_0_1", "pysd_random_uniform",
+    "pysd_random_normal", "pysd_random_exponential",
+    "pysd_vector_select", "pysd_vector_sort_order",
+    "pysd_vector_reorder", "pysd_vector_rank",
+    "pysd_get_time_value",
+    "pysd_logical_and", "pysd_logical_or", "pysd_logical_not",
+})
 
 # Helper functions that receive the current time *t* as their first argument
 _TIME_HELPERS: frozenset = frozenset({
-    "_pulse", "_pulse_train", "_ramp", "_step",
-    "_xpulse", "_xpulse_train", "_xramp", "_get_time_value",
+    "pysd_pulse", "pysd_pulse_train", "pysd_ramp", "pysd_step",
+    "pysd_xpulse", "pysd_xpulse_train", "pysd_xramp", "pysd_get_time_value",
 })
 
 
@@ -596,11 +492,15 @@ class JuliaASTVisitor:
             op = ARITHMETIC_OPS.get(ops[0], ops[0])
             return f"({op}{args[0]})"
 
-        parts = [args[0]]
+        # Build expression, using pysd_power for ^ to handle negative bases
+        result = args[0]
         for op, arg in zip(ops, args[1:]):
-            parts.append(ARITHMETIC_OPS.get(op, op))
-            parts.append(arg)
-        return "(" + " ".join(parts) + ")"
+            julia_op = ARITHMETIC_OPS.get(op, op)
+            if julia_op == "^":
+                result = f"pysd_power({result}, {arg})"
+            else:
+                result = f"({result} {julia_op} {arg})"
+        return result
 
     def _logic(self, node: LogicStructure) -> str:
         args = [self.visit(a) for a in node.arguments]
@@ -612,8 +512,8 @@ class JuliaASTVisitor:
         if len(args) == 1:
             op_key = ops[0].upper().strip(":")
             if op_key in ("NOT", ":NOT:"):
-                self.needed_helpers.add("_logical_not")
-                return f"_logical_not({args[0]})"
+                self.needed_helpers.add("pysd_logical_not")
+                return f"pysd_logical_not({args[0]})"
             op = LOGIC_OPS.get(ops[0], ops[0])
             return f"({op}{args[0]})"
 
@@ -621,11 +521,11 @@ class JuliaASTVisitor:
         for op, arg in zip(ops, args[1:]):
             op_key = op.upper().strip(":")
             if op_key in ("AND", ":AND:"):
-                self.needed_helpers.add("_logical_and")
-                result = f"_logical_and({result}, {arg})"
+                self.needed_helpers.add("pysd_logical_and")
+                result = f"pysd_logical_and({result}, {arg})"
             elif op_key in ("OR", ":OR:"):
-                self.needed_helpers.add("_logical_or")
-                result = f"_logical_or({result}, {arg})"
+                self.needed_helpers.add("pysd_logical_or")
+                result = f"pysd_logical_or({result}, {arg})"
             else:
                 julia_op = LOGIC_OPS.get(op, op)
                 result = f"({result} {julia_op} {arg})"
@@ -1089,7 +989,7 @@ class JuliaASTVisitor:
             julia_func = re.sub(r"[^a-z0-9_]", "_", node.function.reference.lower())
 
         # ELMCOUNT(SubscriptRange) → emit the integer literal size
-        if julia_func == "_elmcount":
+        if julia_func == "pysd_elmcount":
             if node.arguments:
                 arg = node.arguments[0]
                 if isinstance(arg, ReferenceStructure):
@@ -1107,8 +1007,8 @@ class JuliaASTVisitor:
 
         if julia_func in HELPER_IMPLEMENTATIONS:
             self.needed_helpers.add(julia_func)
-            if julia_func == "_quantum":
-                self.needed_helpers.add("_trunc")
+            if julia_func == "pysd_quantum":
+                self.needed_helpers.add("pysd_trunc")
 
         # sum/prod/vmax/vmin with ! subscripts: generate ONE comprehension that
         # covers ALL references sharing the same ! dim, rather than separate
@@ -1139,12 +1039,12 @@ class JuliaASTVisitor:
 
         args = [self.visit(a) for a in node.arguments]
 
-        # Symbolics.jl ifelse requires a Bool condition.  Vensim IF THEN ELSE
+        # pysd_ifelse dispatches on the condition type.  Vensim IF THEN ELSE
         # accepts any numeric condition (nonzero = true), so a bare variable or
-        # arithmetic expression must be wrapped with `!= 0`.  Only LogicStructure
-        # arguments (comparisons like `<`, `>`, `==`, and logical operators) are
-        # already Bool — leave them untouched.
-        if julia_func == "ifelse" and args:
+        # arithmetic expression must be wrapped with `!= 0` to produce a Bool.
+        # Only LogicStructure arguments (comparisons like `<`, `>`, `==`, and
+        # logical operators) are already Bool — leave them untouched.
+        if julia_func == "pysd_ifelse" and args:
             if not isinstance(node.arguments[0], LogicStructure):
                 args[0] = f"({args[0]} != 0)"
 
