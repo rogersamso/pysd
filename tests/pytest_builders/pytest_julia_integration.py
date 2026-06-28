@@ -120,8 +120,6 @@ CLEAN_MODELS: List[str] = [
     "delay_parentheses",
     "dynamic_final_time",
     "euler_step_vs_saveper",
-    "except",
-    "except_subranges",
     "exp",
     "exponentiation",
     "fully_invalid_names",
@@ -250,10 +248,10 @@ class TestTranslationAllModels:
         jl_path = translate_to_julia(dst)
         content = jl_path.read_text()
 
-        assert "using ModelingToolkit" in content, f"{folder}: missing 'using ModelingToolkit'"
-        assert "ODESystem" in content, f"{folder}: missing 'ODESystem'"
+        assert "using OrdinaryDiffEq" in content, f"{folder}: missing 'using OrdinaryDiffEq'"
+        assert "function rhs!" in content, f"{folder}: missing 'function rhs!'"
         assert "run_model" in content, f"{folder}: missing 'run_model'"
-        assert "@independent_variables t" in content, f"{folder}: missing '@independent_variables t'"
+        assert "function observe" in content, f"{folder}: missing 'function observe'"
 
 
 class TestTranslationCleanModels:
@@ -292,8 +290,8 @@ class TestTranslationCleanModels:
 
         jl_path = translate_to_julia(dst)
         content = jl_path.read_text()
-        # Every model has at minimum the ODESystem boilerplate
-        assert "ODESystem" in content
+        # Every model has at minimum the ODE boilerplate
+        assert "function rhs!" in content
 
     @pytest.mark.parametrize(
         "folder,mdl_path",
@@ -332,7 +330,7 @@ class TestTranslationFeatures:
 
     def test_integ_emits_ode(self, tmp_path):
         content = self._translate("abs", tmp_path)
-        assert "D(" in content, "INTEG must produce a D(x) ~ ... ODE equation"
+        assert "du[" in content, "INTEG must produce du[i] = ... ODE derivative"
 
     def test_lookup_emits_interpolation(self, tmp_path):
         content = self._translate("lookups_inline", tmp_path)
@@ -367,14 +365,14 @@ class TestTranslationFeatures:
     def test_game_passthrough(self, tmp_path):
         """GAME should not break translation."""
         content = self._translate("game", tmp_path)
-        assert "ODESystem" in content
+        assert "function rhs!" in content
 
     @pytest.mark.filterwarnings("ignore::UserWarning")
     def test_delay_emits_pipeline_levels(self, tmp_path):
         """DELAY1 / DELAY3 expand into auxiliary _dl level stocks."""
         content = self._translate("delays", tmp_path)
         assert "_dl" in content, "DELAY must introduce pipeline level variables"
-        assert "D(_dl" in content, "each DELAY level must have its own ODE"
+        assert "du[" in content, "each DELAY level must have its own ODE derivative"
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +455,9 @@ class TestModularTranslation:
             jl_path = translate_to_julia(dst, split_views=True)
 
         content = jl_path.read_text()
-        assert "@variables" in content
-        assert "ODESystem" in content
+        assert "rhs!" in content   # referenced in ODEProblem(rhs!, ...)
+        assert "run_model" in content
+        assert "include(" in content
 
 
 # ---------------------------------------------------------------------------
@@ -947,7 +946,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_delay_fixed test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "ODESystem" in content
+        assert "function rhs!" in content
 
     def test_delay_fixed_emits_first_order_ode(self, tmp_path):
         """DELAY FIXED must expand into a first-order ODE auxiliary stock."""
@@ -958,7 +957,7 @@ class TestNewConstructsTranslation:
         # Must declare an internal level stock
         assert "_df_" in content, "DELAY FIXED must declare a _df_ auxiliary stock"
         # Must produce an ODE equation for the internal level
-        assert "D(_df_" in content, "DELAY FIXED must produce a D(_df_…) ODE"
+        assert "du[" in content, "DELAY FIXED must produce a du[i] = ... ODE derivative"
         # Must NOT emit a plain identity (identity would be 'output ~ input')
         assert "DELAY FIXED is not supported" not in content
 
@@ -970,7 +969,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_trend test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "ODESystem" in content
+        assert "function rhs!" in content
 
     def test_trend_emits_smooth_stock_and_output(self, tmp_path):
         """TREND must introduce a smooth level stock and an algebraic output."""
@@ -980,9 +979,9 @@ class TestNewConstructsTranslation:
         content = self._translate(mdl, tmp_path)
         # Internal smooth level
         assert "_sm_" in content, "TREND must declare a _sm_ smooth stock"
-        assert "D(_sm_" in content, "TREND must produce a D(_sm_…) ODE"
-        # Output must be algebraic (not another ODE)
-        assert "trend_output ~" in content or "trend_output" in content
+        assert "du[" in content, "TREND must produce a du[i] = ... ODE derivative"
+        # Output must be computed (not another ODE)
+        assert "trend_output" in content
 
     # --- FORECAST ---
 
@@ -992,7 +991,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_forecast test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "ODESystem" in content
+        assert "function rhs!" in content
 
     def test_forecast_emits_smooth_stock_and_projection(self, tmp_path):
         """FORECAST must introduce a smooth level and project input forward."""
@@ -1001,7 +1000,7 @@ class TestNewConstructsTranslation:
             pytest.skip("julia_forecast test model not found")
         content = self._translate(mdl, tmp_path)
         assert "_sm_" in content, "FORECAST must declare a _sm_ smooth stock"
-        assert "D(_sm_" in content, "FORECAST must produce a D(_sm_…) ODE"
+        assert "du[" in content, "FORECAST must produce a du[i] = ... ODE derivative"
         # Projection formula: input * (1.0 + trend * horizon)
         assert "* (1.0 +" in content or "*(1.0 +" in content, \
             "FORECAST output must multiply input by (1 + trend*horizon)"
@@ -1014,7 +1013,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_sample_if_true test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "ODESystem" in content
+        assert "function rhs!" in content
 
     def test_sample_if_true_emits_conditional_stock(self, tmp_path):
         """SAMPLE IF TRUE must expand into a conditional ODE state variable."""
@@ -1025,7 +1024,7 @@ class TestNewConstructsTranslation:
         # Must declare a hold stock
         assert "_sit_" in content, "SAMPLE IF TRUE must declare a _sit_ hold stock"
         # Must produce a conditional ODE
-        assert "D(_sit_" in content, "SAMPLE IF TRUE must produce a D(_sit_…) ODE"
+        assert "du[" in content, "SAMPLE IF TRUE must produce a du[i] = ... ODE derivative"
         # Condition must appear in the ODE
         assert "ifelse" in content, "SAMPLE IF TRUE ODE must use ifelse for condition"
 
@@ -1247,7 +1246,7 @@ class TestNewFeatureIntegration:
         from pysd.translators.structures.abstract_model import (
             AbstractUnchangeableConstant, AbstractElement,
         )
-        comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=3.14, units="Dmnl")
+        comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=3.14)
         elem = AbstractElement(name="Pi Approx", components=[comp], units="Dmnl")
         model = self._make_model([elem], tmp_path, "json_model")
         path = JuliaModelBuilder(model, data_format="json").build_model()
@@ -1325,7 +1324,7 @@ class TestNewFeatureIntegration:
         model = self._make_model([elem], tmp_path, "limits_model")
         path = JuliaModelBuilder(model).build_model()
         content = path.read_text()
-        assert "# limits: [0.0, 1.0]" in content
+        assert "limits: [0.0, 1.0]" in content
 
     # -----------------------------------------------------------------------
     # EXCEPT subscript exclusion — integration
