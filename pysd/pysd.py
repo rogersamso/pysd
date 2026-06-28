@@ -207,11 +207,12 @@ def translate_to_julia(
     split_views=False,
     encoding=None,
     data_format="hardcoded",
+    backend="ode",
     **kwargs,
 ):
     """
-    Translate a Vensim or Stella model to a standalone Julia file that uses
-    ModelingToolkit.jl.  The output requires no PySD or Python at runtime.
+    Translate a Vensim or Stella model to a standalone Julia file.
+    The output requires no PySD or Python at runtime.
 
     Parameters
     ----------
@@ -229,9 +230,14 @@ def translate_to_julia(
 
     data_format: str (optional)
         How to store external numeric data in the generated file.
-        ``"hardcoded"`` (default) inlines all values as Julia literals.
-        ``"json"`` writes a companion ``<model>_data.json`` file and generates
-        Julia code that reads it at startup via ``JSON3.jl``.
+        ``"hardcoded"`` (default) reads Excel files at Julia load time via
+        ``PySD.jl`` helpers.  ``"json"`` writes a companion
+        ``<model>_data.json`` file and reads it at startup via ``JSON3.jl``.
+
+    backend: str (optional)
+        Julia ODE backend.  ``"ode"`` (default) emits a plain ``rhs!``
+        function solved by ``OrdinaryDiffEq.jl``.  ``"mtk"`` emits a
+        ``ModelingToolkit.jl`` ``ODESystem``.
 
     subview_sep: list (optional)
         Passed to ``parse_sketch`` when ``split_views=True`` (Vensim only).
@@ -245,7 +251,7 @@ def translate_to_julia(
     Examples
     --------
     >>> path = translate_to_julia('my_model.mdl')
-    >>> path = translate_to_julia('my_model.mdl', split_views=True)
+    >>> path = translate_to_julia('my_model.mdl', backend='mtk')
     >>> path = translate_to_julia('my_model.mdl', data_format='json')
     """
     from pathlib import Path as _Path
@@ -273,7 +279,7 @@ def translate_to_julia(
             "Supported formats: .mdl, .xmile, .stmx"
         )
 
-    return JuliaModelBuilder(abs_model, data_format=data_format).build_model()
+    return JuliaModelBuilder(abs_model, data_format=data_format, backend=backend).build_model()
 
 
 def load(py_model_file, data_files=None, data_files_encoding=None,

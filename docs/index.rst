@@ -158,6 +158,7 @@ For additional help or consulting, join our slack channel in `sd-tools-and-metho
    installation
    getting_started
    advanced_usage
+   julia_builder
    command_line_usage
    python_api/python_api_index
    tools
