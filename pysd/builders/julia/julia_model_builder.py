@@ -3252,7 +3252,10 @@ class JuliaSectionBuilder:
         if self.backend == "mtk":
             return self._equations_block_mtk(equations)
         if not equations:
-            return "function rhs!(du, u, p, t)\nend\n"
+            return (
+                "function rhs!(du, u, p, t)\nend\n\n"
+                "function observe(u, t)\n    return Dict{String,Any}()\nend\n"
+            )
 
         # Collect stock names and sizes from u0_entries
         # Each entry is "var => init" or "var[idx] => init"
@@ -3288,8 +3291,6 @@ class JuliaSectionBuilder:
             else:
                 alg_lines.append(eq)
 
-        func_lines = ["function rhs!(du, u, p, t)"]
-
         # Detect stock dimensionality from ODE equations
         stock_dims: Dict[str, List[str]] = {}
         for eq in ode_lines:
@@ -3306,21 +3307,21 @@ class JuliaSectionBuilder:
                         if ranges:
                             stock_dims[name] = ranges
 
-        # Unpack state variables from u
-        func_lines.append("    # State variables")
+        # Build state-variable unpacking lines (shared by rhs! and observe)
+        state_lines: List[str] = []
         for name in stock_indices:
             idx = stock_indices[name]
             size = stock_sizes[name]
             if size == 1:
-                func_lines.append(f"    {name} = u[{idx}]")
+                state_lines.append(f"    {name} = u[{idx}]")
             elif name in stock_dims and len(stock_dims[name]) >= 2:
                 dims = stock_dims[name]
                 dims_str = ", ".join(dims)
-                func_lines.append(
+                state_lines.append(
                     f"    {name} = reshape(@view(u[{idx}:{idx + size - 1}]), {dims_str})"
                 )
             else:
-                func_lines.append(f"    {name} = @view u[{idx}:{idx + size - 1}]")
+                state_lines.append(f"    {name} = @view u[{idx}:{idx + size - 1}]")
 
         # Pre-allocate auxiliary arrays
         # Scan equations for indexed assignments like "var[i] = ..."
@@ -3392,26 +3393,47 @@ class JuliaSectionBuilder:
                             pass
                     alloc_needed[name] = cur
 
-        # Algebraic equations (auxiliaries) — topologically sorted
-        func_lines.append("")
-        func_lines.append("    # Auxiliaries")
-        if alloc_needed:
-            for name, dims in sorted(alloc_needed.items()):
-                # Replace any "0" dims with a reasonable default
-                dims = [d if d != "0" else "100" for d in dims]
-                if len(dims) == 1:
-                    func_lines.append(f"    {name} = pysd_safe(zeros({dims[0]}))")
-                else:
-                    dims_str = ", ".join(dims)
-                    func_lines.append(f"    {name} = pysd_safe(zeros({dims_str}))")
-            func_lines.append("")
+        # Build alloc lines (shared by rhs! and observe)
+        alloc_lines: List[str] = []
+        for name, dims in sorted(alloc_needed.items()):
+            dims = [d if d != "0" else "100" for d in dims]
+            if len(dims) == 1:
+                alloc_lines.append(f"    {name} = pysd_safe(zeros({dims[0]}))")
+            else:
+                dims_str = ", ".join(dims)
+                alloc_lines.append(f"    {name} = pysd_safe(zeros({dims_str}))")
+
+        # Build aux assignment lines (shared by rhs! and observe), collecting names
         sorted_alg = self._topo_sort_equations(alg_lines, stock_indices)
+        aux_assign_lines: List[str] = []
+        scalar_aux_names: List[str] = []
+        seen_aux: set = set(alloc_needed.keys())
         for eq in sorted_alg:
             if "Symbolics.scalarize" in eq or ".~" in eq:
                 continue
             converted = self._convert_eq_to_assignment(eq)
-            for line in converted:
-                func_lines.append(f"    {line}")
+            aux_assign_lines.extend(f"    {line}" for line in converted)
+            # Collect scalar aux variable name from first converted line
+            if converted:
+                m_lhs = re.match(r"\s*(\w+)\s*=", converted[0])
+                if m_lhs:
+                    vname = m_lhs.group(1)
+                    if vname not in stock_indices and vname not in seen_aux:
+                        seen_aux.add(vname)
+                        scalar_aux_names.append(vname)
+
+        # ------------------------------------------------------------------ #
+        # rhs!(du, u, p, t)                                                  #
+        # ------------------------------------------------------------------ #
+        func_lines = ["function rhs!(du, u, p, t)"]
+        func_lines.append("    # State variables")
+        func_lines.extend(state_lines)
+        func_lines.append("")
+        func_lines.append("    # Auxiliaries")
+        if alloc_lines:
+            func_lines.extend(alloc_lines)
+            func_lines.append("")
+        func_lines.extend(aux_assign_lines)
 
         # Create reshaped views of du for multi-dimensional stocks
         func_lines.append("")
@@ -3426,7 +3448,6 @@ class JuliaSectionBuilder:
                     f"    du_{name} = reshape(@view(du[{idx}:{idx + size - 1}]), {dims_str})"
                 )
         for eq in ode_lines:
-            # Skip MTK-specific vectorized syntax
             if "Symbolics.scalarize" in eq or ".~" in eq:
                 continue
             converted = self._convert_ode_to_du(eq, stock_indices)
@@ -3435,13 +3456,57 @@ class JuliaSectionBuilder:
 
         func_lines.append("    return nothing")
         func_lines.append("end")
-        return "\n".join(func_lines) + "\n"
+
+        # ------------------------------------------------------------------ #
+        # observe(u, t) — reconstruct every variable at a given state/time   #
+        # ------------------------------------------------------------------ #
+        obs_lines = ["function observe(u, t)"]
+        obs_lines.append("    # State variables")
+        obs_lines.extend(state_lines)
+        obs_lines.append("")
+        obs_lines.append("    # Auxiliaries")
+        if alloc_lines:
+            obs_lines.extend(alloc_lines)
+            obs_lines.append("")
+        obs_lines.extend(aux_assign_lines)
+        obs_lines.append("")
+        # Module-level consts (INITIAL, GET CONSTANTS, etc.) are in scope inside
+        # observe because they are module globals — just reference them by name.
+        const_names = self._const_names_for_observe(set(stock_indices) | seen_aux)
+        obs_lines.append("")
+        obs_lines.append("    return Dict{String,Any}(")
+        for name in list(stock_indices.keys()) + list(alloc_needed.keys()) + scalar_aux_names + const_names:
+            obs_lines.append(f'        "{name}" => {name},')
+        obs_lines.append("    )")
+        obs_lines.append("end")
+
+        return "\n".join(func_lines) + "\n\n" + "\n".join(obs_lines) + "\n"
 
     def _equations_block_mtk(self, equations: List[str]) -> str:
         if not equations:
             return "eqs = Equation[]\n"
         eq_lines = ",\n    ".join(equations)
         return f"eqs = Equation[\n    {eq_lines},\n]\n"
+
+    def _const_names_for_observe(self, already_known: set) -> List[str]:
+        """Return names of module-level consts not yet in the observe Dict.
+
+        Scans param_decls and ext_const_decls for ``@parameters name = ...``
+        or ``const name = ...`` lines.  Names in *already_known* (stocks,
+        alloc'd arrays, scalar aux) are skipped to avoid duplicates.
+        """
+        names: List[str] = []
+        seen: set = set(already_known)
+        for decl in self.param_decls + self.ext_const_decls:
+            if decl.startswith("#"):
+                continue
+            m = re.match(r"(?:@parameters\s+|const\s+)(\w+)", decl)
+            if m:
+                name = m.group(1)
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        return names
 
     @staticmethod
     def _extract_lhs_name(eq: str) -> Optional[str]:

@@ -1965,6 +1965,7 @@ class TestJuliaFileGeneration:
         sb = self._minimal_sb(tmp_path)
         block = sb._equations_block([])
         assert "function rhs!" in block
+        assert "function observe" in block
 
     def test_equations_block_empty_mtk(self, tmp_path):
         stock = _make_stock_element("S", 1.0, 10.0)

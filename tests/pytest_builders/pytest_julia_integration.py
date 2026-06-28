@@ -568,6 +568,16 @@ _JL_PACKAGES = (
 
 _BATCH_GET_SERIES = """\
 function _batch_get_series(sol, mod, id_str)
+    # ODE backend: use observe(u, t) to reconstruct all variables
+    if isdefined(mod, :observe)
+        try
+            return [let obs = mod.observe(sol.u[i], sol.t[i])
+                        haskey(obs, id_str) ? Float64(obs[id_str]) : NaN
+                    end for i in eachindex(sol.t)]
+        catch
+        end
+    end
+    # MTK backend: use sys for symbolic access
     sym = nothing
     try; sym = getproperty(mod.sys, Symbol(id_str)); catch; end
     if sym !== nothing
