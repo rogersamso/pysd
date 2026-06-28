@@ -166,6 +166,9 @@ NUMERICAL_MODELS: List[str] = [
     "abs",
     "builtin_max",
     "builtin_min",
+    "case_sensitive_extension",
+    "comparisons",
+    "eval_order",
     "exp",
     "if_stmt",
     "initial_function",
@@ -173,7 +176,9 @@ NUMERICAL_MODELS: List[str] = [
     "logicals",
     "lookups_with_expr",
     "number_handling",
+    "odd_number_quotes",
     "sqrt",
+    "trend",
     "trig",
 ]
 
@@ -673,12 +678,27 @@ def _parse_batch_output(stdout: str) -> "Dict[str, Dict[str, List[float]]]":
     return results
 
 
+def _find_model_file(folder: Path) -> Optional[Path]:
+    """Return the first supported model file in *folder* (MDL or XMILE, any case)."""
+    for pattern in ("*.mdl", "*.MDL", "*.xmile", "*.stmx"):
+        m = next(folder.glob(pattern), None)
+        if m is not None:
+            return m
+    return None
+
+
 def _build_id_map(mdl: Path, ref_cols: List[str]) -> Dict[str, str]:
     """Map ref CSV column names → Julia identifiers via JuliaNamespaceManager."""
     from pysd.builders.julia.namespace import JuliaNamespaceManager
-    from pysd.translators.vensim.vensim_file import VensimFile
 
-    vf = VensimFile(mdl)
+    suffix = mdl.suffix.lower()
+    if suffix in (".xmile", ".stmx", ".xml"):
+        from pysd.translators.xmile.xmile_file import XmileFile
+        vf = XmileFile(mdl)
+    else:
+        from pysd.translators.vensim.vensim_file import VensimFile
+        vf = VensimFile(mdl)
+
     vf.parse()
     am = vf.get_abstract_model()
     ns = JuliaNamespaceManager()
@@ -704,14 +724,15 @@ def julia_numerical_results(tmp_path_factory):
 
     tmp = tmp_path_factory.mktemp("julia_numerical")
     folders = [
-        "abs", "builtin_max", "builtin_min", "exp", "if_stmt",
-        "initial_function", "input_functions", "logicals", "lookups_with_expr",
-        "number_handling", "sqrt", "trig",
+        "abs", "builtin_max", "builtin_min", "case_sensitive_extension",
+        "comparisons", "eval_order", "exp", "if_stmt", "initial_function",
+        "input_functions", "logicals", "lookups_with_expr", "number_handling",
+        "odd_number_quotes", "sqrt", "trend", "trig",
     ]
 
     models = []
     for folder in folders:
-        mdl = next((TEST_MODELS_DIR / folder).glob("*.mdl"), None)
+        mdl = _find_model_file(TEST_MODELS_DIR / folder)
         if mdl is None or not (TEST_MODELS_DIR / folder / "output.csv").exists():
             continue
         dst = tmp / folder / mdl.name
@@ -720,8 +741,8 @@ def julia_numerical_results(tmp_path_factory):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             jl_path = translate_to_julia(dst)
-        ref = _read_csv(TEST_MODELS_DIR / folder / "output.csv")
-        id_map = _build_id_map(mdl, list(ref.keys()))
+            ref = _read_csv(TEST_MODELS_DIR / folder / "output.csv")
+            id_map = _build_id_map(mdl, list(ref.keys()))
         if not id_map:
             continue
         col_names = list(id_map.keys())
@@ -909,6 +930,26 @@ class TestNumericalValidation:
 
     def test_trig(self, julia_numerical_results):
         self._compare("trig", *self._sim("trig", julia_numerical_results))
+
+    def test_case_sensitive_extension(self, julia_numerical_results):
+        """Model with uppercase .MDL extension translates and runs correctly."""
+        self._compare("case_sensitive_extension", *self._sim("case_sensitive_extension", julia_numerical_results))
+
+    def test_comparisons(self, julia_numerical_results):
+        """Comparison operators (eq, gt, gte, lt, lte, neq) produce correct values."""
+        self._compare("comparisons", *self._sim("comparisons", julia_numerical_results))
+
+    def test_eval_order(self, julia_numerical_results):
+        """Auxiliary evaluation order produces correct result."""
+        self._compare("eval_order", *self._sim("eval_order", julia_numerical_results))
+
+    def test_odd_number_quotes(self, julia_numerical_results):
+        """Model with unusual quoting in identifiers translates and runs correctly."""
+        self._compare("odd_number_quotes", *self._sim("odd_number_quotes", julia_numerical_results))
+
+    def test_trend_numerical(self, julia_numerical_results):
+        """TREND construct produces correct time series against reference output."""
+        self._compare("trend", *self._sim("trend", julia_numerical_results))
 
 
 # ---------------------------------------------------------------------------

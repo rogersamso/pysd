@@ -3738,35 +3738,35 @@ class JuliaSectionBuilder:
                     break
 
         if needs_init_fn:
-            # Emit a function that computes u0 by running auxiliaries at t=initial_time
-            # Use a dummy du and u (zeros) to bootstrap
-            lines = []
-            lines.append("function compute_u0()")
-            lines.append(f"    t = initial_time")
-            lines.append(f"    n_states = {len(self.u0_entries)}")
-            lines.append(f"    u = zeros(n_states)")
-            lines.append(f"    du = zeros(n_states)")
-            lines.append(f"    rhs!(du, u, nothing, t)")
-            lines.append(f"    return u")
-            lines.append("end")
-            lines.append("")
+            # Collect all auxiliary identifiers referenced in u0 expressions that
+            # are not module-level constants.  Use observe(zeros, initial_time) to
+            # evaluate them at t=0 so stocks depending on auxiliaries initialise
+            # correctly (e.g. TREND smooth stocks that depend on a dynamic input).
+            dynamic_tokens: set = set()
+            for entry in self.u0_entries:
+                if "=>" in entry:
+                    rhs = entry.split("=>", 1)[1].strip()
+                    tokens = set(re.findall(r"\b([a-z_]\w*)\b", rhs))
+                    for tok in list(tokens):
+                        if any(f" {tok} =" in d or f" {tok}[" in d
+                               for d in self.param_decls + self.ext_const_decls):
+                            tokens.discard(tok)
+                    dynamic_tokens |= tokens - {"time_step", "initial_time", "final_time", "t"}
 
-            # But we still need initial values for stocks BEFORE calling rhs!
-            # Use a two-pass: set known values, call rhs! for aux, then set u0
-            u0_lines = []
+            n = len(self.u0_entries)
+            lines = [f"u0 = let _obs_init = observe(zeros(Float64, {n}), initial_time)"]
+            for tok in sorted(dynamic_tokens):
+                lines.append(f"    {tok} = get(_obs_init, \"{tok}\", 0.0)")
+            lines.append("    Float64[")
             for entry in self.u0_entries:
                 if "=>" in entry:
                     lhs, rhs = entry.split("=>", 1)
-                    u0_lines.append(f"    {rhs.strip()},  # {lhs.strip()}")
+                    lines.append(f"        {rhs.strip()},  # {lhs.strip()}")
                 else:
-                    u0_lines.append(f"    {entry},")
-
-            # Just emit the u0 values as-is — they'll reference module-level consts
-            # For aux-dependent values, use try/catch to handle undefined
-            result = "u0 = try\n    Float64[\n"
-            result += "\n".join(u0_lines) + "\n    ]\n"
-            result += "catch\n    zeros(Float64, " + str(len(self.u0_entries)) + ")\nend\n"
-            return result
+                    lines.append(f"        {entry},")
+            lines.append("    ]")
+            lines.append("end")
+            return "\n".join(lines) + "\n"
         else:
             lines = []
             for entry in self.u0_entries:
