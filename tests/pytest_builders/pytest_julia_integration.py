@@ -178,6 +178,8 @@ NUMERICAL_MODELS: List[str] = [
     "number_handling",
     "odd_number_quotes",
     "sqrt",
+    "subscript_1d_arrays",
+    "subscript_individually_defined_1d_arrays",
     "trend",
     "trig",
 ]
@@ -572,24 +574,30 @@ _JL_PACKAGES = (
 
 _BATCH_GET_SERIES = """\
 function _batch_get_series(sol, mod, id_str)
+    # Parse optional array subscript: "stock_a[2]" → base="stock_a", elem_idx=2
+    m = match(r"^(\\w+)\\[(\\d+)\\]$", id_str)
+    base_id  = m === nothing ? id_str : m.captures[1]
+    elem_idx = m === nothing ? nothing : parse(Int, m.captures[2])
+    _extract(val) = elem_idx === nothing ? Float64(val) : Float64(val[elem_idx])
+
     # ODE backend: use observe(u, t) to reconstruct all variables
     if isdefined(mod, :observe)
         try
             return [let obs = mod.observe(sol.u[i], sol.t[i])
-                        haskey(obs, id_str) ? Float64(obs[id_str]) : NaN
+                        haskey(obs, base_id) ? _extract(obs[base_id]) : NaN
                     end for i in eachindex(sol.t)]
         catch
         end
     end
     # MTK backend: use sys for symbolic access
     sym = nothing
-    try; sym = getproperty(mod.sys, Symbol(id_str)); catch; end
+    try; sym = getproperty(mod.sys, Symbol(base_id)); catch; end
     if sym !== nothing
         try; return Float64.(sol[sym, :]); catch; end
         try; return fill(Float64(sol.prob.ps[sym]), length(sol.t)); catch; end
     end
     try
-        p = Base.eval(mod, Symbol(id_str))
+        p = Base.eval(mod, Symbol(base_id))
         val = Float64(ModelingToolkit.getdefault(p))
         return fill(val, length(sol.t))
     catch
@@ -688,7 +696,11 @@ def _find_model_file(folder: Path) -> Optional[Path]:
 
 
 def _build_id_map(mdl: Path, ref_cols: List[str]) -> Dict[str, str]:
-    """Map ref CSV column names → Julia identifiers via JuliaNamespaceManager."""
+    """Map ref CSV column names → Julia identifiers.
+
+    Handles plain columns ('Stock A' → 'stock_a') and subscripted columns
+    ('Stock A[Entry 1]' → 'stock_a[1]') using the model's subscript ranges.
+    """
     from pysd.builders.julia.namespace import JuliaNamespaceManager
 
     suffix = mdl.suffix.lower()
@@ -705,7 +717,33 @@ def _build_id_map(mdl: Path, ref_cols: List[str]) -> Dict[str, str]:
     for section in am.sections:
         for elem in section.elements:
             ns.add_to_namespace(elem.name)
-    return {col: ns.get(col) for col in ref_cols if col.lower() != "time" and ns.get(col)}
+
+    # Flat label→1-based-index from all subscript ranges.
+    # Later ranges overwrite earlier ones for the same label — fine in practice
+    # because element labels are unique across dimensions within a model.
+    label_to_idx: Dict[str, int] = {}
+    for section in am.sections:
+        for sr in section.subscripts:
+            for i, label in enumerate(sr.subscripts):
+                label_to_idx[label.lower().strip()] = i + 1
+
+    result: Dict[str, str] = {}
+    for col in ref_cols:
+        if col.lower() == "time":
+            continue
+        if "[" in col:
+            base, rest = col.split("[", 1)
+            label = rest.rstrip("]").strip()
+            julia_id = ns.get(base.strip())
+            if julia_id is not None:
+                idx = label_to_idx.get(label.lower().strip())
+                if idx is not None:
+                    result[col] = f"{julia_id}[{idx}]"
+        else:
+            julia_id = ns.get(col)
+            if julia_id is not None:
+                result[col] = julia_id
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -727,7 +765,9 @@ def julia_numerical_results(tmp_path_factory):
         "abs", "builtin_max", "builtin_min", "case_sensitive_extension",
         "comparisons", "eval_order", "exp", "if_stmt", "initial_function",
         "input_functions", "logicals", "lookups_with_expr", "number_handling",
-        "odd_number_quotes", "sqrt", "trend", "trig",
+        "odd_number_quotes", "sqrt",
+        "subscript_1d_arrays", "subscript_individually_defined_1d_arrays",
+        "trend", "trig",
     ]
 
     models = []
@@ -950,6 +990,17 @@ class TestNumericalValidation:
     def test_trend_numerical(self, julia_numerical_results):
         """TREND construct produces correct time series against reference output."""
         self._compare("trend", *self._sim("trend", julia_numerical_results))
+
+    def test_subscript_1d_arrays(self, julia_numerical_results):
+        """1-D subscripted arrays (Stock A[Entry 1..3]) produce correct element series."""
+        self._compare("subscript_1d_arrays", *self._sim("subscript_1d_arrays", julia_numerical_results))
+
+    def test_subscript_individually_defined_1d_arrays(self, julia_numerical_results):
+        """Individually-defined 1-D subscripts produce correct element series."""
+        self._compare(
+            "subscript_individually_defined_1d_arrays",
+            *self._sim("subscript_individually_defined_1d_arrays", julia_numerical_results),
+        )
 
 
 # ---------------------------------------------------------------------------
