@@ -63,10 +63,19 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Job 2: numerical tests (require Julia runtime)
+  #
+  # Uses a pre-built base image (ghcr.io/rogersamso/pysd-julia-base) that
+  # has all heavy packages (MTK, Symbolics, …) already precompiled.
+  # Only PySD.jl is developed in-place here, which is fast (~30s).
+  #
+  # The base image is rebuilt by docker-julia-base.yml whenever the
+  # Dockerfile changes, or weekly to pick up package updates.
   # -------------------------------------------------------------------------
   julia-numerical-tests:
     name: Julia builder — numerical tests (Julia ${{ matrix.julia-version }})
     runs-on: ubuntu-latest
+    container: ghcr.io/rogersamso/pysd-julia-base:${{ matrix.julia-version }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -77,29 +86,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Set up Julia
-        uses: julia-actions/setup-julia@v2
-        with:
-          version: ${{ matrix.julia-version }}
-
-      - name: Cache Julia packages
-        uses: julia-actions/cache@v2
-
-      - name: Install Julia packages
+      - name: Develop PySD.jl
         run: |
           julia --startup-file=no -e '
             using Pkg
-            Pkg.add(["ModelingToolkit", "Symbolics", "OrdinaryDiffEq",
-                     "OrdinaryDiffEqLowOrderRK", "DataInterpolations",
-                     "NCDatasets", "JSON3"])
             Pkg.develop(PackageSpec(path="pysd/builders/julia/PySD.jl"))
             Pkg.precompile()
           '
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
 
       - name: Install Python dependencies
         run: |
