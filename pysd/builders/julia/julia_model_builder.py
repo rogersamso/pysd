@@ -540,6 +540,11 @@ class JuliaSectionBuilder:
                     "interp_type": itp_type, "subscripts": [],
                 }
 
+        if self.split and self.views_dict and self.backend == "ode":
+            raise ValueError(
+                "split_views=True is not supported with backend='ode'. "
+                "Use backend='mtk' for modular (multi-file) builds."
+            )
         if self.split and self.views_dict:
             self._build_modular()
         else:
@@ -1277,6 +1282,7 @@ class JuliaSectionBuilder:
             idx_vars = self._idx_vars(ndim)
             vnd = self._nd_visitor(dims, idx_vars)
             rhs_nd = vnd.visit(ast)
+            self._drain_embedded_delays(vnd)
             if is_control:
                 if identifier in self.control_vals:
                     self.control_vals[identifier] = rhs_nd
@@ -1478,9 +1484,7 @@ class JuliaSectionBuilder:
                 value_expr = visitor.visit(comp.ast)
                 for idx in covered_indices:
                     if not is_control:
-                        equations.append(
-                            f"# EXCEPT: {identifier}[{idx}] = {value_expr}"
-                        )
+                        equations.append(f"{identifier}[{idx}] ~ {value_expr}")
 
             elif isinstance(comp.ast, IntegStructure):
                 # Stock component — emit per-index ODE + initial condition.
@@ -3133,7 +3137,7 @@ class JuliaSectionBuilder:
         1D subscripted::
 
             @variables x(t)[1:N]
-            Symbolics.scalarize(D.(x) .~ 0.0)...
+            [D(x[_i0]) ~ 0.0 for _i0 in 1:N]...
             u0: x[i] => expr_at_i   (for i in 1..N)
 
         2D subscripted::
@@ -3164,7 +3168,7 @@ class JuliaSectionBuilder:
             for i in range(1, n0 + 1):
                 expr_i = raw_expr.replace("_i0", str(i))
                 self.u0_entries.append(f"{identifier}[{i}] => {expr_i}")
-            return [f"Symbolics.scalarize(D.({identifier}) .~ 0.0)..."]
+            return [f"[D({identifier}[_i0]) ~ 0.0 for _i0 in 1:{self._jl_n(d0)}]..."]
 
         # ndim >= 2
         idx_vars = self._idx_vars(ndim)
@@ -3330,7 +3334,8 @@ class JuliaSectionBuilder:
             else:
                 visitor = JuliaASTVisitor(
                     self.namespace, self.inline_registry,
-                    self.needed_helpers, self.lookup_identifiers,
+                    self.needed_helpers,
+                    lookup_names=self.lookup_identifiers,
                     macro_names=self._known_macro_names,
                 )
                 val = visitor.visit(comp.ast)
@@ -3841,6 +3846,7 @@ class JuliaSectionBuilder:
             f"# Model {self.model_name}\n"
             f"# Translated using PySD version {__version__}\n\n"
             f"using {', '.join(uses)}\n\n"
+            f'check_compat(v"0.1.0")\n\n'
         )
         if self.data_format == "json":
             json_fname = f"{self.path.stem}_data.json"
@@ -3860,6 +3866,7 @@ class JuliaSectionBuilder:
             f"# Model {self.model_name}\n"
             f"# Translated using PySD version {__version__}\n\n"
             f"using {', '.join(uses)}\n\n"
+            f'check_compat(v"0.1.0")\n\n'
             "@independent_variables t\n"
             "D = Differential(t)\n\n"
         )
@@ -4510,7 +4517,15 @@ class JuliaSectionBuilder:
         eq = eq.strip().rstrip(",")
         # Handle comprehension: [var[i] ~ expr for _i in 1:N]...
         if eq.startswith("["):
-            inner = eq.strip().lstrip("[").rstrip(".]")
+            # Strip exactly: outer "[", then trailing "...", then outer "]".
+            # Using rstrip(".]") is wrong for multi-dim for-clauses that contain
+            # list ranges like [1, 2, 3] — those brackets would also be stripped.
+            _eq = eq.strip()
+            if _eq.endswith("..."):
+                _eq = _eq[:-3]
+            if _eq.endswith("]"):
+                _eq = _eq[:-1]
+            inner = _eq.lstrip("[")
             # Find the outer "for" clause — the one NOT inside brackets.
             # Walk backwards to find "for" at bracket depth 0.
             for_pos = None
@@ -4533,8 +4548,10 @@ class JuliaSectionBuilder:
                     f"    {body}",
                     "end",
                 ]
-            # Fallback
-            return [eq.replace(" ~ ", " = ")]
+            raise ValueError(
+                f"Cannot convert comprehension equation to assignment: no outer "
+                f"'for' clause found at depth 0 in: {eq!r}"
+            )
         return [eq.replace(" ~ ", " = ", 1)]
 
     def _convert_ode_to_du(self, eq: str, stock_indices: dict) -> List[str]:
@@ -4542,7 +4559,12 @@ class JuliaSectionBuilder:
         eq = eq.strip().rstrip(",")
         # Handle comprehension: [D(var[i]) ~ expr for i in 1:N]...
         if eq.startswith("["):
-            inner = eq.strip().lstrip("[").rstrip(".]")
+            _eq = eq.strip()
+            if _eq.endswith("..."):
+                _eq = _eq[:-3]
+            if _eq.endswith("]"):
+                _eq = _eq[:-1]
+            inner = _eq.lstrip("[")
             # Find the outer "for" at bracket depth 0
             for_pos = None
             depth = 0

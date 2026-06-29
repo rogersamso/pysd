@@ -117,8 +117,6 @@ BUILTIN_FUNCTIONS: dict = {
     "PULSE_TRAIN": "pysd_pulse_train",
     "RAMP": "pysd_ramp",
     "STEP": "pysd_step",
-    "WITH LOOKUP": "pysd_with_lookup",
-    "WITH_LOOKUP": "pysd_with_lookup",
     # XMILE pulse/ramp variants
     "XPULSE": "pysd_xpulse",
     "XPULSE_TRAIN": "pysd_xpulse_train",
@@ -391,6 +389,7 @@ class JuliaASTVisitor:
             subs_elems=self.subs_elems,
             lookup_names=self.lookup_names,
             root=self._root,
+            macro_names=self._macro_names,
         )
 
     # ------------------------------------------------------------------
@@ -538,7 +537,7 @@ class JuliaASTVisitor:
         # Julia's &&/|| require a concrete Bool; the helpers use ifelse instead.
         if len(args) == 1:
             op_key = ops[0].upper().strip(":")
-            if op_key in ("NOT", ":NOT:"):
+            if op_key == "NOT":
                 self.needed_helpers.add("pysd_logical_not")
                 return f"pysd_logical_not({args[0]})"
             op = LOGIC_OPS.get(ops[0], ops[0])
@@ -547,10 +546,10 @@ class JuliaASTVisitor:
         result = args[0]
         for op, arg in zip(ops, args[1:]):
             op_key = op.upper().strip(":")
-            if op_key in ("AND", ":AND:"):
+            if op_key == "AND":
                 self.needed_helpers.add("pysd_logical_and")
                 result = f"pysd_logical_and({result}, {arg})"
-            elif op_key in ("OR", ":OR:"):
+            elif op_key == "OR":
                 self.needed_helpers.add("pysd_logical_or")
                 result = f"pysd_logical_or({result}, {arg})"
             else:

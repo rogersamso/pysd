@@ -697,6 +697,20 @@ class TestJuliaASTVisitor:
         result = v.visit(node)
         assert "input" in result
 
+    def test_with_extra_subs_propagates_macro_names(self):
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("my_macro")
+        registry = InlineLookupRegistry()
+        helpers = set()
+        v = JuliaASTVisitor(
+            ns, registry, helpers,
+            macro_names={"my_macro"},
+        )
+        child = v._with_extra_subs({"dim": "_i0"})
+        assert "my_macro" in child._macro_names, (
+            f"_with_extra_subs must propagate macro_names, got: {child._macro_names}"
+        )
+
 
 # ===========================================================================
 # JuliaSectionBuilder — element processing
@@ -1099,12 +1113,12 @@ class TestModularBuild:
 
     def test_main_file_created(self, tmp_path):
         model = self._two_view_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         assert path.exists()
 
     def test_module_files_created(self, tmp_path):
         model = self._two_view_model(tmp_path)
-        JuliaModelBuilder(model).build_model()
+        JuliaModelBuilder(model, backend="mtk").build_model()
         modules_dir = tmp_path / "modules_split_model"
         assert modules_dir.exists()
         jl_files = list(modules_dir.glob("*.jl"))
@@ -1112,20 +1126,20 @@ class TestModularBuild:
 
     def test_main_file_has_include_statements(self, tmp_path):
         model = self._two_view_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "include(" in content
 
     def test_main_file_concatenates_eq_vectors(self, tmp_path):
         model = self._two_view_model(tmp_path)
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         # The main file should reference the module equation vectors
         assert "eqs = [" in content
 
     def test_module_files_contain_eq_var(self, tmp_path):
         model = self._two_view_model(tmp_path)
-        JuliaModelBuilder(model).build_model()
+        JuliaModelBuilder(model, backend="mtk").build_model()
         modules_dir = tmp_path / "modules_split_model"
         for jl_file in modules_dir.glob("*.jl"):
             content = jl_file.read_text()
@@ -1531,6 +1545,28 @@ class TestJuliaSectionBuilderInitial:
         # D(init_fallback) ~ 0.0 in the equations
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
         assert any("D(init_fallback)" in e for e in all_eqs)
+
+    def test_1d_frozen_initial_emits_indexed_du(self):
+        # 1D subscripted INITIAL that can't be resolved at translation time →
+        # must emit [D(x[_i0]) ~ 0.0 for _i0 in 1:N]..., NOT Symbolics.scalarize.
+        # The ODE builder skips equations containing ".~" or "Symbolics.scalarize",
+        # so using scalarize causes the du entries to be lost.
+        import warnings
+        sr = _make_subscript_range("dim", ["A", "B", "C"])
+        init_ast = InitialStructure(initial=ReferenceStructure("unknown_var"))
+        comp = AbstractComponent(subscripts=[["dim"], []], ast=init_ast)
+        elem = AbstractElement(name="Init 1D", components=[comp])
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            sb = _section_builder_from_elements([elem], subscripts=[sr])
+            sb.build_section()
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert not any("Symbolics.scalarize" in e for e in all_eqs), (
+            f"1D frozen INITIAL must not use Symbolics.scalarize, got: {all_eqs}"
+        )
+        assert any("D(init_1d[" in e for e in all_eqs), (
+            f"1D frozen INITIAL must emit indexed D(x[i]) form, got: {all_eqs}"
+        )
 
     def test_resolve_ref_initial_chain(self):
         """INITIAL(aux) where aux ~ stock → resolves to stock initial."""
@@ -2140,7 +2176,7 @@ class TestModularBuildExtended:
         )
         model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
         with pytest.warns(UserWarning, match="not declared in any view"):
-            JuliaModelBuilder(model).build_model()
+            JuliaModelBuilder(model, backend="mtk").build_model()
 
     def test_view_with_only_control_vars_skipped(self, tmp_path):
         """A view containing only control variables produces no module file."""
@@ -2161,7 +2197,7 @@ class TestModularBuildExtended:
         )
         model = AbstractModel(original_path=tmp_path / "ctrl_model.mdl",
                                sections=(section,))
-        JuliaModelBuilder(model).build_model()
+        JuliaModelBuilder(model, backend="mtk").build_model()
         modules_dir = tmp_path / "modules_ctrl_model"
         jl_files = list(modules_dir.glob("*.jl"))
         assert len(jl_files) == 1  # Only "Main", not "Controls"
@@ -2190,10 +2226,31 @@ class TestModularBuildExtended:
         )
         model = AbstractModel(original_path=tmp_path / "nested.mdl",
                                sections=(section,))
-        JuliaModelBuilder(model).build_model()
+        JuliaModelBuilder(model, backend="mtk").build_model()
         modules_dir = tmp_path / "modules_nested"
         jl_files = list(modules_dir.rglob("*.jl"))
         assert len(jl_files) == 2
+
+    def test_split_views_with_ode_backend_raises_error(self, tmp_path):
+        # split_views=True is only supported for the MTK backend.
+        # Combining it with backend="ode" must raise a clear error.
+        pop = _make_stock_element("Population", 1.0, 100.0)
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        views_dict = {"Sector A": {"Population"}}
+        section = _make_section(
+            elements=[pop] + controls,
+            path=tmp_path / "m.mdl",
+            split=True,
+            views_dict=views_dict,
+        )
+        sb = JuliaSectionBuilder(section, backend="ode")
+        with pytest.raises(ValueError, match="split_views"):
+            sb.build_section()
 
 
 # ===========================================================================
@@ -3178,7 +3235,7 @@ class TestCoverageGaps:
             views_dict=views_dict,
         )
         model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "eqs = [" in content
 
@@ -3204,7 +3261,7 @@ class TestCoverageGaps:
         )
         model = AbstractModel(original_path=tmp_path / "empty_eq.mdl",
                                sections=(section,))
-        path = JuliaModelBuilder(model).build_model()
+        path = JuliaModelBuilder(model, backend="mtk").build_model()
         content = path.read_text()
         assert "eqs = Equation[]" in content
 
@@ -3523,7 +3580,7 @@ class TestJSONDataBackendCoverage:
             views_dict=views_dict,
         )
         model = AbstractModel(original_path=tmp_path / "split.mdl", sections=(section,))
-        JuliaModelBuilder(model, data_format="json").build_model()
+        JuliaModelBuilder(model, data_format="json", backend="mtk").build_model()
         assert (tmp_path / "split_data.json").exists()
 
     def test_json_mode_nonnumeric_constant_uses_fallback(self, tmp_path):
@@ -4196,7 +4253,10 @@ class TestMacroSupportCoverage:
 class TestExceptConstantComponent:
     """Covers the Constant component in EXCEPT handler (lines 744-749)."""
 
-    def test_except_with_constant_component_emits_comment(self):
+    def test_except_with_constant_component_emits_equation(self):
+        # EXCEPT component with constant value must emit an actual equation
+        # (const_except[idx] ~ value), not a comment.  A comment is dead code
+        # that the Julia runtime never executes.
         sr = _make_subscript_range("dim", ["X", "Y", "Z"])
         comp1 = AbstractUnchangeableConstant(
             subscripts=[["dim"], [["Y"]]], ast=1.0
@@ -4208,8 +4268,12 @@ class TestExceptConstantComponent:
         sb = _section_builder_from_elements([elem], subscripts=[sr])
         sb.build_section()
         eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        # The constant component in EXCEPT emits a comment equation
-        assert any("# EXCEPT:" in e for e in eqs)
+        assert not any("# EXCEPT:" in e for e in eqs), (
+            f"EXCEPT constant must not emit a comment, got: {eqs}"
+        )
+        assert any("const_except[" in e and " ~ " in e for e in eqs), (
+            f"EXCEPT constant must emit const_except[idx] ~ value, got: {eqs}"
+        )
 
 
 # ===========================================================================
@@ -4615,6 +4679,40 @@ class TestXmileDelayFixed:
         assert "_df_pipe_1__edf0" in content
 
 
+class TestEmbeddedDelayDrain2D:
+    """Drain of embedded DelayFixed inside ndim≥2 auxiliaries."""
+
+    def test_2d_aux_with_embedded_delay_drains_pipeline_stocks(self):
+        # When a 2D auxiliary's RHS contains an embedded DelayFixedStructure,
+        # _drain_embedded_delays must be called so the pipeline stocks are created.
+        # Without the drain call the _edf placeholder is referenced but never defined.
+        sr_a = _make_subscript_range("dim_a", ["A1", "A2"])
+        sr_b = _make_subscript_range("dim_b", ["B1", "B2"])
+        inp_elem = _make_element("Input Var", 1.0)
+        delay_ast = DelayFixedStructure(
+            input=ReferenceStructure("Input Var"),
+            delay_time=1.0,
+            initial=0.0,
+        )
+        emb_ast = ArithmeticStructure(operators=["+"], arguments=[delay_ast, 0.0])
+        comp = AbstractComponent(subscripts=[["dim_a", "dim_b"], []], ast=emb_ast)
+        aux_elem = AbstractElement(name="Aux 2D", components=[comp])
+        control_elems = [
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        sb = _section_builder_from_elements(
+            [inp_elem, aux_elem] + control_elems,
+            subscripts=[sr_a, sr_b],
+        )
+        sb.build_section()
+        assert any("_edf" in d for d in sb.stock_decls), (
+            f"2D aux with embedded delay must generate pipeline stocks, got: {sb.stock_decls}"
+        )
+
+
 class TestXmileMinMax:
     """XMILE MIN/MAX over an entire subscript dimension."""
 
@@ -4765,7 +4863,7 @@ class TestInvertMatrix:
 
     def test_2d_invert_matrix_generates_scalarize(self):
         """2D case: matrix1i[d,d1] = INVERT_MATRIX(matrix_1[d,d1], 2)
-        should produce:  Symbolics.scalarize(matrix1i .~ inv(matrix_1))...
+        should use the _inv_mat2d_elem helper (registered via needed_helpers),
         NOT element-wise: [matrix1i[_i0,_i1] ~ inv(matrix_1[_i0,_i1], 2) ...]
         """
         sr_d  = _make_subscript_range("d",  ["A", "B"])
@@ -5161,3 +5259,39 @@ class TestBackendDispatch:
         content = JuliaModelBuilder(model, backend="mtk").build_model().read_text()
         assert '"North"' in content
         assert '"South"' in content
+
+
+# ===========================================================================
+# check_compat — version guard emitted in generated files
+# ===========================================================================
+
+class TestCheckCompat:
+    """Generated Julia files must call check_compat so the runtime can detect
+    a PySD.jl major-version mismatch before execution."""
+
+    def _build(self, tmp_path, backend="ode"):
+        elem = _make_stock_element("Level", 1.0, 0.0)
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[elem] + controls,
+            path=tmp_path / "m.mdl",
+        )
+        model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
+        return JuliaModelBuilder(model, backend=backend).build_model().read_text()
+
+    def test_ode_file_emits_check_compat(self, tmp_path):
+        content = self._build(tmp_path, "ode")
+        assert 'check_compat(v"' in content, (
+            f"ODE generated file must call check_compat, got header:\n{content[:500]}"
+        )
+
+    def test_mtk_file_emits_check_compat(self, tmp_path):
+        content = self._build(tmp_path, "mtk")
+        assert 'check_compat(v"' in content, (
+            f"MTK generated file must call check_compat, got header:\n{content[:500]}"
+        )

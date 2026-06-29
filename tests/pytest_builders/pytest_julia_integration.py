@@ -503,7 +503,7 @@ class TestTranslationFeatures:
 # ---------------------------------------------------------------------------
 
 class TestModularTranslation:
-    """split_views=True must create a main .jl file plus per-view module files."""
+    """split_views=True is MTK-backend only; creates main .jl plus per-view module files."""
 
     def test_split_model_creates_modules_dir(self, tmp_path):
         import shutil as _shutil
@@ -518,7 +518,7 @@ class TestModularTranslation:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            jl_path = translate_to_julia(dst, split_views=True)
+            jl_path = translate_to_julia(dst, split_views=True, backend="mtk")
 
         modules_dir = tmp_path / f"modules_{dst.stem}"
         assert jl_path.exists()
@@ -537,7 +537,7 @@ class TestModularTranslation:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            translate_to_julia(dst, split_views=True)
+            translate_to_julia(dst, split_views=True, backend="mtk")
 
         modules_dir = tmp_path / f"modules_{dst.stem}"
         jl_files = list(modules_dir.rglob("*.jl"))
@@ -556,7 +556,7 @@ class TestModularTranslation:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            jl_path = translate_to_julia(dst, split_views=True)
+            jl_path = translate_to_julia(dst, split_views=True, backend="mtk")
 
         content = jl_path.read_text()
         assert "include(" in content
@@ -575,10 +575,9 @@ class TestModularTranslation:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            jl_path = translate_to_julia(dst, split_views=True)
+            jl_path = translate_to_julia(dst, split_views=True, backend="mtk")
 
         content = jl_path.read_text()
-        assert "rhs!" in content   # referenced in ODEProblem(rhs!, ...)
         assert "run_model" in content
         assert "include(" in content
 

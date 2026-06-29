@@ -338,7 +338,7 @@ Supported Vensim features
      - Supported
      - Supported
    * - ``DELAY FIXED``
-     - Supported (exact N-stage Euler pipeline)
+     - Supported (exact N-stage Euler pipeline; falls back to first-order ODE if delay time is dynamic)
      - Supported
    * - ``TREND``, ``FORECAST``
      - Supported
@@ -458,7 +458,7 @@ parse.  The Julia builder does not yet cover:
      - Passes through; interactive value ignored in batch simulation
    * - ``DELAY FIXED`` exact semantics
      - Full (discrete transport delay)
-     - Supported (exact N-stage Euler pipeline matching Vensim ring-buffer semantics)
+     - Supported (exact N-stage Euler pipeline matching Vensim ring-buffer semantics); dynamic delay times fall back to a first-order ODE approximation with a warning
    * - ``SAMPLE IF TRUE`` exact semantics
      - Full (holds last-true value)
      - Supported (instantaneous ifelse output; hold stock updated each step)
