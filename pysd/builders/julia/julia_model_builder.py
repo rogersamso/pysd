@@ -30,6 +30,7 @@ from pysd.translators.structures.abstract_model import (
 from pysd.translators.structures.abstract_expressions import (
     AllocateAvailableStructure,
     AllocateByPriorityStructure,
+    ArithmeticStructure,
     CallStructure,
     DataStructure,
     DelayFixedStructure,
@@ -1055,10 +1056,16 @@ class JuliaSectionBuilder:
             try:
                 order = int(ast.order)
             except (TypeError, ValueError):
-                warn(
-                    f"SMOOTH with non-integer order for '{elem.name}'; defaulting to 3."
-                )
-                order = 3
+                order = None
+                if isinstance(ast, SmoothNStructure):
+                    t0_val = self._eval_ast_at_t0(ast.order)
+                    if t0_val is not None:
+                        order = max(1, round(t0_val))
+                if order is None:
+                    warn(
+                        f"SMOOTH with non-integer order for '{elem.name}'; defaulting to 3."
+                    )
+                    order = 3
             return self._expand_smooth(identifier, ast, visitor, order=order, dims=dims)
 
         # ---- Delay (integer order) -------------------------------------
@@ -1066,10 +1073,16 @@ class JuliaSectionBuilder:
             try:
                 order = int(ast.order)
             except (TypeError, ValueError):
-                warn(
-                    f"DELAY with non-integer order for '{elem.name}'; defaulting to 3."
-                )
-                order = 3
+                order = None
+                if isinstance(ast, DelayNStructure):
+                    t0_val = self._eval_ast_at_t0(ast.order)
+                    if t0_val is not None:
+                        order = max(1, round(t0_val))
+                if order is None:
+                    warn(
+                        f"DELAY with non-integer order for '{elem.name}'; defaulting to 3."
+                    )
+                    order = 3
             return self._expand_delay(identifier, ast, visitor, order=order, dims=dims)
 
         # ---- DELAY FIXED ------------------------------------------------
@@ -1959,6 +1972,71 @@ class JuliaSectionBuilder:
     # DELAY FIXED expansion
     # ------------------------------------------------------------------
 
+    def _eval_ast_at_t0(self, node) -> Optional[float]:
+        """Evaluate an abstract-expression AST node at t=0.
+
+        Used to resolve the initial order of SMOOTH N / DELAY N when the order
+        is a time-varying expression (e.g. ``2 + STEP(1, 10)``).  Returns None
+        if the value cannot be determined.
+
+        Handles: literals, ArithmeticStructure (+−×÷), ReferenceStructure
+        resolved via prescanned constants or built_elements, and common
+        zero-at-t0 calls (STEP, RAMP, PULSE).
+        """
+        if isinstance(node, (int, float)):
+            return float(node)
+        if isinstance(node, ArithmeticStructure):
+            args = [self._eval_ast_at_t0(a) for a in node.arguments]
+            if any(v is None for v in args):
+                return None
+            ops = node.operators
+            result = args[0]
+            for op, val in zip(ops, args[1:]):
+                if op == "+":
+                    result += val
+                elif op in ("-", "−"):
+                    result -= val
+                elif op in ("*", "×"):
+                    result *= val
+                elif op in ("/", "÷"):
+                    result = result / val if val != 0 else None
+                else:
+                    return None
+                if result is None:
+                    return None
+            return result
+        if isinstance(node, CallStructure):
+            func_name = ""
+            if isinstance(node.function, ReferenceStructure):
+                func_name = node.function.reference.lower()
+            # Functions that are zero at t=0
+            if func_name in ("step", "ramp", "pulse", "pulse train"):
+                return 0.0
+            return None
+        if isinstance(node, ReferenceStructure):
+            julia_id = self.namespace.get(node.reference)
+            if julia_id is not None:
+                val = self._try_eval_as_float(julia_id)
+                if val is not None:
+                    return val
+            # Try to find the referenced element in the abstract section and
+            # recursively evaluate its AST at t=0 (handles variables like
+            # "Order Variable = 2 + STEP(1, 10)" → returns 2.0).
+            # Normalize both names: lowercase, spaces→underscores.
+            ref_norm = node.reference.lower().replace(" ", "_").strip()
+            for elem in self.abstract_elements:
+                elem_norm = elem.name.lower().replace(" ", "_").strip()
+                if elem_norm == ref_norm:
+                    for comp in elem.components:
+                        if not isinstance(comp.ast, (int, float, ArithmeticStructure,
+                                                     CallStructure, ReferenceStructure)):
+                            break
+                        val = self._eval_ast_at_t0(comp.ast)
+                        if val is not None:
+                            return val
+            return None
+        return None
+
     def _try_eval_as_float(self, expr: str) -> Optional[float]:
         """Try to evaluate a Julia expression string as a constant float.
 
@@ -2083,7 +2161,7 @@ class JuliaSectionBuilder:
             idx_str_t = ", ".join(idx_vars)
             for_clause = self._for_clause(dims, idx_vars)
             return [
-                f"[D({lv_name}[{idx_str_t}]) ~ ({input_nd} - {lv_name}[{idx_str_t}]) / ({delay_time_nd}) "
+                f"[D({lv_name}[{idx_str_t}]) ~ ({input_nd} - {lv_name}[{idx_str_t}]) / max({delay_time_nd}, eps(Float64)) "
                 f"for {for_clause}]...",
                 f"[{identifier}[{idx_str_t}] ~ {lv_name}[{idx_str_t}] for {for_clause}]...",
             ]
@@ -2092,7 +2170,7 @@ class JuliaSectionBuilder:
         self.u0_entries.append(f"{lv_name} => {initial_expr}")
         self.aux_decls.append(f"@variables {identifier}(t)")
         return [
-            f"D({lv_name}) ~ ({input_expr} - {lv_name}) / {delay_time_expr}",
+            f"D({lv_name}) ~ ({input_expr} - {lv_name}) / max({delay_time_expr}, eps(Float64))",
             f"{identifier} ~ {lv_name}",
         ]
 

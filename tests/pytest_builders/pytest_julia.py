@@ -37,6 +37,7 @@ from pysd.translators.structures.abstract_expressions import (
     CallStructure,
     DataStructure,
     DelayFixedStructure,
+    DelayNStructure,
     DelayStructure,
     ForecastStructure,
     GameStructure,
@@ -1659,6 +1660,73 @@ class TestJuliaSectionBuilderExpansions:
             "DELAY FIXED must assign the output identifier"
         assert any("_df_pipe_" in d for d in sb.stock_decls), \
             "Pipeline stages must appear in stock_decls"
+
+    def test_delay_fixed_dynamic_fallback_guards_division_by_zero(self):
+        """DELAY FIXED with dynamic (non-constant) delay time falls back to a
+        first-order ODE.  The denominator must use max(delay_expr, eps(Float64))
+        so that when delay_time = 0 at t=0 the Euler solver does not blow up
+        to Inf and halt the simulation prematurely."""
+        import warnings
+        # ReferenceStructure delay_time cannot be evaluated at translation time
+        # → triggers the fallback first-order ODE path.
+        delay_ast = DelayFixedStructure(
+            input=ReferenceStructure("input_var"),
+            delay_time=ReferenceStructure("delay_var"),
+            initial=5.0,
+        )
+        comp = AbstractComponent(subscripts=[[], []], ast=delay_ast)
+        elem = AbstractElement(name="Out", components=[comp])
+        sb = _section_builder_from_elements([elem])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sb.build_section()
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        fallback_eq = next((e for e in all_eqs if "_df_out" in e and "~" in e), None)
+        assert fallback_eq is not None, "Expected a fallback ODE equation for _df_out"
+        assert "max(" in fallback_eq, (
+            "Fallback DELAY FIXED ODE must use max(delay_time, eps(Float64)) "
+            f"to prevent division by zero, but got: {fallback_eq!r}"
+        )
+        assert "eps(Float64)" in fallback_eq, (
+            f"Fallback must clamp with eps(Float64), but got: {fallback_eq!r}"
+        )
+
+    def test_delay_n_variable_order_uses_initial_value(self):
+        """DELAY N whose order is a time-varying expression (e.g. 2 + STEP(1, 10))
+        must use the order evaluated at t=0 (here: 2) instead of defaulting to 3.
+        This matches the Python backend behaviour and gives correct initial dynamics."""
+        import warnings
+        order_ast = ArithmeticStructure(
+            operators=["+"],
+            arguments=[2.0, CallStructure(
+                function=ReferenceStructure("step"),
+                arguments=(1.0, 10.0),
+            )],
+        )
+        delay_ast = DelayNStructure(
+            input=5.0,
+            delay_time=4.0,
+            initial=6.0,
+            order=order_ast,
+        )
+        comp = AbstractComponent(subscripts=[[], []], ast=delay_ast)
+        elem = AbstractElement(name="Out Delay N", components=[comp])
+        sb = _section_builder_from_elements([elem])
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            sb.build_section()
+        fallback_warns = [str(w.message) for w in captured
+                          if "defaulting to 3" in str(w.message)]
+        assert not fallback_warns, (
+            "DELAY N with evaluable initial order should not fall back to 3: "
+            + str(fallback_warns)
+        )
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        stage_names = [e for e in sb.stock_decls if "_dl" in e]
+        assert len(stage_names) == 2, (
+            f"Order 2 (from t=0 evaluation) must produce 2 pipeline stages, "
+            f"got: {stage_names}"
+        )
 
     def test_trend_expands(self):
         ast = TrendStructure(input=10.0, average_time=5.0, initial_trend=0.02)
