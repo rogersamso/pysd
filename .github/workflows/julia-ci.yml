@@ -66,7 +66,9 @@ jobs:
   #
   # Uses a pre-built base image (ghcr.io/rogersamso/pysd-julia-base) that
   # has all heavy packages (MTK, Symbolics, …) already precompiled.
-  # Only PySD.jl is developed in-place here, which is fast (~30s).
+  # PySD.jl is made available via JULIA_LOAD_PATH (pointing at the
+  # pysd/builders/julia directory) rather than Pkg.develop, so the
+  # pre-installed packages in the image are never modified.
   #
   # The base image is rebuilt by docker-julia-base.yml whenever the
   # Dockerfile changes, or weekly to pick up package updates.
@@ -86,14 +88,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Develop PySD.jl
-        run: |
-          julia --startup-file=no -e '
-            using Pkg
-            Pkg.develop(PackageSpec(path="pysd/builders/julia/PySD.jl"))
-            Pkg.precompile()
-          '
-
       - name: Install Python dependencies
         run: |
           pip install -U pip wheel
@@ -101,5 +95,10 @@ jobs:
           pip install --prefer-binary -e .
 
       - name: Run numerical integration tests
+        # Point Julia at PySD.jl via JULIA_LOAD_PATH so the pre-installed
+        # packages in the Docker image are never touched (Pkg.develop updates
+        # the manifest and can evict or change package versions).
+        env:
+          JULIA_LOAD_PATH: "${{ github.workspace }}/pysd/builders/julia:@v#.#:@stdlib"
         run: |
           pytest tests/pytest_builders/pytest_julia_integration.py -m julia -v --tb=short
