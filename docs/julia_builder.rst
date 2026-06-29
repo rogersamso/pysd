@@ -39,10 +39,12 @@ Install the required Julia packages once::
 
    julia -e 'using Pkg; Pkg.add([
        "OrdinaryDiffEq",
+       "OrdinaryDiffEqLowOrderRK",
        "DataInterpolations",
        "NCDatasets",
-       "XLSX",
+       "JSON3",
        "ModelingToolkit",   # only needed for the mtk backend
+       "Symbolics",         # only needed for the mtk backend
    ])'
 
 Then install the ``PySD.jl`` companion library. It lives in a submodule of
