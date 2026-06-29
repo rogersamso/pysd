@@ -302,21 +302,11 @@ _julia_mtk_available_cache: bool | None = None
 
 
 def _julia_mtk_available() -> bool:
-    """Return True iff the julia binary exists AND ModelingToolkit.jl is loadable."""
+    """Return True iff the julia binary is available on PATH."""
     global _julia_mtk_available_cache
     if _julia_mtk_available_cache is not None:
         return _julia_mtk_available_cache
-    if not shutil.which("julia"):
-        _julia_mtk_available_cache = False
-        return False
-    result = subprocess.run(
-        ["julia", "--startup-file=no", "-e",
-         "using ModelingToolkit, OrdinaryDiffEq, OrdinaryDiffEqLowOrderRK; println(\"ok\")"],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    _julia_mtk_available_cache = result.returncode == 0 and "ok" in result.stdout
+    _julia_mtk_available_cache = shutil.which("julia") is not None
     return _julia_mtk_available_cache
 
 
