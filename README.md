@@ -53,7 +53,7 @@ git clone --recursive https://github.com/SDXorg/pysd.git
 
 You can use PySD in [R](https://www.r-project.org/) via the [PySD2R](https://github.com/JimDuggan/pysd2r) package, also available on [CRAN](https://CRAN.R-project.org/package=pysd2r).
 
-PySD can also translate models to standalone [Julia](https://julialang.org/) files that run without Python at runtime, using either a plain ODE backend or a [ModelingToolkit](https://mtk.sciml.ai/) symbolic backend. See the [Julia Builder documentation](https://pysd.readthedocs.io/en/latest/julia_builder.html) for details.
+PySD can also translate models to standalone [Julia](https://julialang.org/) files that run without Python at runtime, using either a plain ODE backend or a [ModelingToolkit](https://mtk.sciml.ai/) symbolic backend. See the [Julia Builder documentation](docs/julia_builder.rst) for details.
 
 ## Contributing
 
