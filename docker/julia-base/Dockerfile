@@ -10,6 +10,10 @@ RUN apt-get update && \
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# Store Julia depot outside $HOME so GitHub Actions' HOME=/github/home override
+# doesn't hide the pre-installed packages.
+ENV JULIA_DEPOT_PATH=/opt/julia-depot
+
 # Pre-install and precompile all heavy Julia packages.
 # PySD.jl is intentionally excluded: it lives in the repo and is developed
 # in-place by the CI job, so only it needs recompiling on each run (fast).

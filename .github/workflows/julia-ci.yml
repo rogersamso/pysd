@@ -88,6 +88,21 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Debug Julia environment
+        env:
+          JULIA_DEPOT_PATH: /opt/julia-depot
+        run: |
+          julia --startup-file=no -e '
+            println("=== LOAD_PATH ==="); println(LOAD_PATH)
+            println("=== DEPOT_PATH ==="); println(DEPOT_PATH)
+            println("=== HOME ==="); println(homedir())
+            using Pkg; Pkg.status()
+          '
+          echo "--- depot env dir ---"
+          ls /opt/julia-depot/environments/ 2>/dev/null || echo "(empty or missing)"
+          echo "--- packages dir ---"
+          ls /opt/julia-depot/packages/ 2>/dev/null | head -10 || echo "(empty or missing)"
+
       - name: Install Python dependencies
         run: |
           pip install -U pip wheel
@@ -95,10 +110,8 @@ jobs:
           pip install --prefer-binary -e .
 
       - name: Run numerical integration tests
-        # Point Julia at PySD.jl via JULIA_LOAD_PATH so the pre-installed
-        # packages in the Docker image are never touched (Pkg.develop updates
-        # the manifest and can evict or change package versions).
         env:
+          JULIA_DEPOT_PATH: /opt/julia-depot
           JULIA_LOAD_PATH: "${{ github.workspace }}/pysd/builders/julia:@v#.#:@stdlib"
         run: |
           pytest tests/pytest_builders/pytest_julia_integration.py -m julia -v --tb=short
