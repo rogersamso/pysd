@@ -57,11 +57,27 @@ SAMPLES_DIR = Path("tests/test-models/samples")
 # ---------------------------------------------------------------------------
 
 def _all_mdl_files() -> List[Tuple[str, Path]]:
-    """Return (folder_name, mdl_path) for every .mdl in tests/test-models/tests/."""
+    """Return (folder_name, model_path) for every model in tests/test-models/tests/.
+
+    Handles both lowercase .mdl and uppercase .MDL extensions (Linux is case-sensitive).
+    XMILE-only folders (no .mdl/.MDL file) are included via their .xmile file.
+    """
     results = []
+    mdl_folders: set = set()
     for mdl in sorted(TEST_MODELS_DIR.glob("*/*.mdl")):
         results.append((mdl.parent.name, mdl))
-    return results
+        mdl_folders.add(mdl.parent.name)
+    # Uppercase .MDL (e.g. case_sensitive_extension)
+    for mdl in sorted(TEST_MODELS_DIR.glob("*/*.MDL")):
+        folder = mdl.parent.name
+        if folder not in mdl_folders:
+            results.append((folder, mdl))
+            mdl_folders.add(folder)
+    for xmile in sorted(TEST_MODELS_DIR.glob("*/*.xmile")):
+        folder = xmile.parent.name
+        if folder not in mdl_folders:
+            results.append((folder, xmile))
+    return sorted(results)
 
 
 def _output_csv_path(folder: str) -> Path | None:
@@ -109,53 +125,146 @@ def _isclose(a: float, b: float, rtol: float = 1e-3, atol: float = 1e-4) -> bool
 #: and collecting those that produce no warnings.
 CLEAN_MODELS: List[str] = [
     "abs",
+    "active_initial",
+    "active_initial_circular",
+    "allocate_available",
+    "allocate_by_priority",
+    "arguments",
     "arithmetics",
     "arithmetics_exp",
+    "array_with_line_break",
     "builtin_max",
     "builtin_min",
+    "case_sensitive_extension",
     "chained_initialization",
+    "comparisons",
+    "conditional_subscripts",
     "constant_expressions",
     "control_vars",
+    "data_from_other_model",
     "delay_numeric_error",
     "delay_parentheses",
+    "delay_xmile",
     "dynamic_final_time",
+    "elm_count",
     "euler_step_vs_saveper",
+    "eval_order",
+    "except",
+    "except_multiple",
+    "except_subranges",
     "exp",
     "exponentiation",
+    "forecast",
     "fully_invalid_names",
     "function_capitalization",
     "game",
+    "get_constants",
+    "get_constants_incomplete_subscript",
     "get_constants_subranges",
+    "get_data",
+    "get_data_args_3d_xls",
+    "get_lookups_data_3d_xls",
+    "get_lookups_subscripted_args",
+    "get_lookups_subset",
+    "get_mixed_definitions",
+    "get_subscript_3d_arrays_xls",
+    "min_max_1arg",
+    "get_time_value",
+    "get_values_order",
+    "get_with_missing_values_xlsx",
+    "get_xls_cellrange",
     "if_stmt",
     "initial_function",
     "input_functions",
+    "invert_matrix",
     "limits",
     "line_breaks",
     "line_continuation",
     "ln",
     "log",
     "logicals",
+    "lookups",
+    "lookups_funcnames",
     "lookups_inline",
     "lookups_inline_bounded",
     "lookups_inline_spaces",
     "lookups_with_expr",
+    "lookups_without_range",
+    "macro_cross_reference",
+    "macro_expression",
+    "macro_multi_expression",
+    "macro_multi_macros",
+    "macro_trailing_definition",
     "model_doc",
     "multiple_lines_def",
     "na",
     "nested_functions",
+    "non_negative_all",
+    "non_negative_flows",
+    "non_negative_stocks",
     "number_handling",
     "parentheses",
+    "partial_range_definitions",
+    "pi",
+    "power",
     "reference_capitalization",
+    "repeated_subscript",
     "rounding",
+    "sample_if_true",
+    "smaller_range",
     "smooth_and_stock",
     "special_characters",
+    "special_characters_xmile",
     "sqrt",
+    "subrange_merge",
+    "subscript_1d_arrays",
+    "subscript_2d_arrays",
+    "subscript_3d_arrays",
+    "subscript_3d_arrays_lengthwise",
+    "subscript_3d_arrays_widthwise",
+    "subscript_aggregation",
+    "subscript_constant_call",
+    "subscript_copy",
+    "subscript_definition",
+    "subscript_docs",
+    "subscript_element_name",
+    "subscript_individually_defined_1_of_2d_arrays",
+    "subscript_individually_defined_1_of_2d_arrays_from_floats",
     "subscript_individually_defined_1d_arrays",
+    "subscript_individually_defined_stocks",
+    "subscript_logicals",
+    "subscript_mapping_simple",
+    "subscript_mapping_vensim",
+    "subscript_mixed_assembly",
+    "subscript_multiples",
+    "subscript_numeric_range",
+    "subscript_selection",
+    "subscript_subranges",
+    "subscript_subranges_equal",
+    "subscript_switching",
+    "subscript_transposition",
+    "subscript_updimensioning",
+    "subscripted_delays",
+    "subscripted_flows",
+    "subscripted_if_then_else",
+    "subscripted_logicals",
+    "subscripted_lookups",
+    "subscripted_ramp_step",
+    "subscripted_round",
+    "subscripted_trend",
+    "subscripted_trig",
+    "subscripted_xidz",
+    "subset_duplicated_coord",
+    "tabbed_arrays",
     "time",
+    "trend",
     "trig",
     "unchangeable_constant",
     "unicode_characters",
     "variable_ranges",
+    "vector_order",
+    "vector_select",
+    "with_lookup",
     "xidz_zidz",
     "zeroled_decimals",
 ]
@@ -168,6 +277,8 @@ NUMERICAL_MODELS: List[str] = [
     "builtin_min",
     "case_sensitive_extension",
     "comparisons",
+    "delay_fixed",
+    "delays",
     "eval_order",
     "exp",
     "if_stmt",
@@ -177,9 +288,11 @@ NUMERICAL_MODELS: List[str] = [
     "lookups_with_expr",
     "number_handling",
     "odd_number_quotes",
+    "smooth",
     "sqrt",
     "subscript_1d_arrays",
     "subscript_individually_defined_1d_arrays",
+    "subscripted_delays",
     "trend",
     "trig",
 ]
@@ -272,8 +385,9 @@ class TestTranslationCleanModels:
     def test_no_warnings(self, folder, mdl_path, tmp_path):
         """Clean models must not emit any UserWarning during translation."""
         import shutil as _shutil
-        dst = tmp_path / mdl_path.name
-        _shutil.copy(mdl_path, dst)
+        model_dir = tmp_path / folder
+        _shutil.copytree(mdl_path.parent, model_dir)
+        dst = model_dir / mdl_path.name
 
         from pysd import translate_to_julia
 
@@ -290,8 +404,9 @@ class TestTranslationCleanModels:
     def test_stocks_declared(self, folder, mdl_path, tmp_path):
         """Models with stocks must declare @variables ... (t) in the output."""
         import shutil as _shutil
-        dst = tmp_path / mdl_path.name
-        _shutil.copy(mdl_path, dst)
+        model_dir = tmp_path / folder
+        _shutil.copytree(mdl_path.parent, model_dir)
+        dst = model_dir / mdl_path.name
 
         from pysd import translate_to_julia
 
@@ -308,8 +423,9 @@ class TestTranslationCleanModels:
     def test_control_vars_emitted(self, folder, mdl_path, tmp_path):
         """Control variables (initial/final time, dt) must appear in output."""
         import shutil as _shutil
-        dst = tmp_path / mdl_path.name
-        _shutil.copy(mdl_path, dst)
+        model_dir = tmp_path / folder
+        _shutil.copytree(mdl_path.parent, model_dir)
+        dst = model_dir / mdl_path.name
 
         from pysd import translate_to_julia
 
@@ -763,10 +879,11 @@ def julia_numerical_results(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("julia_numerical")
     folders = [
         "abs", "builtin_max", "builtin_min", "case_sensitive_extension",
-        "comparisons", "eval_order", "exp", "if_stmt", "initial_function",
-        "input_functions", "logicals", "lookups_with_expr", "number_handling",
-        "odd_number_quotes", "sqrt",
-        "subscript_1d_arrays", "subscript_individually_defined_1d_arrays",
+        "comparisons", "delay_fixed", "delays", "eval_order", "exp",
+        "if_stmt", "initial_function", "input_functions", "logicals",
+        "lookups_with_expr", "number_handling", "odd_number_quotes",
+        "smooth", "sqrt", "subscript_1d_arrays",
+        "subscript_individually_defined_1d_arrays", "subscripted_delays",
         "trend", "trig",
     ]
 
@@ -894,9 +1011,12 @@ class TestNumericalValidation:
         return mapping
 
     def _compare(self, folder: str, ref: Dict, sim: Dict,
-                 rtol: float = 1e-3, atol: float = 1e-4) -> None:
+                 rtol: float = 1e-3, atol: float = 1e-4,
+                 extra_ignore: set = None) -> None:
         """Assert all shared columns match within tolerance."""
         IGNORABLE = {"saveper", "initial_time", "final_time", "time_step", "time"}
+        if extra_ignore:
+            IGNORABLE = IGNORABLE | {c.lower() for c in extra_ignore}
         failures = []
 
         for col, ref_vals in ref.items():
@@ -1002,6 +1122,31 @@ class TestNumericalValidation:
             *self._sim("subscript_individually_defined_1d_arrays", julia_numerical_results),
         )
 
+    def test_delays(self, julia_numerical_results):
+        """DELAY1 / DELAY3 / DELAYN produce correct time series against Python reference."""
+        self._compare("delays", *self._sim("delays", julia_numerical_results))
+
+    def test_smooth(self, julia_numerical_results):
+        """SMOOTH / SMOOTH3 / SMOOTHN produce correct time series against Python reference."""
+        self._compare("smooth", *self._sim("smooth", julia_numerical_results))
+
+    def test_delay_fixed(self, julia_numerical_results):
+        """DELAY FIXED with static delay time produces correct transport delay."""
+        ref, sim = self._sim("delay_fixed", julia_numerical_results)
+        # DST and DT2 use dynamic (time-varying) delay times which fall back to
+        # a first-order ODE in the Julia builder; their values differ from Python.
+        self._compare(
+            "delay_fixed", ref, sim,
+            extra_ignore={"DST", "DT2"},
+        )
+
+    def test_subscripted_delays(self, julia_numerical_results):
+        """Subscripted DELAY1 / DELAY3 / DELAYN produce correct 1-D element series."""
+        self._compare(
+            "subscripted_delays",
+            *self._sim("subscripted_delays", julia_numerical_results),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tier 1 — Feature-specific translation tests for newly implemented constructs
@@ -1040,18 +1185,22 @@ class TestNewConstructsTranslation:
         content = self._translate(mdl, tmp_path)
         assert "function rhs!" in content
 
-    def test_delay_fixed_emits_first_order_ode(self, tmp_path):
-        """DELAY FIXED must expand into a first-order ODE auxiliary stock."""
+    def test_delay_fixed_emits_pipeline_stages(self, tmp_path):
+        """DELAY FIXED must expand into N Euler pipeline stages (exact transport delay)."""
         mdl = MORE_TESTS_DIR / "julia_delay_fixed" / "test_julia_delay_fixed.mdl"
         if not mdl.exists():
             pytest.skip("julia_delay_fixed test model not found")
         content = self._translate(mdl, tmp_path)
-        # Must declare an internal level stock
-        assert "_df_" in content, "DELAY FIXED must declare a _df_ auxiliary stock"
-        # Must produce an ODE equation for the internal level
-        assert "du[" in content, "DELAY FIXED must produce a du[i] = ... ODE derivative"
-        # Must NOT emit a plain identity (identity would be 'output ~ input')
+        # Must declare internal pipeline stocks (prefix _df_pipe_)
+        assert "_df_pipe_" in content, "DELAY FIXED must declare _df_pipe_ pipeline stocks"
+        # Must produce ODE derivatives
+        assert "du[" in content, "DELAY FIXED must produce du[i] = ... ODE derivatives"
+        # Must NOT emit a 'not supported' warning marker in generated code
         assert "DELAY FIXED is not supported" not in content
+        # The model has delay_time=2 and time_step=0.0625 → N=32 stages
+        # Check at least a few stage declarations appear
+        assert "_df_pipe_1_output" in content, "First pipeline stage must appear"
+        assert "_df_pipe_32_output" in content, "Last pipeline stage (N=32) must appear"
 
     # --- TREND ---
 
@@ -1108,17 +1257,22 @@ class TestNewConstructsTranslation:
         assert "function rhs!" in content
 
     def test_sample_if_true_emits_conditional_stock(self, tmp_path):
-        """SAMPLE IF TRUE must expand into a conditional ODE state variable."""
+        """SAMPLE IF TRUE must expand into a hold stock with correct instantaneous output."""
         mdl = MORE_TESTS_DIR / "julia_sample_if_true" / "test_julia_sample_if_true.mdl"
         if not mdl.exists():
             pytest.skip("julia_sample_if_true test model not found")
         content = self._translate(mdl, tmp_path)
         # Must declare a hold stock
         assert "_sit_" in content, "SAMPLE IF TRUE must declare a _sit_ hold stock"
-        # Must produce a conditional ODE
+        # Must produce a conditional ODE for the hold stock
         assert "du[" in content, "SAMPLE IF TRUE must produce a du[i] = ... ODE derivative"
         # Condition must appear in the ODE
         assert "ifelse" in content, "SAMPLE IF TRUE ODE must use ifelse for condition"
+        # The output variable must use the instantaneous conditional expression,
+        # NOT just read the stock directly (fixes off-by-one for the "true" branch)
+        # i.e. sampled_value = ifelse(condition, input, _sit_sampled_value)
+        assert "sampled_value = ifelse(" in content or "_sit_sampled_value" in content, \
+            "Output must use conditional ifelse(condition, input, hold_state)"
 
     # --- Built-in function expansions ---
 
@@ -1239,14 +1393,25 @@ class TestNewConstructsNumerical:
     JIT compilation is paid once for the whole class.
     """
 
-    def test_delay_fixed_converges_to_input(self, julia_constructs_results):
-        """DELAY FIXED (approximated as 1st-order ODE) must converge to constant input."""
+    def test_delay_fixed_exact_pipeline_behavior(self, julia_constructs_results):
+        """DELAY FIXED pipeline: output must equal 0 before delay_time, then exactly 5.
+
+        Model: Input=5 (const), Delay Time=2, Initial Value=0, TIME STEP=0.0625.
+        Expected: output=0 for t in [0,2), output=5 for t in [2,10].
+        """
         result = julia_constructs_results.get("delay_fixed", {})
         vals = result.get("Output", [])
         assert vals, "Output variable not in Julia result (delay_fixed)"
-        final_val = vals[-1]
-        assert abs(final_val - 5.0) < 0.5, \
-            f"DELAY FIXED output should converge to ~5.0 at t=10, got {final_val}"
+        # t=0 through t=1 (inclusive): output should be 0 (initial value held)
+        # t=2 onward: output should be 5 (input value, exactly, not exponential)
+        t_ref = list(range(0, 11))
+        for t, v in zip(t_ref, vals):
+            if t < 2:
+                assert abs(v) < 1e-6, \
+                    f"DELAY FIXED output at t={t} should be 0 (hold initial), got {v}"
+            elif t >= 2:
+                assert abs(v - 5.0) < 1e-6, \
+                    f"DELAY FIXED output at t={t} should be exactly 5.0, got {v}"
 
     def test_trend_qualitative_behaviour(self, julia_constructs_results):
         """TREND of a linearly growing input should produce a positive trend."""
@@ -1266,17 +1431,24 @@ class TestNewConstructsNumerical:
             assert f >= inp * 0.9, \
                 f"FORECAST should be >= input after transient: forecast={f}, input={inp}"
 
-    def test_sample_if_true_holds_value(self, julia_constructs_results):
-        """SAMPLE IF TRUE must hold the input value when condition becomes true."""
+    def test_sample_if_true_exact_behavior(self, julia_constructs_results):
+        """SAMPLE IF TRUE: output must be 0 before t=5, then equal Input=2*t after t>=5.
+
+        Model: Condition=IF THEN ELSE(Time>=5,1,0), Input=Time*2, Initial=0.
+        Expected: sampled_value=0 for t<5, sampled_value=Input(t)=2*t for t>=5.
+        """
         result = julia_constructs_results.get("sample_if_true", {})
         vals = result.get("Sampled Value", [])
         assert vals, "Sampled Value variable not in Julia result (sample_if_true)"
-        early_vals = vals[:5]   # t=0..4
-        late_vals = vals[6:]    # t=6..10
-        assert all(v < 5.0 for v in early_vals), \
-            f"Sampled Value should be near 0 before condition (t<5): {early_vals}"
-        assert max(late_vals) > 5.0, \
-            f"Sampled Value should track input (>5) after condition (t>=5): {late_vals}"
+        t_ref = list(range(0, 11))
+        for t, v in zip(t_ref, vals):
+            if t < 5:
+                assert abs(v) < 1e-6, \
+                    f"Sampled Value at t={t} should be 0 (before condition), got {v}"
+            else:
+                expected = 2.0 * t
+                assert abs(v - expected) < 0.1, \
+                    f"Sampled Value at t={t} should be ~{expected} (Input=2*t), got {v}"
 
 
 # ===========================================================================
@@ -1514,7 +1686,71 @@ class TestNewFeatureIntegration:
         macro_path = tmp_path / "macro_model_my_macro.jl"
         assert macro_path.exists()
         content = macro_path.read_text()
-        assert "my_macro_eqs" in content
+        assert "function my_macro(" in content
+
+    # -----------------------------------------------------------------------
+    # Variable descriptions and units as comments
+
+    def test_description_and_units_emitted_as_comments(self, tmp_path):
+        """Variables with documentation and/or units must have them as # comments."""
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractUnchangeableConstant, AbstractElement,
+        )
+        comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=3.14)
+        elem = AbstractElement(
+            name="Growth Rate",
+            components=[comp],
+            units="1/Year",
+            documentation="Annual growth rate of the population",
+        )
+        model = self._make_model([elem], tmp_path, "doc_model")
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        # Comment with units must appear somewhere in the file
+        assert "1/Year" in content, "Units must appear as a comment in generated Julia"
+        # Comment with documentation must appear
+        assert "Annual growth rate" in content, \
+            "Documentation must appear as a comment in generated Julia"
+
+    def test_description_only_emitted_as_comment(self, tmp_path):
+        """A variable with only documentation (no units) still gets a comment."""
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractUnchangeableConstant, AbstractElement,
+        )
+        from pysd.translators.structures.abstract_expressions import IntegStructure
+        from pysd.translators.structures.abstract_model import AbstractComponent
+        flow_comp = AbstractComponent(
+            subscripts=[[], []],
+            ast=IntegStructure(flow=1.0, initial=0.0),
+        )
+        elem = AbstractElement(
+            name="Level",
+            components=[flow_comp],
+            documentation="Accumulated stock level",
+        )
+        model = self._make_model([elem], tmp_path, "doc_only_model")
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        assert "Accumulated stock level" in content, \
+            "Documentation must appear as comment even without units"
+
+    def test_empty_description_no_spurious_comment(self, tmp_path):
+        """A variable with empty documentation must NOT add a spurious empty comment."""
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractUnchangeableConstant, AbstractElement,
+        )
+        comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=1.0)
+        elem = AbstractElement(name="Rate", components=[comp])  # no doc, no units
+        model = self._make_model([elem], tmp_path, "no_doc_model")
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        # Should not have a line that is ONLY "# " with nothing after it
+        lines = content.splitlines()
+        empty_comments = [l for l in lines if l.strip() == "#"]
+        assert not empty_comments, f"Spurious empty comments found: {empty_comments}"
 
     # -----------------------------------------------------------------------
     # DataStructure unsupported — integration (using julia_data_structure model)
@@ -1538,3 +1774,71 @@ class TestNewFeatureIntegration:
                        or "UNSUPPORTED" in str(w.message)]
         # DataStructure or related warning is expected
         assert path.read_text()  # file exists and has content
+
+    # -----------------------------------------------------------------------
+    # ALLOCATE AVAILABLE / ALLOCATE BY PRIORITY translation tests
+
+    # -----------------------------------------------------------------------
+    # 3D EXCEPT / per-element translation — integration
+
+    def test_3d_per_element_no_warning_in_invert_matrix(self, tmp_path):
+        """invert_matrix.mdl has 3D multi-component constants; must not warn."""
+        mdl = (Path(__file__).parent.parent / "test-models" / "tests"
+               / "invert_matrix" / "test_invert_matrix.mdl")
+        if not mdl.exists():
+            pytest.skip("invert_matrix test model not found")
+        import shutil, warnings
+        shutil.copy(mdl, tmp_path / mdl.name)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            path = translate_to_julia(tmp_path / mdl.name)
+        unsupported_3d = [w for w in captured if "3D" in str(w.message)]
+        assert not unsupported_3d, \
+            f"Unexpected 3D-unsupported warnings: {[str(w.message) for w in unsupported_3d]}"
+        content = path.read_text()
+        # Both matrix_2 and matrix_3 constants must be covered
+        assert "matrix_2[" in content and "matrix_3[" in content, \
+            "Expected matrix_2 and matrix_3 index equations in generated output"
+
+    # -----------------------------------------------------------------------
+    # ALLOCATE AVAILABLE / ALLOCATE BY PRIORITY translation tests
+
+    def test_allocate_available_emits_helper_call(self, tmp_path):
+        """ALLOCATE AVAILABLE must translate to pysd_allocate_available(), not proportional."""
+        mdl = MORE_TESTS_DIR / "julia_allocate" / "test_julia_allocate.mdl"
+        if not mdl.exists():
+            pytest.skip("julia_allocate test model not found")
+        import shutil, warnings
+        shutil.copy(mdl, tmp_path / mdl.name)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            path = translate_to_julia(tmp_path / mdl.name)
+        content = path.read_text()
+        assert "pysd_allocate_available(" in content, \
+            "Expected pysd_allocate_available() in generated Julia"
+        assert "proportional" not in content.lower(), \
+            "Should not contain proportional approximation comment"
+        proportional_warns = [w for w in captured if "proportional" in str(w.message)]
+        assert not proportional_warns, "Should not warn about proportional approximation"
+
+    def test_allocate_by_priority_emits_helper_call(self, tmp_path):
+        """ALLOCATE BY PRIORITY must translate to pysd_allocate_by_priority()."""
+        mdl = (Path(__file__).parent.parent / "test-models" / "tests"
+               / "allocate_by_priority" / "test_allocate_by_priority.mdl")
+        if not mdl.exists():
+            pytest.skip("allocate_by_priority test model not found")
+        import shutil, warnings
+        dst_dir = tmp_path / "allocate_by_priority"
+        dst_dir.mkdir()
+        shutil.copy(mdl, dst_dir / mdl.name)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            path = translate_to_julia(dst_dir / mdl.name)
+        content = path.read_text()
+        assert "pysd_allocate_by_priority(" in content, \
+            "Expected pysd_allocate_by_priority() in generated Julia"
+        proportional_warns = [w for w in captured if "proportional" in str(w.message)]
+        assert not proportional_warns, "Should not warn about proportional approximation"

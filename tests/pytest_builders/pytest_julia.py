@@ -1316,6 +1316,67 @@ class TestJuliaASTVisitorExtended:
             result = v.visit(node)
         assert result == "0.0"
 
+    def test_subscript_element_label_resolves_to_index(self):
+        """A bare reference to a subscript element label must resolve to its
+        1-based integer index, not emit a 'not found in namespace' warning.
+
+        In Vensim: Vector2[dimA] = IF THEN ELSE(dimA = B, 1, 0)
+        The AST stores the element name 'B' (or 'b') as a ReferenceStructure.
+        When iterating dimA with _i0, 'B' should become '2'.
+        """
+        ns = JuliaNamespaceManager()
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            active_subs={"dimA": "_i0"},
+            subs_elems={"dimA": ["A", "B", "C"]},
+        )
+        import warnings
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            result = v.visit(ReferenceStructure("b"))
+        assert result == "2", f"Expected '2', got {result!r}"
+        ns_warns = [w for w in captured if issubclass(w.category, UserWarning)
+                    and "not found in namespace" in str(w.message)]
+        assert not ns_warns, f"Should not warn about 'b' not in namespace: {ns_warns}"
+
+    def test_subscript_element_label_third_element(self):
+        """Element 'C' (3rd in dimA: A, B, C) must resolve to '3'."""
+        ns = JuliaNamespaceManager()
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            active_subs={"dimA": "_i0"},
+            subs_elems={"dimA": ["A", "B", "C"]},
+        )
+        import warnings
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            result = v.visit(ReferenceStructure("c"))
+        assert result == "3", f"Expected '3', got {result!r}"
+        ns_warns = [w for w in captured if issubclass(w.category, UserWarning)
+                    and "not found in namespace" in str(w.message)]
+        assert not ns_warns
+
+    def test_subscript_element_label_prefers_active_dim(self):
+        """When an element appears in multiple ranges, the active dim's index wins."""
+        ns = JuliaNamespaceManager()
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            active_subs={"dimD": "_i1"},
+            subs_elems={
+                "dimA": ["A", "B", "C"],
+                "dimD": ["D", "E", "F"],
+            },
+        )
+        # 'E' is 2nd in dimD (active) and not in dimA, should give 2
+        result = v.visit(ReferenceStructure("e"))
+        assert result == "2"
+
     def test_sum_subscripted_lookup_call_no_double_comprehension(self):
         """SUM(f[dim!](t)) where f is a subscripted lookup must produce a single
         comprehension sum([f(_ii0, t) for _ii0 in 1:N_DIM]), not a nested one.
@@ -1548,15 +1609,20 @@ class TestJuliaSectionBuilderInitial:
 class TestJuliaSectionBuilderExpansions:
 
     def test_delay_fixed_expands(self):
+        """DELAY FIXED with literal delay=2, time_step=1 → N=2 pipeline stages."""
         ast = DelayFixedStructure(input=5.0, delay_time=2.0, initial=5.0)
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Delayed Fixed", components=[comp])
         sb = _section_builder_from_elements([elem])
         sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("_df_delayed_fixed" in e for e in all_eqs)
-        assert any("delayed_fixed ~" in e for e in all_eqs)
-        assert any("_df_delayed_fixed(t)" in d for d in sb.stock_decls)
+        # New pipeline uses _df_pipe_k_delayed_fixed naming
+        assert any("_df_pipe_" in e for e in all_eqs), \
+            "DELAY FIXED must emit pipeline stages"
+        assert any("delayed_fixed ~" in e for e in all_eqs), \
+            "DELAY FIXED must assign the output identifier"
+        assert any("_df_pipe_" in d for d in sb.stock_decls), \
+            "Pipeline stages must appear in stock_decls"
 
     def test_trend_expands(self):
         ast = TrendStructure(input=10.0, average_time=5.0, initial_trend=0.02)
@@ -1589,7 +1655,7 @@ class TestJuliaSectionBuilderExpansions:
         assert any("_sit_sample_out" in e for e in all_eqs)
         assert any("sample_out ~" in e for e in all_eqs)
 
-    def test_allocate_available_approximation_warns(self):
+    def test_allocate_available_emits_helper_call(self):
         ast = AllocateAvailableStructure(
             request=ReferenceStructure("request"),
             pp=ReferenceStructure("pp"),
@@ -1600,13 +1666,15 @@ class TestJuliaSectionBuilderExpansions:
         req_elem = _make_element("request", 1.0)
         pp_elem = _make_element("pp", 1.0)
         sup_elem = _make_element("supply", 10.0)
-        with pytest.warns(UserWarning, match="proportional"):
-            sb = _section_builder_from_elements([req_elem, pp_elem, sup_elem, elem])
-            sb.build_section()
+        sb = _section_builder_from_elements([req_elem, pp_elem, sup_elem, elem])
+        sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("alloc_out" in e for e in all_eqs)
+        assert any("pysd_allocate_available" in e for e in all_eqs), \
+            "Expected pysd_allocate_available() call in generated equations"
+        assert not any("proportional" in e.lower() for e in all_eqs), \
+            "Should not fall back to proportional approximation"
 
-    def test_allocate_by_priority_approximation_warns(self):
+    def test_allocate_by_priority_emits_helper_call(self):
         ast = AllocateByPriorityStructure(
             request=ReferenceStructure("demand"),
             priority=ReferenceStructure("prio"),
@@ -1619,9 +1687,13 @@ class TestJuliaSectionBuilderExpansions:
         d_elem = _make_element("demand", 1.0)
         p_elem = _make_element("prio", 1.0)
         a_elem = _make_element("available", 5.0)
-        with pytest.warns(UserWarning, match="proportional"):
-            sb = _section_builder_from_elements([d_elem, p_elem, a_elem, elem])
-            sb.build_section()
+        sb = _section_builder_from_elements([d_elem, p_elem, a_elem, elem])
+        sb.build_section()
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("pysd_allocate_by_priority" in e for e in all_eqs), \
+            "Expected pysd_allocate_by_priority() call in generated equations"
+        assert not any("proportional" in e.lower() for e in all_eqs), \
+            "Should not fall back to proportional approximation"
 
     def test_smooth_non_integer_order_warns_and_defaults(self):
         ast = SmoothStructure(input=1.0, smooth_time=2.0, initial=1.0, order="bad")
@@ -1649,6 +1721,7 @@ class TestJuliaSectionBuilderExpansions:
 class TestJuliaSectionBuilderUnsupported:
 
     def test_data_structure_emits_warning_and_placeholder(self):
+        # AbstractComponent (no keyword) with DataStructure AST still unsupported
         ast = DataStructure()
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Data Var", components=[comp])
@@ -1657,6 +1730,36 @@ class TestJuliaSectionBuilderUnsupported:
             sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
         assert any("UNSUPPORTED" in e for e in all_eqs)
+
+    def test_abstract_data_with_data_structure_emits_tab_val(self):
+        """AbstractData + DataStructure emits _tab_val call (tab-file read), no warning."""
+        import warnings as _w
+        ast = DataStructure()
+        comp = AbstractData(subscripts=[[], []], ast=ast, keyword="interpolate")
+        elem = AbstractElement(name="Tab Var", components=[comp])
+        with _w.catch_warnings(record=True) as captured:
+            _w.simplefilter("always")
+            sb = _section_builder_from_elements([elem])
+            sb.build_section()
+        assert not any("not supported" in str(w.message).lower() for w in captured), \
+            f"Expected no 'not supported' warning, got: {[str(w.message) for w in captured]}"
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("_tab_val" in e for e in all_eqs), \
+            f"Expected _tab_val in equations, got: {all_eqs}"
+
+    def test_abstract_data_with_data_structure_hold_backward(self):
+        """hold_backward keyword produces a _tab_val equation."""
+        import warnings as _w
+        ast = DataStructure()
+        comp = AbstractData(subscripts=[[], []], ast=ast, keyword="hold_backward")
+        elem = AbstractElement(name="Hold Var", components=[comp])
+        with _w.catch_warnings(record=True) as captured:
+            _w.simplefilter("always")
+            sb = _section_builder_from_elements([elem])
+            sb.build_section()
+        assert not any("not supported" in str(w.message).lower() for w in captured)
+        all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("_tab_val" in e for e in all_eqs)
 
     def test_abstract_data_no_get_data_structure_falls_through_to_aux(self):
         # AbstractData whose AST is not a GetDataStructure falls through to the
@@ -3853,6 +3956,66 @@ class TestExceptSubscriptExclusion:
         )
 
 
+    def test_3d_per_element_no_warning(self):
+        """3D multi-component element (no EXCEPT clauses, just per-element slices)
+        must not emit the '3D subscripts not yet supported' warning."""
+        # c={E,F}, d={A,B}, d1={A,B}
+        # comp0: covers [E,d,d1]  → c-slice 1, all d, all d1
+        # comp1: covers [F,d,d1]  → c-slice 2, all d, all d1
+        sr_c  = _make_subscript_range("c",  ["E", "F"])
+        sr_d  = _make_subscript_range("d",  ["A", "B"])
+        sr_d1 = _make_subscript_range("d1", ["A", "B"])
+        comp0 = AbstractComponent(subscripts=[["E", "d", "d1"], []], ast=1.0)
+        comp1 = AbstractComponent(subscripts=[["F", "d", "d1"], []], ast=2.0)
+        elem = AbstractElement(name="Matrix Two", components=[comp0, comp1])
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error", UserWarning)  # fail on any UserWarning
+            sb = _section_builder_from_elements(
+                [elem], subscripts=[sr_c, sr_d, sr_d1]
+            )
+            sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        # Comprehension form: "for _i0 in [1]" means c=1 (E); "[2]" means c=2 (F)
+        assert any("in [1]" in e and "matrix_two" in e for e in eqs), \
+            f"Missing c=1 (E) equations; got: {eqs}"
+        assert any("in [2]" in e and "matrix_two" in e for e in eqs), \
+            f"Missing c=2 (F) equations; got: {eqs}"
+
+    def test_3d_except_emits_per_index_equations(self):
+        """3D element with true EXCEPT clause emits correct index comprehensions."""
+        # c={E,F}, d={A,B}; d1={A,B}
+        # comp0: c×d×d1 EXCEPT [F, d, d1] → covers only c=E (index 1)
+        # comp1: c=F (index 2) × d×d1 (no EXCEPT)
+        sr_c  = _make_subscript_range("c",  ["E", "F"])
+        sr_d  = _make_subscript_range("d",  ["A", "B"])
+        sr_d1 = _make_subscript_range("d1", ["A", "B"])
+        comp0 = AbstractComponent(
+            subscripts=[["c", "d", "d1"], [["F", "d", "d1"]]],
+            ast=10.0,
+        )
+        comp1 = AbstractComponent(subscripts=[["F", "d", "d1"], []], ast=20.0)
+        elem = AbstractElement(name="Matrix Three", components=[comp0, comp1])
+        import warnings as _w
+        with _w.catch_warnings():
+            _w.simplefilter("error", UserWarning)
+            sb = _section_builder_from_elements(
+                [elem], subscripts=[sr_c, sr_d, sr_d1]
+            )
+            sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        # comp0 formula (10.0) must only appear in equations for c=1 (E)
+        comp0_eqs = [e for e in eqs if "10.0" in e and "matrix_three" in e]
+        assert comp0_eqs, "comp0 equations not found"
+        assert all("in [1]" in e for e in comp0_eqs), \
+            f"comp0 must only cover c=1 (E); got: {comp0_eqs}"
+        # comp1 formula (20.0) must only appear for c=2 (F)
+        comp1_eqs = [e for e in eqs if "20.0" in e and "matrix_three" in e]
+        assert comp1_eqs, "comp1 equations not found"
+        assert all("in [2]" in e for e in comp1_eqs), \
+            f"comp1 must only cover c=2 (F); got: {comp1_eqs}"
+
+
 # ===========================================================================
 # Phase 3E — Macro support
 # ===========================================================================
@@ -3860,7 +4023,11 @@ class TestExceptSubscriptExclusion:
 class TestMacroSupport:
 
     def _two_section_model(self, tmp_path):
-        """AbstractModel with a main section and one macro section."""
+        """AbstractModel with a main section and one macro section.
+
+        The macro element name 'My Macro' normalises to 'my_macro', matching
+        the section name, so it is correctly identified as the return value.
+        """
         # Main section: simple stock
         pop = _make_stock_element("Population", 1.0, 100.0)
         controls = [
@@ -3874,14 +4041,14 @@ class TestMacroSupport:
             path=tmp_path / "my_model.mdl",
         )
 
-        # Macro section: simple auxiliary
-        macro_aux = _make_element("Macro Output", 42.0)
+        # Macro section: element name matches macro name so it's the return value
+        macro_aux = _make_element("My Macro", 42.0)
         macro_section = AbstractSection(
             name="my_macro",
             path=tmp_path / "my_model.mdl",
             type="macro",
             params=["Input"],
-            returns=["Macro Output"],
+            returns=["My Macro"],
             subscripts=(),
             elements=(macro_aux,),
             constraints=(),
@@ -3904,17 +4071,24 @@ class TestMacroSupport:
     def test_macro_section_creates_companion_file(self, tmp_path):
         model = self._two_section_model(tmp_path)
         JuliaModelBuilder(model).build_model()
-        # Macro file should exist next to main file
         macro_file = tmp_path / "my_model_my_macro.jl"
         assert macro_file.exists()
 
-    def test_macro_file_contains_equations(self, tmp_path):
+    def test_macro_file_contains_julia_function(self, tmp_path):
+        """ODE backend companion file defines a Julia function, not MTK equations."""
         model = self._two_section_model(tmp_path)
         JuliaModelBuilder(model).build_model()
         macro_file = tmp_path / "my_model_my_macro.jl"
         content = macro_file.read_text()
-        assert "my_macro_eqs" in content
-        assert "Equation[" in content
+        assert "function my_macro(" in content
+
+    def test_macro_function_takes_params_as_args(self, tmp_path):
+        """Companion function signature includes macro params."""
+        model = self._two_section_model(tmp_path)
+        JuliaModelBuilder(model).build_model()
+        macro_file = tmp_path / "my_model_my_macro.jl"
+        content = macro_file.read_text()
+        assert "function my_macro(input)" in content
 
     def test_macro_file_contains_macro_name_comment(self, tmp_path):
         model = self._two_section_model(tmp_path)
@@ -3931,13 +4105,54 @@ class TestMacroSupport:
         assert "function rhs!" in content
         assert "population" in content
 
+    def test_main_file_includes_macro_companion(self, tmp_path):
+        """Main model has an include() statement for the macro companion file."""
+        model = self._two_section_model(tmp_path)
+        path = JuliaModelBuilder(model).build_model()
+        content = path.read_text()
+        assert 'include(' in content
+        assert 'my_macro' in content
+
+    def test_macro_params_no_namespace_warning(self, tmp_path):
+        """Macro params are in namespace; no 'not found' warning during translation."""
+        import warnings
+        from pathlib import Path
+        import shutil
+        mdl_src = Path("tests/test-models/tests/macro_expression/test_macro_expression.mdl")
+        if not mdl_src.exists():
+            pytest.skip("macro_expression model not found")
+        dst = tmp_path / "test_macro_expression.mdl"
+        shutil.copy(mdl_src, dst)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            import pysd
+            pysd.translate_to_julia(str(dst))
+        ns_warnings = [x for x in w if "not found in namespace" in str(x.message)]
+        assert not ns_warnings, f"Unexpected namespace warnings: {ns_warnings}"
+
+    def test_macro_call_no_unknown_function_warning(self, tmp_path):
+        """Calling a macro from the main section does not emit 'Unknown Vensim function'."""
+        import warnings
+        from pathlib import Path
+        import shutil
+        mdl_src = Path("tests/test-models/tests/macro_expression/test_macro_expression.mdl")
+        if not mdl_src.exists():
+            pytest.skip("macro_expression model not found")
+        dst = tmp_path / "test_macro_expression.mdl"
+        shutil.copy(mdl_src, dst)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            import pysd
+            pysd.translate_to_julia(str(dst))
+        unk_warnings = [x for x in w if "Unknown Vensim function" in str(x.message)]
+        assert not unk_warnings, f"Unexpected unknown-function warnings: {unk_warnings}"
+
 
 class TestMacroSupportCoverage:
     """Cover remaining macro-section code paths."""
 
     def test_macro_with_inline_lookup_and_json(self, tmp_path):
-        """Macro section with inline lookup and json mode covers lines 227-232, 243, 262."""
-        import json
+        """Macro with inline lookup (json mode): companion file has DataInterpolations."""
         lut_ast = InlineLookupsStructure(
             argument=1.0,
             lookups=LookupsStructure(
@@ -3972,7 +4187,9 @@ class TestMacroSupportCoverage:
         JuliaModelBuilder(model, data_format="json").build_model()
         macro_path = tmp_path / "m_lookup_macro.jl"
         assert macro_path.exists()
-        assert "DataInterpolations" in macro_path.read_text()
+        content = macro_path.read_text()
+        assert "DataInterpolations" in content
+        assert "function lookup_macro(" in content
         assert (tmp_path / "m_lookup_macro_data.json").exists()
 
 
@@ -4026,7 +4243,8 @@ class TestMdlFileTranslation:
         assert jl_path.exists()
         assert jl_path.suffix == ".jl"
 
-    def test_julia_data_structure_emits_unsupported_warning(self, tmp_path):
+    def test_julia_data_structure_emits_data_override_warning(self, tmp_path):
+        """AbstractData with a non-GET DATA equation (data-override) still warns."""
         mdl = self.MORE_TESTS / "julia_data_structure" / "test_julia_data_structure.mdl"
         if not mdl.exists():
             pytest.skip("julia_data_structure test model not found")
@@ -4038,9 +4256,123 @@ class TestMdlFileTranslation:
             warnings.simplefilter("always")
             translate_to_julia(dst)
         msgs = [str(w.message) for w in captured]
-        # DataStructure or DATA variable warning should be present
-        assert any("DataStructure" in m or "data" in m.lower() for m in msgs), \
-            f"Expected DataStructure warning, got: {msgs}"
+        assert any("data-override" in m.lower() for m in msgs), \
+            f"Expected data-override warning, got: {msgs}"
+
+    def test_data_from_other_model_emits_tab_infrastructure(self, tmp_path):
+        """data_from_other_model (DataStructure + AbstractData) emits tab-data helpers."""
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/data_from_other_model/test_data_from_other_model.mdl")
+        if not mdl.exists():
+            pytest.skip("data_from_other_model test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("ignore")
+            jl_path = translate_to_julia(dst)
+        content = jl_path.read_text()
+        assert "_load_tab_data!" in content, "Must emit _load_tab_data! loader function"
+        assert "_tab_data" in content, "Must emit _tab_data Dict"
+        assert "_tab_val" in content, "Must emit _tab_val helper"
+        assert "tab_data_files" in content, "run_model must accept tab_data_files="
+
+    def test_data_from_other_model_no_unsupported_warning(self, tmp_path):
+        """DataStructure variables should not produce 'not supported' warnings."""
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/data_from_other_model/test_data_from_other_model.mdl")
+        if not mdl.exists():
+            pytest.skip("data_from_other_model test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            translate_to_julia(dst)
+        bad = [str(w.message) for w in captured
+               if "not supported" in str(w.message).lower()
+               and "DataStructure" in str(w.message)]
+        assert not bad, f"DataStructure must not emit 'not supported': {bad}"
+
+    def test_conditional_subscripts_no_namespace_warning(self, tmp_path):
+        """conditional_subscripts uses bare element labels (B, C) in IF THEN ELSE
+        comparisons.  They must resolve to integer indices, not emit 'not found'.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/conditional_subscripts/test_conditional_subscripts.mdl")
+        if not mdl.exists():
+            pytest.skip("conditional_subscripts test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            translate_to_julia(dst)
+        ns_warns = [str(w.message) for w in captured
+                    if "not found in namespace" in str(w.message)]
+        assert not ns_warns, f"Element labels must not warn 'not found': {ns_warns}"
+
+    def test_conditional_subscripts_element_label_is_integer(self, tmp_path):
+        """The generated Julia for Vector2[dimA] must compare _i0 to an integer
+        index (2 for 'B', 3 for 'C'), not an undefined variable 'b' or 'c'.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/conditional_subscripts/test_conditional_subscripts.mdl")
+        if not mdl.exists():
+            pytest.skip("conditional_subscripts test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            jl_path = translate_to_julia(dst)
+        content = jl_path.read_text()
+        # Should contain integer comparisons, not bare 'b' or 'c' identifiers
+        assert "== 2" in content or "== 2)" in content, "Expected index 2 for element B"
+        assert "== 3" in content or "== 3)" in content, "Expected index 3 for element C"
+
+    def test_subscripted_delay_fixed_no_module_warning(self, tmp_path):
+        """Subscripted DELAY FIXED pipeline must not warn 'Unsupported AST node type module'.
+        The internal pipeline loop was accidentally passing the abstract_expressions
+        module object to visitor.visit() instead of an AST node.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/forecast/test_forecast.mdl")
+        if not mdl.exists():
+            pytest.skip("forecast test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            translate_to_julia(dst)
+        module_warns = [str(w.message) for w in captured
+                        if "module" in str(w.message).lower()
+                        and "unsupported" in str(w.message).lower()]
+        assert not module_warns, f"Should not warn about 'module' node: {module_warns}"
+
+    def test_delay_fixed_with_constant_variable_no_fallback_warning(self, tmp_path):
+        """DELAY FIXED whose delay time is a named constant (defined later in the
+        model file) must still be expanded as an N-stage pipeline, not fall back
+        to the first-order ODE approximation.
+
+        Regression: the builder pre-scanned constants before the main processing
+        pass so that DELAY FIXED can look up a named constant even before its
+        element has been processed.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/forecast/test_forecast.mdl")
+        if not mdl.exists():
+            pytest.skip("forecast test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            translate_to_julia(dst)
+        fallback_warns = [str(w.message) for w in captured
+                          if "falling back to first-order ODE approximation" in str(w.message)]
+        assert not fallback_warns, f"DELAY FIXED with constant delay time should not fall back: {fallback_warns}"
 
     def test_julia_delay_fixed_no_warning(self, tmp_path):
         mdl = self.MORE_TESTS / "julia_delay_fixed" / "test_julia_delay_fixed.mdl"
@@ -4088,6 +4420,122 @@ class TestMdlFileTranslation:
         content = jl_path.read_text()
         assert "_sit_" in content
 
+    def test_except_2d_integ_no_unsupported_warning(self, tmp_path):
+        """2-D EXCEPT + INTEG (stock variable with 2D subscript and EXCEPT clause)
+        must emit ODE equations, not an 'Unsupported AST node type IntegStructure' warning.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/except/test_except.mdl")
+        if not mdl.exists():
+            pytest.skip("except test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            translate_to_julia(dst)
+        integ_warns = [str(w.message) for w in captured
+                       if "IntegStructure" in str(w.message)
+                       and "unsupported" in str(w.message).lower()]
+        assert not integ_warns, f"IntegStructure must not warn as unsupported: {integ_warns}"
+
+    def test_except_2d_integ_emits_ode_equations(self, tmp_path):
+        """The generated Julia for a 2D stock with EXCEPT must contain D(inventory[...]) ODE
+        equations, not placeholder 0.0 assignments.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/except/test_except.mdl")
+        if not mdl.exists():
+            pytest.skip("except test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            jl_path = translate_to_julia(dst)
+        content = jl_path.read_text()
+        assert "D(inventory[" in content, "Expected ODE equations for inventory stock"
+
+    def test_subscripted_inline_lookup_no_unsupported_warning(self, tmp_path):
+        """Inline lookup tables with per-element subscript assignments (e.g.
+        lookup1dim[A](...) and lookup1dim[B](...)) must not emit
+        'Unsupported AST node type LookupsStructure' warnings.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/subscripted_lookups/test_subscripted_lookups.mdl")
+        if not mdl.exists():
+            pytest.skip("subscripted_lookups test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            translate_to_julia(dst)
+        lk_warns = [str(w.message) for w in captured
+                    if "LookupsStructure" in str(w.message)
+                    and "unsupported" in str(w.message).lower()]
+        assert not lk_warns, f"LookupsStructure must not warn as unsupported: {lk_warns}"
+
+    def test_subscripted_inline_lookup_emits_dispatch_function(self, tmp_path):
+        """The generated Julia for subscripted inline lookups (lookup1dim, lookup2dim)
+        must contain proper lookup functions with per-element interpolants.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/subscripted_lookups/test_subscripted_lookups.mdl")
+        if not mdl.exists():
+            pytest.skip("subscripted_lookups test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            jl_path = translate_to_julia(dst)
+        content = jl_path.read_text()
+        # Must define the 1D subscripted lookup as a callable function
+        assert "lookup1dim(" in content, "Expected lookup1dim function in generated code"
+        assert "lookup2dim(" in content, "Expected lookup2dim function in generated code"
+
+    def test_nested_delay_in_smooth_no_unsupported_warning(self, tmp_path):
+        """SMOOTH N(DELAY3(...), ...) — where DELAY is nested as the input to
+        SMOOTH — must not warn 'Unsupported AST node type DelayStructure'.
+        The builder must create an intermediate variable for the inner DELAY3
+        and use its identifier as the input to the outer SMOOTH.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/arguments/test_arguments.mdl")
+        if not mdl.exists():
+            pytest.skip("arguments test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            translate_to_julia(dst)
+        delay_warns = [str(w.message) for w in captured
+                       if "DelayStructure" in str(w.message)
+                       and "unsupported" in str(w.message).lower()]
+        assert not delay_warns, f"Nested DelayStructure must not warn: {delay_warns}"
+
+    def test_nested_delay_in_smooth_emits_ode_for_both(self, tmp_path):
+        """The generated Julia for SMOOTH N(DELAY3(Time,...)) must contain ODE
+        equations for both the inner delay pipeline and the outer smooth levels.
+        """
+        import shutil, warnings
+        mdl = Path("tests/test-models/tests/arguments/test_arguments.mdl")
+        if not mdl.exists():
+            pytest.skip("arguments test model not found")
+        dst = tmp_path / mdl.name
+        shutil.copy(mdl, dst)
+        from pysd import translate_to_julia
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            jl_path = translate_to_julia(dst)
+        content = jl_path.read_text()
+        # Should have smooth level variables from the outer SMOOTH
+        assert "_lv" in content or "_sm_" in content, "Expected smooth level variables"
+        # Should have delay pipeline variables from the inner DELAY3
+        assert "_lv" in content, "Expected delay level variables from inner DELAY3"
+
     def test_json_mode_produces_data_file(self, tmp_path):
         """translate_to_julia with data_format=json creates a .json companion."""
         mdl = self.MORE_TESTS / "julia_delay_fixed" / "test_julia_delay_fixed.mdl"
@@ -4102,6 +4550,108 @@ class TestMdlFileTranslation:
             jl_path = translate_to_julia(dst, data_format="json")
         json_path = jl_path.with_name(f"{jl_path.stem}_data.json")
         assert json_path.exists()
+
+    def test_get_subscript_3d_arrays_xls_no_reshape_warning(self, tmp_path):
+        """GET DIRECT SUBSCRIPT from Excel: subscript sizes are read from file, no reshape warning."""
+        import shutil, warnings
+        from pathlib import Path
+        mdl_src = Path("tests/test-models/tests/get_subscript_3d_arrays_xls/test_get_subscript_3d_arrays_xls.mdl")
+        if not mdl_src.exists():
+            pytest.skip("get_subscript_3d_arrays_xls model not found")
+        # Copy entire folder (Excel file must be present)
+        dst_folder = tmp_path / "get_subscript_3d_arrays_xls"
+        shutil.copytree(mdl_src.parent, dst_folder)
+        dst = dst_folder / mdl_src.name
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            translate_to_julia(str(dst))
+        reshape_warnings = [x for x in w if "reshape" in str(x.message).lower()]
+        assert not reshape_warnings, f"Unexpected reshape warnings: {reshape_warnings}"
+
+
+# ===========================================================================
+# Phase 3G — XMILE min_max_1arg (vmin_xmile / vmax_xmile)
+# ===========================================================================
+
+class TestXmileDelayFixed:
+    """XMILE DELAY(x, n) used inline inside an arithmetic expression."""
+
+    TEST_MODELS = Path("tests/test-models/tests")
+
+    def test_delay_xmile_no_unsupported_warning(self, tmp_path):
+        """DELAY(X, n) embedded in arithmetic must not emit 'Unsupported AST' warning."""
+        import shutil, warnings
+        model_dir = self.TEST_MODELS / "delay_xmile"
+        if not model_dir.exists():
+            pytest.skip("delay_xmile test model not found")
+        dst_dir = tmp_path / "delay_xmile"
+        shutil.copytree(model_dir, dst_dir)
+        xmile = next(dst_dir.glob("*.xmile"))
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            translate_to_julia(xmile)
+        unsupported = [x for x in w if "Unsupported AST" in str(x.message)]
+        assert not unsupported, f"Unexpected unsupported AST warnings: {unsupported}"
+
+    def test_delay_xmile_emits_ode_stocks(self, tmp_path):
+        """DELAY(X, n) embedded in arithmetic must create ODE pipeline stocks."""
+        import shutil, warnings
+        model_dir = self.TEST_MODELS / "delay_xmile"
+        if not model_dir.exists():
+            pytest.skip("delay_xmile test model not found")
+        dst_dir = tmp_path / "delay_xmile"
+        shutil.copytree(model_dir, dst_dir)
+        xmile = next(dst_dir.glob("*.xmile"))
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            jl_path = translate_to_julia(xmile)
+        content = jl_path.read_text()
+        # The embedded delay must be lifted: _edf0 becomes an auxiliary backed
+        # by a pipeline stock (_df_pipe_1__edf0 etc.) in the ODE state vector.
+        assert "_edf0" in content
+        assert "_df_pipe_1__edf0" in content
+
+
+class TestXmileMinMax:
+    """XMILE MIN/MAX over an entire subscript dimension."""
+
+    TEST_MODELS = Path("tests/test-models/tests")
+
+    def test_min_max_1arg_no_unknown_function_warning(self, tmp_path):
+        """MIN(arr[dim]) in XMILE must not emit 'Unknown Vensim function' warning."""
+        import shutil, warnings
+        model_dir = self.TEST_MODELS / "min_max_1arg"
+        if not model_dir.exists():
+            pytest.skip("min_max_1arg test model not found")
+        dst_dir = tmp_path / "min_max_1arg"
+        shutil.copytree(model_dir, dst_dir)
+        xmile = next(dst_dir.glob("*.xmile"))
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            translate_to_julia(xmile)
+        unknown = [x for x in w if "Unknown Vensim function" in str(x.message)]
+        assert not unknown, f"Unexpected unknown function warnings: {unknown}"
+
+    def test_min_max_1arg_emits_minimum_maximum(self, tmp_path):
+        """MIN(arr[dim]) → minimum(arr), MAX(arr[dim]) → maximum(arr)."""
+        import shutil, warnings
+        model_dir = self.TEST_MODELS / "min_max_1arg"
+        if not model_dir.exists():
+            pytest.skip("min_max_1arg test model not found")
+        dst_dir = tmp_path / "min_max_1arg"
+        shutil.copytree(model_dir, dst_dir)
+        xmile = next(dst_dir.glob("*.xmile"))
+        from pysd import translate_to_julia
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            jl_path = translate_to_julia(xmile)
+        content = jl_path.read_text()
+        assert "minimum(" in content
+        assert "maximum(" in content
 
 
 # ===========================================================================

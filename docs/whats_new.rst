@@ -26,6 +26,14 @@ New Features
     TRANSPOSE, ACTIVE INITIAL, PULSE, PULSE TRAIN, RAMP, STEP, WITH LOOKUP,
     RANDOM 0 1, RANDOM UNIFORM, RANDOM NORMAL, RANDOM EXPONENTIAL, VECTOR SELECT,
     VECTOR SORT ORDER, VECTOR REORDER, VECTOR RANK, and GET TIME VALUE.
+  - ``GET DIRECT SUBSCRIPT`` (subscript ranges from Excel) is now resolved at
+    translation time, so multi-dimensional constants with externally-defined subscript
+    sizes produce correctly shaped arrays.
+  - XMILE ``MIN``/``MAX`` whole-array aggregations (internally ``vmin_xmile`` /
+    ``vmax_xmile``) are now mapped to Julia's ``minimum`` / ``maximum``.
+  - XMILE ``DELAY`` constructs that appear embedded inside arithmetic expressions
+    (rather than as top-level element equations) are now correctly lifted to dedicated
+    pipeline auxiliary stocks in the ODE state vector.
 
   (`@rogersamso <https://github.com/rogersamso>`_)
 

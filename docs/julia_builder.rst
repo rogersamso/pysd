@@ -255,6 +255,8 @@ runtime helper functions used by generated models, imported via
 - ``pysd_logical_and(a, b)``, ``pysd_logical_or(a, b)``, ``pysd_logical_not(a)``
 - ``pysd_safe(x)`` — replaces ``NaN``/``Inf`` with ``0.0`` (guards array
   allocations against uninitialised reads in subscripted equations)
+- ``pysd_allocate_by_priority(request, priority, width, supply)`` — Vensim priority allocation
+- ``pysd_allocate_available(request, pp, avail)`` — Vensim profile-based demand allocation
 
 **Excel data readers**
 
@@ -326,6 +328,9 @@ Supported Vensim features
    * - ``GET DIRECT DATA``
      - Supported
      - Supported
+   * - ``GET DIRECT SUBSCRIPT`` (subscript ranges from Excel)
+     - Supported
+     - Supported (read at translation time; correct array shapes)
    * - ``SMOOTH`` / ``SMOOTH3`` / ``SMOOTHN``
      - Supported
      - Supported
@@ -333,13 +338,13 @@ Supported Vensim features
      - Supported
      - Supported
    * - ``DELAY FIXED``
-     - Supported (first-order ODE approximation)
+     - Supported (exact N-stage Euler pipeline)
      - Supported
    * - ``TREND``, ``FORECAST``
      - Supported
      - Supported
    * - ``SAMPLE IF TRUE``
-     - Supported (conditional ODE stock)
+     - Supported (instantaneous ifelse output)
      - Supported
    * - ``INITIAL``
      - Supported
@@ -356,18 +361,88 @@ Supported Vensim features
    * - Multiple views (``split_views=True``)
      - Supported
      - Supported
-   * - Macros
-     - Partial (companion ``.jl`` file per macro)
-     - Partial
-   * - ``ALLOCATE AVAILABLE`` / ``ALLOCATE BY PRIORITY``
-     - Not supported (placeholder ``0.0``)
+   * - ``GAME``
+     - Supported (passes through; interactive play ignored)
+     - Supported
+   * - ``ELMCOUNT``
+     - Supported (resolved to integer literal at translation time)
+     - Supported
+   * - ``DATA`` variables (tab-delimited ``.tab`` files)
+     - Supported (runtime ``_tab_val`` interpolation via ``tab_data_files=`` parameter)
      - Not supported
+   * - Subscripted ``GET DIRECT LOOKUPS`` > 2D
+     - Partial (flattened to first column with warning)
+     - Partial
+   * - ``SMOOTH``/``DELAY`` with non-integer order
+     - Partial (order rounded to nearest integer with warning)
+     - Partial
+   * - ``EXCEPT`` exclusion on 3-D subscripts
+     - Supported (per-index comprehension equations)
+     - Supported
+   * - Macros (stateless)
+     - Supported (companion ``.jl`` function file per macro)
+     - Supported
+   * - Macros (stateful — ``INTEG`` inside macro)
+     - Not supported (placeholder ``return 0.0`` with warning)
+     - Not supported
+   * - XMILE ``MIN``/``MAX`` aggregation (``vmin_xmile``, ``vmax_xmile``)
+     - Supported
+     - Supported
+   * - XMILE ``DELAY`` embedded in expression
+     - Supported (lifted to pipeline auxiliary stocks)
+     - Supported
+   * - ``ALLOCATE AVAILABLE`` / ``ALLOCATE BY PRIORITY``
+     - Supported (exact Vensim algorithm via PySD.jl helpers)
+     - Supported
 
 .. note::
-   When the builder encounters an unsupported construct it emits a Python
-   ``UserWarning`` during translation and writes a placeholder ``0.0`` in
-   the generated file.  Review warnings after translation to identify any
-   gaps.
+   When the builder encounters an unsupported or partially-supported construct
+   it emits a Python ``UserWarning`` during translation and writes a
+   placeholder (``0.0``) in the generated file.  Always review warnings after
+   translation to identify gaps.
+
+Comparison with the Python builder
+-----------------------------------
+
+The Python builder supports every Vensim/Stella construct that PySD can
+parse.  The Julia builder does not yet cover:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Feature
+     - Python builder
+     - Julia builder
+   * - ``ALLOCATE AVAILABLE`` / ``ALLOCATE BY PRIORITY``
+     - Full
+     - Supported via ``pysd_allocate_available`` / ``pysd_allocate_by_priority`` in PySD.jl
+   * - ``DATA`` variables (tab-delimited ``.tab`` file source)
+     - Full
+     - Supported — pass ``tab_data_files=["data.tab"]`` to ``run_model()``
+   * - Subscripted lookups with > 2 subscript dimensions
+     - Full
+     - Flattened to first column (with warning)
+   * - ``SMOOTH``/``DELAY`` with non-integer order
+     - Full (arbitrary real order)
+     - Order rounded to nearest integer (with warning)
+   * - ``EXCEPT`` exclusion on 3-D subscripts
+     - Full
+     - Supported (per-index comprehension equations, same as 1-D and 2-D)
+   * - Stateless macros (``MACRO`` … ``END OF MACRO`` without ``INTEG``)
+     - Full (inlined)
+     - Companion ``.jl`` function file generated; included via ``include``
+   * - Stateful macros (``INTEG`` inside ``MACRO`` … ``END OF MACRO``)
+     - Full
+     - Not supported; placeholder ``return 0.0`` emitted with warning
+   * - ``GAME`` interactive input
+     - Full
+     - Passes through; interactive value ignored in batch simulation
+   * - ``DELAY FIXED`` exact semantics
+     - Full (discrete transport delay)
+     - Supported (exact N-stage Euler pipeline matching Vensim ring-buffer semantics)
+   * - ``SAMPLE IF TRUE`` exact semantics
+     - Full (holds last-true value)
+     - Supported (instantaneous ifelse output; hold stock updated each step)
 
 
 Limitations
@@ -378,16 +453,29 @@ Limitations
   scalar equations) ``structural_simplify`` can take hours.  Use the ODE
   backend for large models.
 
-- **EXCEPT subscript exclusion** (e.g. ``var[A,B] :EXCEPT: [A1,B1]``)
-  with 3-D subscripts is not yet supported; a plain broadcast equation is
-  emitted with a warning.
+- **EXCEPT subscript exclusion** on 4-D or higher subscripts emits a
+  plain broadcast equation (the exclusion is ignored) with a warning.
+  1-D, 2-D, and 3-D EXCEPT are fully supported.
 
-- **SAMPLE IF TRUE** uses a conditional ODE stock to approximate the
-  hold-until-true behaviour.  Results match Vensim for typical use but may
-  diverge for very large time steps.
+- **SAMPLE IF TRUE** uses an ODE hold-stock to track the last sampled value
+  and instantaneously outputs ``ifelse(condition, input, hold)`` at each step.
+  Behaviour matches Vensim exactly when using the Euler solver.
 
-- **DELAY FIXED** is approximated as a first-order ODE with the same delay
-  constant; the discrete transport-delay semantics are not exact.
+- **DELAY FIXED** is implemented as an exact N-stage Euler pipeline
+  (``N = round(delay_time / time_step)``), which matches Vensim's ring-buffer
+  transport delay exactly when the delay time is a static constant.  If the
+  delay time cannot be evaluated at translation time (e.g. it is a dynamic
+  expression), the builder falls back to a first-order ODE approximation and
+  emits a warning.
+
+- **Non-integer SMOOTH/DELAY order** is rounded to the nearest integer
+  (defaulting to 3) with a warning; the Python builder supports arbitrary
+  real-valued orders.
+
+- **Tab-delimited DATA variables** (``.tab`` file sources) are supported for
+  the ODE backend.  Pass the file paths as ``run_model(tab_data_files=["data.tab"])``;
+  the model reads and interpolates the time series at runtime.  The MTK backend
+  does not yet support tab-delimited DATA variables.
 
 - The Euler solver (default) produces output that matches Vensim's built-in
   integration.  Higher-order solvers (e.g. ``Tsit5()``) are generally more

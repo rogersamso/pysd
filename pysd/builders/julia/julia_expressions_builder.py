@@ -98,6 +98,9 @@ BUILTIN_FUNCTIONS: dict = {
     "PROD": "prod",
     "VMAX": "maximum",
     "VMIN": "minimum",
+    # XMILE emits vmax_xmile/vmin_xmile for whole-array MIN/MAX reductions.
+    "VMAX_XMILE": "maximum",
+    "VMIN_XMILE": "minimum",
     "ELMCOUNT": "pysd_elmcount",   # resolved to literal size by caller
     "INVERT MATRIX": "inv",
     "INVERT_MATRIX": "inv",
@@ -286,6 +289,7 @@ class JuliaASTVisitor:
         subs_elems: Optional[Dict[str, List[str]]] = None,
         lookup_names: Optional[Set[str]] = None,
         root=None,
+        macro_names: Optional[Set[str]] = None,
     ) -> None:
         self.namespace = namespace
         self.registry = inline_registry
@@ -314,13 +318,26 @@ class JuliaASTVisitor:
         self.subs_elems = subs_elems or {}
         # Pre-compute element_label -> {range_name: 1-based-index} for fast lookups
         self._elem_index: Dict[str, Dict[str, int]] = {}
+        # _clean_elem_index: normalised-label -> {range_name: 1-based-index}
+        # for case-insensitive resolution of bare element references in equations.
+        self._clean_elem_index: Dict[str, Dict[str, int]] = {}
         for rng, elems in self.subs_elems.items():
             for i, lbl in enumerate(elems):
                 if lbl not in self._elem_index:
                     self._elem_index[lbl] = {}
                 self._elem_index[lbl][rng] = i + 1
+                clean_lbl = re.sub(r"[^a-z0-9_]", "_", lbl.lower())
+                if clean_lbl not in self._clean_elem_index:
+                    self._clean_elem_index[clean_lbl] = {}
+                self._clean_elem_index[clean_lbl][rng] = i + 1
         # root: Path to the model directory (for reading external files)
         self._root = root
+        # macro_names: Julia identifiers of known Vensim macros (no warning on call)
+        self._macro_names: Set[str] = set(macro_names) if macro_names else set()
+        # Embedded DelayFixedStructure nodes encountered during expression traversal.
+        # The model builder drains this list after each element to lift them out
+        # into dedicated auxiliary pipeline stocks.
+        self._pending_delay_fixed: List[tuple] = []
 
     def _jl_n(self, dim_name: str) -> str:
         """Julia constant name for the size of *dim_name* (``N_DIMNAME``)."""
@@ -471,6 +488,16 @@ class JuliaASTVisitor:
                 return self.namespace.get(ref) or repr(ref)
             return "0.0"
 
+        # DelayFixedStructure embedded inside another expression (XMILE pattern where
+        # DELAY(x, n) appears inline rather than as a top-level element equation).
+        # Queue it to be lifted into a dedicated auxiliary by the model builder.
+        from pysd.translators.structures.abstract_expressions import DelayFixedStructure as _DFS
+        if isinstance(node, _DFS):
+            edf_name = f"_edf{len(self._pending_delay_fixed)}"
+            self.namespace.namespace[edf_name] = edf_name
+            self._pending_delay_fixed.append((edf_name, node))
+            return edf_name
+
         # Structures that are handled at the element level should not appear
         # inside other expressions; warn and emit a placeholder.
         warn(
@@ -543,11 +570,27 @@ class JuliaASTVisitor:
 
         julia_name = self.namespace.get(node.reference)
         if julia_name is None:
+            clean_ref = re.sub(r"[^a-z0-9_]", "_", node.reference.lower())
+            # Check if the reference is a subscript element label (e.g. "B" in
+            # dimA: A, B, C).  When it is, emit the 1-based integer index so
+            # comparisons like "dimA = B" become "_i0 == 2" in generated Julia.
+            if clean_ref in self._clean_elem_index:
+                ranges_map = self._clean_elem_index[clean_ref]
+                # Prefer a range that is currently being iterated (active dim)
+                idx = None
+                for rng, pos in ranges_map.items():
+                    clean_rng = re.sub(r"[^a-z0-9_]", "_", rng.lower())
+                    if clean_rng in self._clean_active_subs:
+                        idx = pos
+                        break
+                if idx is None:
+                    idx = next(iter(ranges_map.values()))
+                return str(idx)
             warn(
                 f"Variable '{node.reference}' not found in namespace; "
                 "using a sanitised fallback identifier."
             )
-            julia_name = re.sub(r"[^a-z0-9_]", "_", node.reference.lower())
+            julia_name = clean_ref
         # Apply subscript indices.  Two sources:
         #
         # (A) Explicit subscripts in the AST node  (e.g. share_FEH[solids])
@@ -985,6 +1028,11 @@ class JuliaASTVisitor:
                             )
                             return f"[{julia_id}({', '.join(full_args)}) for {ranges}]"
                 return f"{julia_id}({', '.join(args)})"
+            # Check if the function is a known Vensim macro — no warning needed.
+            clean_ref = re.sub(r"[^a-z0-9_]", "_", node.function.reference.lower())
+            if clean_ref in self._macro_names:
+                args = [self.visit(a) for a in node.arguments]
+                return f"{clean_ref}({', '.join(args)})"
             warn(f"Unknown Vensim function '{node.function.reference}'; using lowercase name.")
             julia_func = re.sub(r"[^a-z0-9_]", "_", node.function.reference.lower())
 
