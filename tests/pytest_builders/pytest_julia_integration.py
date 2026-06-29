@@ -297,12 +297,6 @@ NUMERICAL_MODELS: List[str] = [
     "trig",
 ]
 
-# ---------------------------------------------------------------------------
-# pytest marks
-# ---------------------------------------------------------------------------
-
-julia_mark = pytest.mark.julia
-
 # Cache the result so the subprocess is only run once per session.
 _julia_mtk_available_cache: bool | None = None
 
