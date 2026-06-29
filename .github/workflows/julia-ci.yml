@@ -1,11 +1,15 @@
-# CI for Julia builder tests that require a Julia runtime with ModelingToolkit.jl.
+# CI for Julia builder tests.
 #
-# Non-Julia tests (the vast majority) run in the main ci.yml workflow without Docker.
-# This workflow runs only the @pytest.mark.julia tests inside a Docker container
-# that pre-installs Julia and ModelingToolkit.jl.
+# Split into two jobs:
+#   1. julia-unit-and-translation — runs the 382 unit tests and the 799
+#      translation-only integration tests.  No Julia binary is needed; these
+#      are pure-Python tests that generate .jl files.
+#   2. julia-numerical — runs only the 27 @pytest.mark.julia tests that
+#      actually execute Julia.  This job installs Julia + packages (slow
+#      on the first run, cached on subsequent runs).
 #
-# The job is separate from the main CI so a slow Julia package installation
-# does not block the fast Python-only test suite.
+# Keeping precompilation isolated to job 2 means the fast Python-only tests
+# are never blocked by Julia package installation time.
 
 name: Julia CI
 
@@ -14,13 +18,11 @@ on:
     paths:
       - 'pysd/builders/julia/**'
       - 'tests/pytest_builders/pytest_julia*.py'
-      - 'Dockerfile.julia'
       - '.github/workflows/julia-ci.yml'
   pull_request:
     paths:
       - 'pysd/builders/julia/**'
       - 'tests/pytest_builders/pytest_julia*.py'
-      - 'Dockerfile.julia'
       - '.github/workflows/julia-ci.yml'
   workflow_dispatch:
   schedule:
@@ -28,8 +30,42 @@ on:
     - cron: '0 8 * * 1'
 
 jobs:
-  julia-tests:
-    name: Julia builder (Julia ${{ matrix.julia-version }})
+  # -------------------------------------------------------------------------
+  # Job 1: unit tests + translation integration tests (no Julia binary needed)
+  # -------------------------------------------------------------------------
+  julia-python-tests:
+    name: Julia builder — Python-only tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -U pip wheel
+          pip install --prefer-binary -r tests/requirements.txt
+          pip install --prefer-binary -e .
+
+      - name: Run unit tests
+        run: |
+          pytest tests/pytest_builders/pytest_julia.py -v --tb=short
+
+      - name: Run translation integration tests (no Julia runtime needed)
+        run: |
+          pytest tests/pytest_builders/pytest_julia_integration.py -m "not julia" -v --tb=short
+
+  # -------------------------------------------------------------------------
+  # Job 2: numerical tests (require Julia runtime)
+  # -------------------------------------------------------------------------
+  julia-numerical-tests:
+    name: Julia builder — numerical tests (Julia ${{ matrix.julia-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -53,8 +89,10 @@ jobs:
         run: |
           julia --startup-file=no -e '
             using Pkg
-            Pkg.add(["ModelingToolkit", "OrdinaryDiffEq",
-                     "OrdinaryDiffEqLowOrderRK", "DataInterpolations", "JSON3"])
+            Pkg.add(["ModelingToolkit", "Symbolics", "OrdinaryDiffEq",
+                     "OrdinaryDiffEqLowOrderRK", "DataInterpolations",
+                     "NCDatasets", "JSON3"])
+            Pkg.develop(PackageSpec(path="pysd/builders/julia/PySD.jl"))
             Pkg.precompile()
           '
 
@@ -69,10 +107,6 @@ jobs:
           pip install --prefer-binary -r tests/requirements.txt
           pip install --prefer-binary -e .
 
-      - name: Run Julia builder unit tests (no Julia runtime needed)
+      - name: Run numerical integration tests
         run: |
-          pytest tests/pytest_builders/pytest_julia.py -v --tb=short
-
-      - name: Run Julia integration tests (translation + numerical)
-        run: |
-          pytest tests/pytest_builders/pytest_julia_integration.py -v --tb=short
+          pytest tests/pytest_builders/pytest_julia_integration.py -m julia -v --tb=short
