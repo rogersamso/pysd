@@ -370,6 +370,10 @@ Supported Vensim features
    * - ``DATA`` variables (tab-delimited ``.tab`` files)
      - Supported (runtime ``_tab_val`` interpolation via ``tab_data_files=`` parameter)
      - Not supported
+   * - ``DATA`` variables fed from another model's NetCDF output
+     - Supported (pass ``nc_data_files=["results.nc"]`` to ``run_model()``; scalars and
+       subscripted variables supported)
+     - Not supported
    * - Subscripted ``GET DIRECT LOOKUPS`` > 2D
      - Partial (flattened to first column with warning)
      - Partial
@@ -419,6 +423,21 @@ parse.  The Julia builder does not yet cover:
    * - ``DATA`` variables (tab-delimited ``.tab`` file source)
      - Full
      - Supported — pass ``tab_data_files=["data.tab"]`` to ``run_model()``
+   * - ``DATA`` variables fed from another model's NetCDF output
+     - Full
+     - Supported — pass ``nc_data_files=["other_model_results.nc"]`` to ``run_model()``
+   * - Step-by-step execution (``model.step()``)
+     - Full — essential for ABM coupling (e.g. Mesa)
+     - Not supported — ``run_model()`` always runs the full simulation in one call
+   * - Mid-run parameter injection (``model.set_components()``)
+     - Full — swap variable equations between steps
+     - Not supported — parameters can only be changed before calling ``run_model()``
+   * - State export/import (``model.export()`` / ``model.import_()``)
+     - Full — snapshot and restore model state for warm restarts or ensemble branching
+     - Not supported
+   * - Submodel selection (``model.select_submodel()``)
+     - Full — prune to a variable subset for faster targeted simulation
+     - Not supported — the full model is always simulated
    * - Subscripted lookups with > 2 subscript dimensions
      - Full
      - Flattened to first column (with warning)
@@ -476,6 +495,31 @@ Limitations
   the ODE backend.  Pass the file paths as ``run_model(tab_data_files=["data.tab"])``;
   the model reads and interpolates the time series at runtime.  The MTK backend
   does not yet support tab-delimited DATA variables.
+
+- **Step-by-step execution** is not available.  The Python builder exposes
+  ``model.set_stepper()`` / ``model.step()`` for advancing the simulation one
+  time step at a time, which is the standard pattern for coupling with
+  agent-based frameworks (e.g. Mesa, Agents.jl).  The Julia builder has no
+  equivalent — ``run_model()`` always executes the full simulation in a single
+  call.
+
+- **Mid-run parameter injection** is not available.  The Python builder's
+  ``model.set_components()`` can replace any variable's equation with a new
+  function or constant value at any point during a run.  In the Julia builder,
+  parameters can only be changed before calling ``run_model()`` (e.g. by
+  modifying ``u0`` or editing the generated constants).
+
+- **State export/import** is not available.  The Python builder's
+  ``model.export()`` / ``model.import_()`` snapshot and restore the full model
+  state — stock values, stateful caches, and current time — enabling warm
+  restarts and ensemble branching from a common saved point.  The Julia builder
+  writes results to NetCDF via ``save_results()`` but cannot restore mid-run
+  state.
+
+- **Submodel selection** is not available.  The Python builder's
+  ``model.select_submodel()`` prunes the model to a requested subset of
+  variables, which can substantially reduce simulation time when only part of
+  the model is needed.  The Julia builder always simulates the full model.
 
 - The Euler solver (default) produces output that matches Vensim's built-in
   integration.  Higher-order solvers (e.g. ``Tsit5()``) are generally more

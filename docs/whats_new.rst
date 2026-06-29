@@ -34,6 +34,10 @@ New Features
   - XMILE ``DELAY`` constructs that appear embedded inside arithmetic expressions
     (rather than as top-level element equations) are now correctly lifted to dedicated
     pipeline auxiliary stocks in the ODE state vector.
+  - ``DATA`` variables can now be driven from another Julia model's NetCDF output:
+    pass ``nc_data_files=["other_model_results.nc"]`` to ``run_model()``.  Scalar
+    and subscripted DATA variables (up to 3D) are supported; subscript indexing
+    matches the integer-based key scheme used by the existing ``.tab`` file path.
 
   (`@rogersamso <https://github.com/rogersamso>`_)
 

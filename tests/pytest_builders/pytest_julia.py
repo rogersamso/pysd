@@ -4655,6 +4655,89 @@ class TestXmileMinMax:
 
 
 # ===========================================================================
+# NC data-file input (DATA variables fed from another model's NC output)
+# ===========================================================================
+
+class TestNcDataFiles:
+    """nc_data_files parameter for feeding another model's NetCDF output into
+    DATA variables of the current Julia model.
+
+    The generated model must emit:
+      - ``_nc_data_registry`` — maps Julia identifier → (method, ndims)
+      - ``_load_nc_data!(files)`` — reads NC, populates ``_tab_data``
+      - ``nc_data_files=String[]`` kwarg in ``run_model()``
+
+    Models without any DATA variables must emit none of the above.
+    """
+
+    TEST_MODELS = Path("tests/test-models/tests/data_from_other_model")
+
+    def _translate(self, tmp_path):
+        import shutil
+        dst = tmp_path / "data_from_other_model"
+        shutil.copytree(self.TEST_MODELS, dst)
+        from pysd import translate_to_julia
+        return translate_to_julia(dst / "test_data_from_other_model.mdl")
+
+    def test_run_model_accepts_nc_data_files(self, tmp_path):
+        """run_model() must accept nc_data_files=String[] when model has DATA variables."""
+        content = self._translate(tmp_path).read_text()
+        assert "nc_data_files=String[]" in content
+
+    def test_load_nc_data_function_emitted(self, tmp_path):
+        """_load_nc_data! function must be emitted for models with DATA variables."""
+        content = self._translate(tmp_path).read_text()
+        assert "function _load_nc_data!" in content
+
+    def test_nc_data_registry_emitted(self, tmp_path):
+        """_nc_data_registry constant must be emitted for models with DATA variables."""
+        content = self._translate(tmp_path).read_text()
+        assert "_nc_data_registry" in content
+
+    def test_nc_data_registry_contains_scalar_var(self, tmp_path):
+        """Scalar DATA variable (var 0dim) must appear in _nc_data_registry with ndims=0."""
+        content = self._translate(tmp_path).read_text()
+        # Registry entries look like: "var_0dim" => (:interpolate, 0)
+        assert '"var_0dim" => (:' in content
+
+    def test_nc_data_registry_records_subscript_ndims(self, tmp_path):
+        """1D subscripted var_1dim must appear in registry; 2D var_2dim likewise."""
+        content = self._translate(tmp_path).read_text()
+        assert '"var_1dim" => (:' in content
+        assert '"var_2dim" => (:' in content
+
+    def test_load_nc_data_uses_ncDatasets(self, tmp_path):
+        """_load_nc_data! must open NC files via NCDatasets.Dataset."""
+        content = self._translate(tmp_path).read_text()
+        assert "NCDatasets.Dataset" in content
+
+    def test_model_without_data_vars_has_no_nc_infrastructure(self, tmp_path):
+        """Models without DATA variables must NOT emit nc_data_files or _load_nc_data!."""
+        ast = IntegStructure(flow=0.0, initial=0.0)
+        comp = AbstractComponent(subscripts=[[], []], ast=ast)
+        elem = AbstractElement(name="Stock", components=[comp])
+        control_elems = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[elem] + control_elems,
+            path=tmp_path / "simple.mdl",
+        )
+        model = AbstractModel(
+            original_path=tmp_path / "simple.mdl",
+            sections=(section,),
+        )
+        jl_path = JuliaModelBuilder(model).build_model()
+        content = jl_path.read_text()
+        assert "nc_data_files" not in content
+        assert "_load_nc_data!" not in content
+        assert "_nc_data_registry" not in content
+
+
+# ===========================================================================
 # Phase 3F — INVERT_MATRIX support
 # ===========================================================================
 

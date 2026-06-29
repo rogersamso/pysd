@@ -3936,6 +3936,48 @@ class JuliaSectionBuilder:
         lines.append("")
         lines.append("_tab_val(key::String, t::Real) = haskey(_tab_data, key) ? Float64(_tab_data[key](t)) : 0.0")
         lines.append("")
+
+        # NC data-file infrastructure: registry + _load_nc_data!
+        # Registry maps Julia identifier → (method_symbol, n_subscript_dims).
+        # _load_nc_data! reads any NC file whose variable names match the registry
+        # and populates _tab_data using the same integer-indexed keys as _load_tab_data!
+        # so that _tab_val() works transparently for both sources.
+        lines.append("const _nc_data_registry = Dict{String, Tuple{Symbol, Int}}(")
+        for julia_id, _real, method_sym, dim_elems in self._tab_data_entries:
+            ndims = len(dim_elems)
+            lines.append(f'    "{julia_id}" => ({method_sym}, {ndims}),')
+        lines.append(")")
+        lines.append("")
+        lines.append("function _load_nc_data!(files::AbstractVector{<:AbstractString})")
+        lines.append("    for f in files")
+        lines.append("        NCDatasets.Dataset(f, \"r\") do ds")
+        lines.append('            "time" ∉ keys(ds) && return')
+        lines.append("            ts = Float64.(ds[\"time\"][:])")
+        lines.append("            for (varname, (method, nd)) in _nc_data_registry")
+        lines.append("                haskey(ds, varname) || continue")
+        lines.append("                try")
+        lines.append("                    data = Array(ds[varname])")
+        lines.append("                    if nd == 0")
+        lines.append("                        _tab_data[varname] = pysd_build_tab_itp(Float64.(vec(data)), ts, method)")
+        lines.append("                    elseif nd == 1")
+        lines.append("                        for k in 1:size(data, 2)")
+        lines.append("                            _tab_data[\"$(varname)_$(k)\"] = pysd_build_tab_itp(Float64.(data[:, k]), ts, method)")
+        lines.append("                        end")
+        lines.append("                    elseif nd == 2")
+        lines.append("                        for i in 1:size(data, 2), j in 1:size(data, 3)")
+        lines.append("                            _tab_data[\"$(varname)_$(i)_$(j)\"] = pysd_build_tab_itp(Float64.(data[:, i, j]), ts, method)")
+        lines.append("                        end")
+        lines.append("                    else")
+        lines.append("                        for i in 1:size(data, 2), j in 1:size(data, 3), k in 1:size(data, 4)")
+        lines.append("                            _tab_data[\"$(varname)_$(i)_$(j)_$(k)\"] = pysd_build_tab_itp(Float64.(data[:, i, j, k]), ts, method)")
+        lines.append("                        end")
+        lines.append("                    end")
+        lines.append("                catch; end")
+        lines.append("            end")
+        lines.append("        end")
+        lines.append("    end")
+        lines.append("end")
+        lines.append("")
         return "\n".join(lines) + "\n"
 
     def _lookup_block(self) -> str:
@@ -4656,8 +4698,11 @@ class JuliaSectionBuilder:
             return self._run_function_mtk()
         ts = self.control_vals.get("time_step") or "time_step"
         has_tab = bool(self._tab_data_entries)
-        tab_param = ", tab_data_files=String[]" if has_tab else ""
-        tab_load = "\n    isempty(tab_data_files) || _load_tab_data!(tab_data_files)" if has_tab else ""
+        tab_param = ", tab_data_files=String[], nc_data_files=String[]" if has_tab else ""
+        tab_load = (
+            "\n    isempty(tab_data_files) || _load_tab_data!(tab_data_files)"
+            "\n    isempty(nc_data_files) || _load_nc_data!(nc_data_files)"
+        ) if has_tab else ""
         return textwrap.dedent(f"""\
             prob = ODEProblem(rhs!, u0, tspan)
 
