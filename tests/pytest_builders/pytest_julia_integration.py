@@ -667,7 +667,7 @@ def _parse_csv_from_string(text: str) -> Dict[str, List[float]]:
 # ---------------------------------------------------------------------------
 
 _JL_PACKAGES = (
-    "ModelingToolkit, Symbolics, OrdinaryDiffEq, OrdinaryDiffEqLowOrderRK, "
+    "OrdinaryDiffEq, OrdinaryDiffEqLowOrderRK, "
     "DataInterpolations, NCDatasets, Printf"
 )
 
@@ -694,12 +694,6 @@ function _batch_get_series(sol, mod, id_str)
     if sym !== nothing
         try; return Float64.(sol[sym, :]); catch; end
         try; return fill(Float64(sol.prob.ps[sym]), length(sol.t)); catch; end
-    end
-    try
-        p = Base.eval(mod, Symbol(base_id))
-        val = Float64(ModelingToolkit.getdefault(p))
-        return fill(val, length(sol.t))
-    catch
     end
     return fill(NaN, length(sol.t))
 end
