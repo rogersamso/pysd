@@ -1,15 +1,17 @@
 # CI for Julia builder tests.
 #
 # Split into two jobs:
-#   1. julia-unit-and-translation — runs the 382 unit tests and the 799
-#      translation-only integration tests.  No Julia binary is needed; these
-#      are pure-Python tests that generate .jl files.
-#   2. julia-numerical — runs only the 27 @pytest.mark.julia tests that
-#      actually execute Julia.  This job installs Julia + packages (slow
-#      on the first run, cached on subsequent runs).
+#   1. julia-python-tests — runs the unit tests and the translation-only
+#      integration tests. No Julia binary needed; these are pure-Python tests
+#      that generate .jl files.
+#   2. julia-numerical-tests — runs only the 27 @pytest.mark.julia tests
+#      that actually execute Julia.
 #
-# Keeping precompilation isolated to job 2 means the fast Python-only tests
-# are never blocked by Julia package installation time.
+# The numerical job uses julia-actions/setup-julia + julia-actions/cache,
+# which is the standard pattern across the Julia ecosystem. Cold runs take
+# ~15-20 min; warm cache (subsequent runs on the same Julia version) take
+# ~3-5 min. This avoids the GitHub Actions HOME=/github/home override that
+# breaks Docker-container-based approaches.
 
 name: Julia CI
 
@@ -26,7 +28,7 @@ on:
       - '.github/workflows/julia-ci.yml'
   workflow_dispatch:
   schedule:
-    # Run weekly to catch Julia/MTK upstream breakage
+    # Run weekly to catch upstream Julia/package breakage
     - cron: '0 8 * * 1'
 
 jobs:
@@ -64,19 +66,17 @@ jobs:
   # -------------------------------------------------------------------------
   # Job 2: numerical tests (require Julia runtime)
   #
-  # Uses a pre-built base image (ghcr.io/rogersamso/pysd-julia-base) that
-  # has all heavy packages (MTK, Symbolics, …) already precompiled.
-  # PySD.jl is made available via JULIA_LOAD_PATH (pointing at the
-  # pysd/builders/julia directory) rather than Pkg.develop, so the
-  # pre-installed packages in the image are never modified.
-  #
-  # The base image is rebuilt by docker-julia-base.yml whenever the
-  # Dockerfile changes, or weekly to pick up package updates.
+  # Standard julia-actions pattern: setup-julia installs Julia, cache restores
+  # the depot (~/.julia) between runs. PySD.jl is added to JULIA_LOAD_PATH
+  # so it is visible without Pkg.develop (which would modify the global env).
   # -------------------------------------------------------------------------
   julia-numerical-tests:
     name: Julia builder — numerical tests (Julia ${{ matrix.julia-version }})
     runs-on: ubuntu-latest
-    container: ghcr.io/rogersamso/pysd-julia-base:${{ matrix.julia-version }}
+
+    permissions:
+      actions: write  # allows julia-actions/cache to evict stale caches
+      contents: read
 
     strategy:
       fail-fast: false
@@ -88,20 +88,32 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Debug Julia environment
-        env:
-          JULIA_DEPOT_PATH: /opt/julia-depot
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v3
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - name: Cache Julia depot
+        uses: julia-actions/cache@v3
+
+      - name: Install Julia packages
         run: |
           julia --startup-file=no -e '
-            println("=== LOAD_PATH ==="); println(LOAD_PATH)
-            println("=== DEPOT_PATH ==="); println(DEPOT_PATH)
-            println("=== HOME ==="); println(homedir())
-            using Pkg; Pkg.status()
+            using Pkg
+            Pkg.add([
+              "OrdinaryDiffEq",
+              "OrdinaryDiffEqLowOrderRK",
+              "DataInterpolations",
+              "NCDatasets",
+              "JSON3",
+            ])
+            Pkg.precompile()
           '
-          echo "--- depot env dir ---"
-          ls /opt/julia-depot/environments/ 2>/dev/null || echo "(empty or missing)"
-          echo "--- packages dir ---"
-          ls /opt/julia-depot/packages/ 2>/dev/null | head -10 || echo "(empty or missing)"
 
       - name: Install Python dependencies
         run: |
@@ -111,7 +123,6 @@ jobs:
 
       - name: Run numerical integration tests
         env:
-          JULIA_DEPOT_PATH: /opt/julia-depot
           JULIA_LOAD_PATH: "${{ github.workspace }}/pysd/builders/julia:@v#.#:@stdlib"
         run: |
           pytest tests/pytest_builders/pytest_julia_integration.py -m julia -v --tb=short
