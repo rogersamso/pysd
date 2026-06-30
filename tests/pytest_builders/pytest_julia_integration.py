@@ -361,7 +361,7 @@ class TestTranslationAllModels:
         from pysd import translate_to_julia
 
         jl_path = translate_to_julia(dst)
-        content = jl_path.read_text()
+        content = jl_path.read_text(encoding="utf-8")
 
         assert "using OrdinaryDiffEq" in content, f"{folder}: missing 'using OrdinaryDiffEq'"
         assert "function rhs!" in content, f"{folder}: missing 'function rhs!'"
@@ -406,7 +406,7 @@ class TestTranslationCleanModels:
         from pysd import translate_to_julia
 
         jl_path = translate_to_julia(dst)
-        content = jl_path.read_text()
+        content = jl_path.read_text(encoding="utf-8")
         # Every model has at minimum the ODE boilerplate
         assert "function rhs!" in content
 
@@ -425,7 +425,7 @@ class TestTranslationCleanModels:
         from pysd import translate_to_julia
 
         jl_path = translate_to_julia(dst)
-        content = jl_path.read_text()
+        content = jl_path.read_text(encoding="utf-8")
         assert "initial_time" in content
         assert "final_time" in content
         assert "time_step" in content
@@ -444,7 +444,7 @@ class TestTranslationFeatures:
         dst = tmp_path / mdl.name
         _shutil.copy(mdl, dst)
         from pysd import translate_to_julia
-        return translate_to_julia(dst).read_text()
+        return translate_to_julia(dst).read_text(encoding="utf-8")
 
     def test_integ_emits_ode(self, tmp_path):
         content = self._translate("abs", tmp_path)
@@ -553,7 +553,7 @@ class TestModularTranslation:
             warnings.simplefilter("ignore", UserWarning)
             jl_path = translate_to_julia(dst, split_views=True, backend="mtk")
 
-        content = jl_path.read_text()
+        content = jl_path.read_text(encoding="utf-8")
         assert "include(" in content
 
     def test_split_model_all_declarations_in_main(self, tmp_path):
@@ -572,7 +572,7 @@ class TestModularTranslation:
             warnings.simplefilter("ignore", UserWarning)
             jl_path = translate_to_julia(dst, split_views=True, backend="mtk")
 
-        content = jl_path.read_text()
+        content = jl_path.read_text(encoding="utf-8")
         assert "run_model" in content
         assert "include(" in content
 
@@ -1169,7 +1169,7 @@ class TestNewConstructsTranslation:
         from pysd import translate_to_julia
         jl_path = translate_to_julia(dst)
         assert jl_path.exists(), f"{mdl_path.name}: .jl was not created"
-        return jl_path.read_text()
+        return jl_path.read_text(encoding="utf-8")
 
     # --- DELAY FIXED ---
 
@@ -1366,7 +1366,7 @@ TIME STEP  = 1
         assert not unknown, \
             f"Lookup-variable call must not produce Unknown-function warning: {unknown}"
 
-        content = jl.read_text()
+        content = jl.read_text(encoding="utf-8")
         assert "LinearInterpolation" in content, \
             "Lookup table variable must emit a LinearInterpolation"
         # The result variable should reference the lookup function
@@ -1510,7 +1510,7 @@ class TestNewFeatureIntegration:
         elem = AbstractElement(name="Pi Approx", components=[comp], units="Dmnl")
         model = self._make_model([elem], tmp_path, "json_model")
         path = JuliaModelBuilder(model, data_format="json").build_model()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "JSON3" in content
         assert "_model_data" in content
         assert "pi_approx" in content
@@ -1541,7 +1541,7 @@ class TestNewFeatureIntegration:
         elem = AbstractElement(name="Step Table", components=[comp])
         model = self._make_model([elem], tmp_path, "hold_fwd_model")
         path = JuliaModelBuilder(model).build_model()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "LinearInterpolation" in content  # default
 
     def test_hold_backward_data_produces_constant_right(self, tmp_path, mocker):
@@ -1566,7 +1566,7 @@ class TestNewFeatureIntegration:
         elem = AbstractElement(name="Fwd Data", components=[comp])
         model = self._make_model([elem], tmp_path, "look_fwd_model")
         path = JuliaModelBuilder(model).build_model()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "ConstantInterpolation" in content
         assert "dir=:right" in content
 
@@ -1583,7 +1583,7 @@ class TestNewFeatureIntegration:
         elem = AbstractElement(name="Rate", components=[comp], limits=(0.0, 1.0))
         model = self._make_model([elem], tmp_path, "limits_model")
         path = JuliaModelBuilder(model).build_model()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "limits: [0.0, 1.0]" in content
 
     # -----------------------------------------------------------------------
@@ -1621,7 +1621,7 @@ class TestNewFeatureIntegration:
             sections=(section,),
         )
         path = JuliaModelBuilder(model).build_model()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "my_var[1]" in content
         assert "my_var[3]" in content
 
@@ -1681,7 +1681,7 @@ class TestNewFeatureIntegration:
         assert path.exists()
         macro_path = tmp_path / "macro_model_my_macro.jl"
         assert macro_path.exists()
-        content = macro_path.read_text()
+        content = macro_path.read_text(encoding="utf-8")
         assert "function my_macro(" in content
 
     # -----------------------------------------------------------------------
@@ -1702,7 +1702,7 @@ class TestNewFeatureIntegration:
         )
         model = self._make_model([elem], tmp_path, "doc_model")
         path = JuliaModelBuilder(model).build_model()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         # Comment with units must appear somewhere in the file
         assert "1/Year" in content, "Units must appear as a comment in generated Julia"
         # Comment with documentation must appear
@@ -1728,7 +1728,7 @@ class TestNewFeatureIntegration:
         )
         model = self._make_model([elem], tmp_path, "doc_only_model")
         path = JuliaModelBuilder(model).build_model()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "Accumulated stock level" in content, \
             "Documentation must appear as comment even without units"
 
@@ -1742,7 +1742,7 @@ class TestNewFeatureIntegration:
         elem = AbstractElement(name="Rate", components=[comp])  # no doc, no units
         model = self._make_model([elem], tmp_path, "no_doc_model")
         path = JuliaModelBuilder(model).build_model()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         # Should not have a line that is ONLY "# " with nothing after it
         lines = content.splitlines()
         empty_comments = [l for l in lines if l.strip() == "#"]
@@ -1769,7 +1769,7 @@ class TestNewFeatureIntegration:
                        if "not supported" in str(w.message).lower()
                        or "UNSUPPORTED" in str(w.message)]
         # DataStructure or related warning is expected
-        assert path.read_text()  # file exists and has content
+        assert path.read_text(encoding="utf-8")  # file exists and has content
 
     # -----------------------------------------------------------------------
     # ALLOCATE AVAILABLE / ALLOCATE BY PRIORITY translation tests
@@ -1792,7 +1792,7 @@ class TestNewFeatureIntegration:
         unsupported_3d = [w for w in captured if "3D" in str(w.message)]
         assert not unsupported_3d, \
             f"Unexpected 3D-unsupported warnings: {[str(w.message) for w in unsupported_3d]}"
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         # Both matrix_2 and matrix_3 constants must be covered
         assert "matrix_2[" in content and "matrix_3[" in content, \
             "Expected matrix_2 and matrix_3 index equations in generated output"
@@ -1811,7 +1811,7 @@ class TestNewFeatureIntegration:
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
             path = translate_to_julia(tmp_path / mdl.name)
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "pysd_allocate_available(" in content, \
             "Expected pysd_allocate_available() in generated Julia"
         assert "proportional" not in content.lower(), \
@@ -1833,7 +1833,7 @@ class TestNewFeatureIntegration:
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
             path = translate_to_julia(dst_dir / mdl.name)
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "pysd_allocate_by_priority(" in content, \
             "Expected pysd_allocate_by_priority() in generated Julia"
         proportional_warns = [w for w in captured if "proportional" in str(w.message)]
