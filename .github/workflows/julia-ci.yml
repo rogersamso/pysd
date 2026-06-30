@@ -111,9 +111,14 @@ jobs:
             # it resolves fresh versions compatible with the running Julia version.
             Pkg.activate("pysd_ci", shared=true)
             Pkg.develop(PackageSpec(path="pysd/builders/julia/PySD.jl"))
+            # DataInterpolations and NCDatasets are deps of PySD.jl but must
+            # also be direct deps of this env so generated model files can
+            # `using DataInterpolations` / `using NCDatasets` directly.
             Pkg.add([
               "OrdinaryDiffEq",
               "OrdinaryDiffEqLowOrderRK",
+              "DataInterpolations",
+              "NCDatasets",
               "JSON3",
             ])
             Pkg.precompile()
