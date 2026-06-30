@@ -302,11 +302,22 @@ _julia_mtk_available_cache: bool | None = None
 
 
 def _julia_mtk_available() -> bool:
-    """Return True iff the julia binary is available on PATH."""
+    """Return True iff Julia is on PATH and OrdinaryDiffEq is loadable."""
     global _julia_mtk_available_cache
     if _julia_mtk_available_cache is not None:
         return _julia_mtk_available_cache
-    _julia_mtk_available_cache = shutil.which("julia") is not None
+    if shutil.which("julia") is None:
+        _julia_mtk_available_cache = False
+        return False
+    try:
+        result = subprocess.run(
+            ["julia", "--startup-file=no", "-e", "using OrdinaryDiffEq"],
+            capture_output=True,
+            timeout=60,
+        )
+        _julia_mtk_available_cache = result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        _julia_mtk_available_cache = False
     return _julia_mtk_available_cache
 
 
