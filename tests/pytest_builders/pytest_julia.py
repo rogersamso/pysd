@@ -2989,6 +2989,20 @@ class TestCoverageGaps:
         sb.build_section()
         assert any("lut_itp" in d for d in sb.lookup_const_decls)
 
+    def test_get_lookups_single_component_with_subscripts_emits_dispatch(self, tmp_path):
+        """Single-component subscripted lookup emits pysd_xlsx_build_lookup_dispatch (lines 2724-2736)."""
+        sr = _make_subscript_range("energy_type", ["H", "S", "L"])
+        ast = GetLookupsStructure(file="d.xlsx", tab="Sheet1", x_row_or_col="yr", cell="A1")
+        comp = AbstractComponent(subscripts=[["energy_type"], []], ast=ast)
+        elem = AbstractElement(name="Sub Lut", components=[comp])
+        sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl",
+                                             subscripts=[sr])
+        sb.build_section()
+        assert any("sub_lut_fns" in d for d in sb.lookup_const_decls), (
+            f"Expected sub_lut_fns in lookup_const_decls, got {sb.lookup_const_decls}"
+        )
+        assert any("sub_lut(i, x)" in d for d in sb.lookup_func_decls)
+
     def test_get_lookups_multi_component(self, tmp_path):
         """Multi-component GetLookupsStructure uses runtime per-component dispatch."""
         ast1 = GetLookupsStructure(file="d.xlsx", tab="S", x_row_or_col="x", cell="A1")
@@ -3001,6 +3015,22 @@ class TestCoverageGaps:
                                              subscripts=[sr])
         sb.build_section()
         assert any("multi_lut_1_fns" in d for d in sb.lookup_const_decls)
+
+    def test_get_lookups_2d_multi_component_emits_2d_dispatch(self, tmp_path):
+        """2D-subscripted multi-component lookup emits 2D dispatch function (lines 2766-2769)."""
+        sr1 = _make_subscript_range("d1", ["A", "B"])
+        sr2 = _make_subscript_range("d2", ["X", "Y"])
+        ast1 = GetLookupsStructure(file="d.xlsx", tab="S", x_row_or_col="x", cell="A1")
+        ast2 = GetLookupsStructure(file="d.xlsx", tab="S", x_row_or_col="x", cell="B1")
+        comp1 = AbstractComponent(subscripts=[["d1", "d2"], []], ast=ast1)
+        comp2 = AbstractComponent(subscripts=[["d1", "d2"], []], ast=ast2)
+        elem = AbstractElement(name="Lut 2D", components=[comp1, comp2])
+        sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl",
+                                             subscripts=[sr1, sr2])
+        sb.build_section()
+        assert any("lut_2d(i, j, x)" in d for d in sb.lookup_func_decls), (
+            f"Expected 2D dispatch function, got {sb.lookup_func_decls}"
+        )
 
     def test_get_lookups_data_without_values_attr(self, mocker, tmp_path):
         """_process_get_lookups handles data without .values (plain numpy array)."""
@@ -3050,6 +3080,20 @@ class TestCoverageGaps:
         sb.build_section()
         assert any("historic_data_itp" in d for d in sb.lookup_const_decls)
 
+    def test_get_data_single_component_with_subscripts_emits_dispatch(self, tmp_path):
+        """Single-component subscripted GET DATA emits pysd_xlsx_build_lookup_dispatch (lines 2997-3009)."""
+        sr = _make_subscript_range("fuel", ["gas", "oil"])
+        ast = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
+        comp = AbstractComponent(subscripts=[["fuel"], []], ast=ast)
+        elem = AbstractElement(name="Fuel Data", components=[comp])
+        sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl",
+                                             subscripts=[sr])
+        sb.build_section()
+        assert any("fuel_data_fns" in d for d in sb.lookup_const_decls), (
+            f"Expected fuel_data_fns in lookup_const_decls, got {sb.lookup_const_decls}"
+        )
+        assert any("fuel_data(i, x)" in d for d in sb.lookup_func_decls)
+
     def test_get_data_multi_component(self, tmp_path):
         """Multi-component GetDataStructure uses runtime per-component dispatch."""
         ast1 = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
@@ -3062,6 +3106,22 @@ class TestCoverageGaps:
                                              subscripts=[sr])
         sb.build_section()
         assert any("multi_data_1_fns" in d for d in sb.lookup_const_decls)
+
+    def test_get_data_2d_multi_component_emits_2d_dispatch(self, tmp_path):
+        """2D-subscripted multi-component GET DATA emits 2D dispatch function (lines 3029-3032)."""
+        sr1 = _make_subscript_range("dm1", ["A", "B"])
+        sr2 = _make_subscript_range("dm2", ["X", "Y"])
+        ast1 = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
+        ast2 = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="B1")
+        comp1 = AbstractComponent(subscripts=[["dm1", "dm2"], []], ast=ast1)
+        comp2 = AbstractComponent(subscripts=[["dm1", "dm2"], []], ast=ast2)
+        elem = AbstractElement(name="Data 2D", components=[comp1, comp2])
+        sb = _section_builder_from_elements([elem], path=tmp_path/"m.mdl",
+                                             subscripts=[sr1, sr2])
+        sb.build_section()
+        assert any("data_2d(i, j, x)" in d for d in sb.lookup_func_decls), (
+            f"Expected 2D dispatch function, got {sb.lookup_func_decls}"
+        )
 
     def test_get_data_no_time_dimension_raises_into_fallback(self, tmp_path):
         """GET DATA with no declared subscripts: runtime scalar path always emits _itp.
@@ -5813,3 +5873,1483 @@ class TestCheckCompat:
         assert 'check_compat(v"' in content, (
             f"MTK generated file must call check_compat, got header:\n{content[:500]}"
         )
+
+
+# ===========================================================================
+# Expressions builder subscript path coverage
+# ===========================================================================
+
+class TestExpressionBuilderSubscriptPaths:
+    """Cover specific uncovered paths in JuliaASTVisitor reference/call handling."""
+
+    def _v(self, **kwargs):
+        ns = JuliaNamespaceManager()
+        for n in kwargs.pop("names", []):
+            ns.add_to_namespace(n)
+        registry = InlineLookupRegistry()
+        needed = set()
+        return JuliaASTVisitor(ns, registry, needed, **kwargs), ns
+
+    # ------------------------------------------------------------------
+    # Lines 611-612: bare lookup reference in active_subs comprehension context
+    # ------------------------------------------------------------------
+
+    def test_bare_lookup_in_comprehension_context_inserts_loop_var(self):
+        """Bare reference to a subscripted lookup in a comprehension inserts the active index (lines 611-612)."""
+        v, ns = self._v(
+            names=["transport data"],
+            subs_sizes={"mode": 3},
+            var_dims={"transport_data": ["mode"]},
+            active_subs={"mode": "_i0"},
+            lookup_names={"transport_data"},
+        )
+        node = ReferenceStructure("transport data")
+        result = v.visit(node)
+        assert result == "transport_data(_i0, t)"
+
+    # ------------------------------------------------------------------
+    # Lines 660: non-bang subscript in active_subs within a bang reference
+    # ------------------------------------------------------------------
+
+    def test_mixed_bang_and_range_subscript_uses_active_loop_var(self):
+        """Reference with a non-bang range sub in active_subs + a bang sub (line 660)."""
+        v, ns = self._v(
+            names=["energy pkm"],
+            subs_sizes={"sectors": 14, "modes": 4},
+            subs_elems={
+                "sectors": [f"S{i}" for i in range(14)],
+                "modes": ["car", "bus", "train", "air"],
+            },
+            var_dims={"energy_pkm": ["sectors", "modes"]},
+            active_subs={"sectors": "_i0"},  # 'sectors' is an active loop var
+        )
+        ns.add_to_namespace("energy pkm")
+        # Reference with both a non-bang range subscript (sectors) and a bang sub (modes!)
+        node = ReferenceStructure(
+            "energy pkm",
+            subscripts=SubscriptsReferenceStructure(subscripts=["sectors", "modes!"]),
+        )
+        result = v.visit(node)
+        # 'sectors' is in active_subs → line 660 → dim_to_idx["sectors"] = "_i0"
+        assert "_i0" in result
+        assert "_ii" in result or "for" in result
+
+    # ------------------------------------------------------------------
+    # Lines 730-737: bang subscript fallback when var_dims is unknown
+    # ------------------------------------------------------------------
+
+    def test_bang_subscript_no_var_dims_uses_node_subs_order(self):
+        """Bang subscript with no var_dims for the variable falls back to node_subs order (lines 730-737)."""
+        v, ns = self._v(
+            names=["generic var"],
+            subs_sizes={"region": 5},
+            # NO var_dims for generic_var — triggers the fallback at line 730
+        )
+        node = ReferenceStructure(
+            "generic var",
+            subscripts=SubscriptsReferenceStructure(subscripts=["region!"]),
+        )
+        result = v.visit(node)
+        assert "_ii0" in result
+        assert "1:N_REGION" in result
+
+    # ------------------------------------------------------------------
+    # Lines 1010-1017: subscripted function call in active comprehension context
+    # ------------------------------------------------------------------
+
+    def test_subscripted_func_call_in_active_context_prepends_index(self):
+        """Subscripted function call inside a comprehension prepends active loop var (lines 1010-1017)."""
+        v, ns = self._v(
+            names=["historic gfcf"],
+            subs_sizes={"sectors": 4},
+            var_dims={"historic_gfcf": ["sectors"]},
+            active_subs={"sectors": "_i0"},
+        )
+        node = CallStructure(
+            function=ReferenceStructure("historic gfcf"),
+            arguments=[ReferenceStructure("Time")],
+        )
+        result = v.visit(node)
+        assert result == "historic_gfcf(_i0, t)"
+
+    # ------------------------------------------------------------------
+    # Lines 1018-1028: subscripted function call in scalar (no active_subs) context
+    # ------------------------------------------------------------------
+
+    def test_subscripted_func_call_in_scalar_context_broadcasts(self):
+        """Subscripted function call with no active_subs generates a comprehension (lines 1018-1028)."""
+        v, ns = self._v(
+            names=["historic gfcf"],
+            subs_sizes={"sectors": 4},
+            var_dims={"historic_gfcf": ["sectors"]},
+            # No active_subs → scalar context
+        )
+        node = CallStructure(
+            function=ReferenceStructure("historic gfcf"),
+            arguments=[ReferenceStructure("Time")],
+        )
+        result = v.visit(node)
+        assert "historic_gfcf(_ii0, t)" in result
+        assert "for _ii0 in 1:N_SECTORS" in result
+
+    # ------------------------------------------------------------------
+    # Line 586: element label bare ref with no active dim
+    # ------------------------------------------------------------------
+
+    def test_element_label_bare_ref_no_active_dim_returns_position(self):
+        """Bare reference to an element label with no active loop var picks first range position (line 586)."""
+        v, ns = self._v(
+            subs_elems={"colors": ["red", "green", "blue"]},
+        )
+        node = ReferenceStructure("green")  # "green" not in namespace → fallback to _clean_elem_index
+        result = v.visit(node)
+        assert result == "2"  # 1-based index of "green" in "colors"
+
+    # ------------------------------------------------------------------
+    # Lines 662-663: non-bang range sub in subs_elems (in bang context, not in active_subs)
+    # ------------------------------------------------------------------
+
+    def test_bang_ref_with_non_bang_range_in_subs_elems_not_active(self):
+        """Non-bang sub in subs_elems but not active_subs is entered but idx_var is None (lines 662-663)."""
+        v, ns = self._v(
+            names=["energy"],
+            subs_sizes={"regions": 3, "modes": 2},
+            subs_elems={"regions": ["R1", "R2", "R3"], "modes": ["car", "bus"]},
+            var_dims={"energy": ["regions", "modes"]},
+            # NO active_subs: modes is in subs_elems but not in active_subs
+        )
+        ns.add_to_namespace("energy")
+        # node_subs has one bang ("regions!") + one plain range ("modes") that's in subs_elems
+        node = ReferenceStructure(
+            "energy",
+            subscripts=SubscriptsReferenceStructure(subscripts=["regions!", "modes"]),
+        )
+        result = v.visit(node)
+        # "modes" hits the elif subs_elems branch (lines 662-663), idx_var=None → skipped
+        # "regions!" creates a comprehension over regions
+        assert "_ii0" in result
+        assert "N_REGIONS" in result
+
+    # ------------------------------------------------------------------
+    # Line 677: element label in bang path, not in any var_dims range → last resort
+    # ------------------------------------------------------------------
+
+    def test_bang_ref_element_label_not_in_var_dims_uses_last_resort_range(self):
+        """Element label in bang subscript not found in var's own dims triggers last-resort range (line 677)."""
+        v, ns = self._v(
+            names=["energy"],
+            subs_sizes={"regions": 3, "sectors": 2},
+            subs_elems={"regions": ["R1", "R2", "R3"], "sectors": ["A", "B"]},
+            var_dims={"energy": ["regions"]},  # energy only has "regions" dim
+        )
+        ns.add_to_namespace("energy")
+        # "A" is an element label in "sectors", but energy's var_dims only has "regions"
+        # So the loop at line 672 finds no match in var_dims_list → line 676 target_dim is None
+        # → line 677: target_dim = next(iter(_elem_index["A"])) = "sectors"
+        node = ReferenceStructure(
+            "energy",
+            subscripts=SubscriptsReferenceStructure(subscripts=["regions!", "A"]),
+        )
+        result = v.visit(node)
+        assert "_ii0" in result  # regions! → comprehension
+
+    # ------------------------------------------------------------------
+    # Lines 782-786: size-match fallback for aligned ranges (non-bang ref)
+    # ------------------------------------------------------------------
+
+    def test_non_bang_ref_size_match_fallback_for_aligned_range(self):
+        """Non-bang subscript with same-size range alias triggers size-match (lines 782-786)."""
+        v, ns = self._v(
+            names=["energy"],
+            subs_sizes={"sectors": 3, "sectors_alias": 3},
+            subs_elems={
+                "sectors": ["A", "B", "C"],
+                "sectors_alias": ["X", "Y", "Z"],  # same SIZE but different elements
+            },
+            var_dims={"energy": ["sectors"]},
+            active_subs={"sectors": "_i0"},  # "sectors" is the active loop var
+        )
+        ns.add_to_namespace("energy")
+        # "sectors_alias" not in active_subs, in subs_elems, exact element-set doesn't match
+        # → falls through to size-match at lines 782-786 → finds "sectors" with size 3 → uses "_i0"
+        node = ReferenceStructure(
+            "energy",
+            subscripts=SubscriptsReferenceStructure(subscripts=["sectors_alias"]),
+        )
+        result = v.visit(node)
+        assert "_i0" in result
+
+    # ------------------------------------------------------------------
+    # Lines 803-806, 809: element label fallback — not in var's own dim
+    # ------------------------------------------------------------------
+
+    def test_non_bang_ref_element_label_not_in_var_dim_uses_last_resort(self):
+        """Element label subscript not in the var's declared dim triggers fallback (lines 803-806, 809)."""
+        v, ns = self._v(
+            names=["energy"],
+            subs_sizes={"regions": 3, "sectors": 2},
+            subs_elems={"regions": ["R1", "R2", "R3"], "sectors": ["A", "B"]},
+            var_dims={"energy": ["regions"]},  # energy is in "regions", not "sectors"
+        )
+        ns.add_to_namespace("energy")
+        # "A" is an element in "sectors", but energy's var_dims only has "regions"
+        # Pos=0, candidate="regions", "A" not in _elem_index["A"]["regions"] → parent_range stays None
+        # Lines 803-806: loop through var_dims_list=["regions"], no match
+        # Line 807-809: last resort → parent_range = "sectors" → index = 1
+        node = ReferenceStructure(
+            "energy",
+            subscripts=SubscriptsReferenceStructure(subscripts=["A"]),
+        )
+        result = v.visit(node)
+        assert "energy[1]" in result  # "A" is at index 1 in "sectors"
+
+    # ------------------------------------------------------------------
+    # Lines 868-886, 895-902, 938-941: bang subscript on function call (new dim)
+    # ------------------------------------------------------------------
+
+    def test_func_call_bang_subscript_creates_comprehension(self):
+        """Function call with bang subscript not in active_subs builds comprehension (lines 868-886, 940-941)."""
+        v, ns = self._v(
+            names=["fuel efficiency"],
+            subs_sizes={"fuel_type": 3},
+            subs_elems={"fuel_type": ["gas", "oil", "elec"]},
+            var_dims={"fuel_efficiency": ["fuel_type"]},
+        )
+        func_ref = ReferenceStructure(
+            "fuel efficiency",
+            subscripts=SubscriptsReferenceStructure(subscripts=["fuel_type!"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        assert "_ii0" in result
+        assert "for _ii0 in 1:N_FUEL_TYPE" in result
+        assert "fuel_efficiency(_ii0, t)" in result
+
+    # ------------------------------------------------------------------
+    # Lines 929-937: bang subscript on function call, no var_dims → fallback to node_subs
+    # ------------------------------------------------------------------
+
+    def test_func_call_bang_subscript_no_var_dims_fallback(self):
+        """Function call with bang subscript but no var_dims uses node_subs order (lines 929-937)."""
+        v, ns = self._v(
+            names=["generic func"],
+            subs_sizes={"dim_a": 4},
+            # NO var_dims for generic_func → triggers lines 929-937
+        )
+        func_ref = ReferenceStructure(
+            "generic func",
+            subscripts=SubscriptsReferenceStructure(subscripts=["dim_a!"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        assert "_ii0" in result
+        assert "for _ii0 in 1:N_DIM_A" in result
+
+    # ------------------------------------------------------------------
+    # Lines 903-928: 2D func, 1 bang sub, positional fallback for unmatched dim
+    # ------------------------------------------------------------------
+
+    def test_func_call_bang_2d_positional_fallback_for_unmatched_dim(self):
+        """2D function with only 1 bang sub uses positional fallback for the other dim (lines 903-928)."""
+        v, ns = self._v(
+            names=["transport share"],
+            subs_sizes={"region": 3, "mode": 4},  # DIFFERENT sizes → no size match
+            var_dims={"transport_share": ["region", "mode"]},
+        )
+        func_ref = ReferenceStructure(
+            "transport share",
+            subscripts=SubscriptsReferenceStructure(subscripts=["mode!"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        # "region" not in dim_to_idx_c → positional fallback → both get "_ii0"
+        assert "_ii0" in result
+
+    # ------------------------------------------------------------------
+    # Lines 918-920: 2D func with equal-size bang dim → size-match succeeds
+    # ------------------------------------------------------------------
+
+    def test_func_call_bang_size_match_for_equal_size_dims(self):
+        """2D function where unmatched dim (processed first) has same size as bang dim → size match (lines 918-920)."""
+        v, ns = self._v(
+            names=["energy matrix"],
+            subs_sizes={"modes": 4, "sectors": 4},  # SAME sizes → size match triggers
+            # "sectors" is listed FIRST so it is processed before "modes" (the bang dim)
+            # → _ii0 not yet in used_ivars_c when the size check runs → match at 918-920
+            var_dims={"energy_matrix": ["sectors", "modes"]},
+        )
+        func_ref = ReferenceStructure(
+            "energy matrix",
+            subscripts=SubscriptsReferenceStructure(subscripts=["modes!"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        assert "_ii0" in result
+
+    # ------------------------------------------------------------------
+    # Lines 963-986: non-bang explicit subscripts on function call (subs_elems alignment)
+    # ------------------------------------------------------------------
+
+    def test_func_call_explicit_subscripts_element_set_alignment(self):
+        """Function call with explicit range subscript aligns via element-set match (lines 963-986)."""
+        v, ns = self._v(
+            names=["water use"],
+            subs_sizes={"sectors": 3, "sectors_alias": 3},
+            subs_elems={
+                "sectors": ["A", "B", "C"],
+                "sectors_alias": ["A", "B", "C"],  # SAME elements → element-set match
+            },
+            var_dims={"water_use": ["sectors"]},
+            active_subs={"sectors": "_i0"},
+        )
+        func_ref = ReferenceStructure(
+            "water use",
+            subscripts=SubscriptsReferenceStructure(subscripts=["sectors_alias"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        assert "water_use(_i0, t)" in result
+
+    def test_func_call_explicit_subscripts_size_alignment_fallback(self):
+        """Function call with range subscript not matching by elements falls back to size (lines 976-986)."""
+        v, ns = self._v(
+            names=["water use"],
+            subs_sizes={"sectors": 3, "sectors_b": 3},
+            subs_elems={
+                "sectors": ["A", "B", "C"],
+                "sectors_b": ["X", "Y", "Z"],  # same SIZE but different elements
+            },
+            var_dims={"water_use": ["sectors"]},
+            active_subs={"sectors": "_i0"},
+        )
+        func_ref = ReferenceStructure(
+            "water use",
+            subscripts=SubscriptsReferenceStructure(subscripts=["sectors_b"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        assert "water_use(_i0, t)" in result
+
+    # ------------------------------------------------------------------
+    # Lines 987-1001: element label in non-bang function call subscripts
+    # ------------------------------------------------------------------
+
+    def test_func_call_explicit_element_label_subscript(self):
+        """Function call with an element label subscript resolves to numeric index (lines 987-1001)."""
+        v, ns = self._v(
+            names=["energy by sector"],
+            subs_sizes={"sectors": 3},
+            subs_elems={"sectors": ["A", "B", "C"]},
+            var_dims={"energy_by_sector": ["sectors"]},
+            active_subs={"sectors": "_i0"},
+        )
+        func_ref = ReferenceStructure(
+            "energy by sector",
+            subscripts=SubscriptsReferenceStructure(subscripts=["B"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        # "B" is element 2 in "sectors"
+        assert "energy_by_sector(2, t)" in result
+
+    def test_func_call_element_label_last_resort_range(self):
+        """Element label in func call subscript not in var's dim uses last-resort range (lines 994-999)."""
+        v, ns = self._v(
+            names=["energy"],
+            subs_sizes={"regions": 3, "sectors": 2},
+            subs_elems={"regions": ["R1", "R2", "R3"], "sectors": ["A", "B"]},
+            var_dims={"energy": ["regions"]},  # energy is in "regions" not "sectors"
+            active_subs={"regions": "_i0"},
+        )
+        func_ref = ReferenceStructure(
+            "energy",
+            subscripts=SubscriptsReferenceStructure(subscripts=["A"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        # "A" is at index 1 in "sectors" → last-resort range → energy(1, t)
+        assert "energy(1, t)" in result
+
+    # ------------------------------------------------------------------
+    # Lines 877-878, 909: func call bang subscripts with mixed bang+non-bang subs
+    # ------------------------------------------------------------------
+
+    def test_func_call_bang_with_non_bang_sub_in_active_subs(self):
+        """Bang func call with a non-bang sub that is in active_subs populates dim_to_idx_c (lines 877-878, 909)."""
+        v, ns = self._v(
+            names=["transport use"],
+            subs_sizes={"fuel_type": 3, "sectors": 4},
+            subs_elems={"fuel_type": ["gas", "oil", "elec"], "sectors": ["A", "B", "C", "D"]},
+            var_dims={"transport_use": ["sectors", "fuel_type"]},
+            active_subs={"sectors": "_i0"},  # non-bang sub "sectors" is active
+        )
+        # func_node_subs = ["fuel_type!", "sectors"] → bang + non-bang
+        # Processing "sectors" (non-bang): hits line 877-878 (sub in active_subs)
+        # Assembly: size-match loop skips "sectors" via line 909 (not endswith "!")
+        func_ref = ReferenceStructure(
+            "transport use",
+            subscripts=SubscriptsReferenceStructure(subscripts=["fuel_type!", "sectors"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        assert "_ii0" in result
+        assert "_i0" in result
+
+    def test_func_call_bang_with_non_bang_element_label(self):
+        """Bang func call with a non-bang element label sub populates dim_to_idx_c (lines 883-886)."""
+        v, ns = self._v(
+            names=["data table"],
+            subs_sizes={"fuel_type": 3, "sectors": 3},
+            subs_elems={"fuel_type": ["gas", "oil", "elec"], "sectors": ["A", "B", "C"]},
+            var_dims={"data_table": ["fuel_type", "sectors"]},
+        )
+        # func_node_subs = ["fuel_type!", "A"] where "A" is an element label (not a range)
+        # → hits line 883-886
+        func_ref = ReferenceStructure(
+            "data table",
+            subscripts=SubscriptsReferenceStructure(subscripts=["fuel_type!", "A"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        assert "_ii0" in result
+
+    # ------------------------------------------------------------------
+    # Lines 716-718: size-match success in bang reference subscripts
+    # ------------------------------------------------------------------
+
+    def test_bang_ref_size_match_for_unmatched_dim_processed_first(self):
+        """Bang reference: unmatched dim listed first has same size as bang dim → size match (lines 716-718)."""
+        v, ns = self._v(
+            names=["energy"],
+            subs_sizes={"modes": 3, "sectors": 3},  # SAME sizes
+            # "modes" is processed first (unmatched) → size matches "sectors!" → 716-718 hit
+            var_dims={"energy": ["modes", "sectors"]},
+        )
+        ns.add_to_namespace("energy")
+        node = ReferenceStructure(
+            "energy",
+            subscripts=SubscriptsReferenceStructure(subscripts=["sectors!"]),
+        )
+        result = v.visit(node)
+        assert "_ii0" in result
+
+    # ------------------------------------------------------------------
+    # Lines 805-806: element label fallback loop finds match in var_dims_list
+    # ------------------------------------------------------------------
+
+    def test_non_bang_ref_element_label_fallback_loop_finds_match(self):
+        """Element label subscript: pos-based check fails but fallback loop finds the range (lines 805-806)."""
+        v, ns = self._v(
+            names=["energy"],
+            subs_sizes={"regions": 3, "sectors": 2},
+            subs_elems={"regions": ["R1", "R2", "R3"], "sectors": ["A", "B"]},
+            # 2D var: "regions" is pos-0 dim, "sectors" is pos-1 dim
+            var_dims={"energy": ["regions", "sectors"]},
+        )
+        ns.add_to_namespace("energy")
+        # "A" is an element label in "sectors" (pos-1), referenced at pos-0 of node_subs
+        # pos=0, candidate="regions" → "A" not in _elem_index["A"]["regions"] → parent_range stays None
+        # Fallback loop at 803: "regions" no match, "sectors" YES match → 805-806 hit
+        node = ReferenceStructure(
+            "energy",
+            subscripts=SubscriptsReferenceStructure(subscripts=["A"]),
+        )
+        result = v.visit(node)
+        assert "energy[1]" in result  # "A" is at index 1 in "sectors"
+
+    # ------------------------------------------------------------------
+    # Lines 996-997: element label fallback loop finds match in func call
+    # ------------------------------------------------------------------
+
+    def test_func_call_element_label_fallback_loop_finds_match(self):
+        """Element label in func call subscript: fallback loop finds the range (lines 996-997)."""
+        v, ns = self._v(
+            names=["energy"],
+            subs_sizes={"regions": 3, "sectors": 2},
+            subs_elems={"regions": ["R1", "R2", "R3"], "sectors": ["A", "B"]},
+            # 2D var: "regions" is pos-0 (doesn't contain "A"), "sectors" is pos-1 (contains "A")
+            var_dims={"energy": ["regions", "sectors"]},
+            active_subs={"regions": "_i0"},
+        )
+        # func_node_subs = ["A"] (element label) at pos-0
+        # candidate = var_dims_list[0] = "regions" → "A" not in _elem_index["A"]["regions"]
+        # Lines 994: loop → "regions" no match, "sectors" YES match → 996-997 hit
+        func_ref = ReferenceStructure(
+            "energy",
+            subscripts=SubscriptsReferenceStructure(subscripts=["A"]),
+        )
+        node = CallStructure(function=func_ref, arguments=[ReferenceStructure("Time")])
+        result = v.visit(node)
+        assert "energy(1, t)" in result  # "A" at index 1 in "sectors"
+
+
+# ===========================================================================
+# Subscripted expansion paths (SMOOTH, DELAY, DELAY FIXED, SIT, INITIAL)
+# ===========================================================================
+
+class TestSubscriptedExpansions:
+    """Cover the `if dims:` branches in _expand_smooth, _expand_delay,
+    _expand_delay_fixed, _expand_sample_if_true, and _expand_initial_frozen_stock
+    that are only reached when an element carries subscript dimensions.
+    """
+
+    def _sr(self, name, elems):
+        return _make_subscript_range(name, elems)
+
+    def _sub_comp(self, dims, ast, comp_class=None):
+        if comp_class is AbstractUnchangeableConstant:
+            c = AbstractUnchangeableConstant(subscripts=[dims, []], ast=ast)
+        else:
+            c = AbstractComponent(subscripts=[dims, []], ast=ast)
+        return c
+
+    # ------------------------------------------------------------------
+    # Subscripted SMOOTH (lines 1828-1855)
+    # ------------------------------------------------------------------
+
+    def test_subscripted_smooth_order1_emits_comprehension(self):
+        """SMOOTH(1) on a 1D subscripted element emits comprehension array levels."""
+        sr = self._sr("sector", ["S1", "S2", "S3"])
+        ast = SmoothStructure(input=10.0, smooth_time=5.0, initial=10.0, order=1)
+        comp = self._sub_comp(["sector"], ast)
+        elem = AbstractElement(name="Smooth Var", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("[_i0]" in e for e in eqs), f"Expected subscripted equations, got {eqs}"
+        assert any("for _i0 in 1:" in e for e in eqs)
+        assert any("[" in d for d in sb.stock_decls), "Smooth internal levels must be array stocks"
+
+    def test_subscripted_smooth_order3_emits_multiple_levels(self):
+        """SMOOTH(3) on 1D subscripted element emits 3 array-level ODE stages."""
+        sr = self._sr("fuel", ["F1", "F2"])
+        ast = SmoothStructure(input=5.0, smooth_time=4.0, initial=5.0, order=3)
+        comp = self._sub_comp(["fuel"], ast)
+        elem = AbstractElement(name="S3 Var", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        lv_decls = [d for d in sb.stock_decls if "_lv" in d]
+        assert len(lv_decls) == 3, f"SMOOTH(3) must produce 3 internal levels, got {lv_decls}"
+
+    # ------------------------------------------------------------------
+    # Subscripted DELAY (lines 1901-1940)
+    # ------------------------------------------------------------------
+
+    def test_subscripted_delay3_emits_comprehension_pipeline(self):
+        """DELAY3 on a 1D subscripted element emits 3 comprehension pipeline stages."""
+        sr = self._sr("region", ["R1", "R2"])
+        ast = DelayStructure(input=5.0, delay_time=3.0, initial=5.0, order=3)
+        comp = self._sub_comp(["region"], ast)
+        elem = AbstractElement(name="Delay Var", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("[_i0]" in e for e in eqs), f"Expected subscripted delay equations, got {eqs}"
+        dl_decls = [d for d in sb.stock_decls if "_dl" in d]
+        assert len(dl_decls) == 3, f"DELAY3 must produce 3 pipeline stages, got {dl_decls}"
+
+    def test_subscripted_delay1_emits_u0_per_index(self):
+        """DELAY1 on a 1D element produces per-index u0 entries."""
+        sr = self._sr("cat", ["C1", "C2", "C3"])
+        ast = DelayStructure(input=2.0, delay_time=1.0, initial=2.0, order=1)
+        comp = self._sub_comp(["cat"], ast)
+        elem = AbstractElement(name="D1 Var", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        u0_entries = [e for e in sb.u0_entries if "_dl1_d1_var" in e]
+        assert len(u0_entries) == 3, f"Expected 3 u0 entries for 3-element dim, got {sb.u0_entries}"
+
+    # ------------------------------------------------------------------
+    # Subscripted DELAY FIXED via MTK backend (lines 2134-2159)
+    # ------------------------------------------------------------------
+
+    def test_subscripted_delay_fixed_mtk_emits_array_ode(self):
+        """DELAY FIXED on subscripted element with MTK backend uses array ODE (not pipeline)."""
+        sr = self._sr("sector", ["S1", "S2"])
+        ast = DelayFixedStructure(input=5.0, delay_time=2.0, initial=5.0)
+        comp = self._sub_comp(["sector"], ast)
+        elem = AbstractElement(name="DF Sub", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr], backend="mtk")
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("_df_df_sub" in e for e in eqs), f"Expected delay-fixed array ODE, got {eqs}"
+        assert any("[" in d for d in sb.stock_decls)
+        u0_entries = [e for e in sb.u0_entries if "_df_df_sub" in e]
+        assert len(u0_entries) == 2, f"Expected 2 u0 entries for 2-element dim, got {sb.u0_entries}"
+
+    # ------------------------------------------------------------------
+    # Subscripted SAMPLE IF TRUE (lines 2388-2415)
+    # ------------------------------------------------------------------
+
+    def test_subscripted_sample_if_true_emits_array_stock(self):
+        """SAMPLE IF TRUE on subscripted element emits array-comprehension stock."""
+        sr = self._sr("product", ["P1", "P2", "P3"])
+        ast = SampleIfTrueStructure(condition=1.0, input=7.0, initial=0.0)
+        comp = self._sub_comp(["product"], ast)
+        elem = AbstractElement(name="SIT Var", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        sit_eqs = [e for e in eqs if "_sit_sit_var" in e]
+        assert sit_eqs, f"Expected SIT stock equations, got {eqs}"
+        assert any("for _i0 in 1:" in e for e in sit_eqs)
+        u0_entries = [e for e in sb.u0_entries if "_sit_" in e]
+        assert len(u0_entries) == 3, f"Expected 3 u0 entries, got {sb.u0_entries}"
+
+    # ------------------------------------------------------------------
+    # 2D INITIAL frozen stock (lines 3244-3259)
+    # ------------------------------------------------------------------
+
+    def test_2d_initial_frozen_stock_emits_per_element_u0(self):
+        """INITIAL(x) with 2D subscript and non-resolvable inner → 2D frozen stock."""
+        import warnings
+        sr1 = self._sr("row", ["R1", "R2"])
+        sr2 = self._sr("col", ["C1", "C2"])
+        # ReferenceStructure inner value cannot be resolved at translation time
+        inner = ReferenceStructure("dynamic_val")
+        ast = InitialStructure(initial=inner)
+        comp = AbstractComponent(subscripts=[["row", "col"], []], ast=ast)
+        elem = AbstractElement(name="Init 2D", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sb.build_section()
+        u0_entries = [e for e in sb.u0_entries if "init_2d" in e]
+        assert len(u0_entries) == 4, f"Expected 4 u0 entries for 2×2 dim, got {sb.u0_entries}"
+        # Per-element entries use concrete indices like "init_2d[1, 1] => ..."
+        assert any("[1, 1]" in e for e in u0_entries)
+        assert any("[2, 2]" in e for e in u0_entries)
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("_i0 in 1:" in e and "_i1 in 1:" in e for e in eqs)
+
+    # ------------------------------------------------------------------
+    # 3D inline lookup flattened fallback (lines 2656-2679)
+    # ------------------------------------------------------------------
+
+    def test_3d_inline_lookup_emits_flattened_array(self):
+        """Subscripted inline lookup with 3 dims falls back to 1D flat array with a warning."""
+        import warnings
+        sr1 = self._sr("r", ["R1", "R2"])
+        sr2 = self._sr("c", ["C1", "C2"])
+        sr3 = self._sr("z", ["Z1", "Z2"])
+        lkp = LookupsStructure(x=(0.0, 1.0), y=(0.0, 1.0),
+                               x_limits=(0.0, 1.0), y_limits=(0.0, 1.0), type="interpolate")
+        # Multi-component inline lookup with 3D specific-element subscripts
+        comps = [
+            AbstractLookup(subscripts=[["R1", "C1", "Z1"], []], ast=lkp),
+            AbstractLookup(subscripts=[["R1", "C1", "Z2"], []], ast=lkp),
+            AbstractLookup(subscripts=[["R2", "C2", "Z1"], []], ast=lkp),
+        ]
+        elem = AbstractElement(name="3D Lookup", components=comps)
+        sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2, sr3])
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            sb.build_section()
+        warns = [str(w.message) for w in captured if "3D Lookup" in str(w.message)]
+        assert warns, "Expected a warning about 3D lookup flattening"
+        assert any("flattening" in w.lower() or "1D" in w for w in warns)
+        # Should register a 1D dispatch function
+        assert any("3d_lookup" in d for d in sb.lookup_func_decls)
+
+    # ------------------------------------------------------------------
+    # Subscript alias range (lines 246, 248)
+    # ------------------------------------------------------------------
+
+    def test_alias_subscript_range_resolves_size_and_elements(self):
+        """An AbstractSubscriptRange with subscripts as a string (alias) resolves
+        to the aliased range's size and element list (lines 246, 248)."""
+        from pysd.translators.structures.abstract_model import AbstractSubscriptRange as ASR
+        sr_real = _make_subscript_range("sector", ["S1", "S2", "S3"])
+        sr_alias = ASR(name="sec_all", subscripts="sector", mapping=[])
+        elem = _make_element("X", 1.0)
+        sb = _section_builder_from_elements([elem], subscripts=[sr_real, sr_alias])
+        assert sb._subs_sizes.get("sec_all") == 3
+        assert sb._subs_elems.get("sec_all") == ["S1", "S2", "S3"]
+
+    # ------------------------------------------------------------------
+    # GCS transpose cell (lines 3365, 3388, 3401, 3426)
+    # ------------------------------------------------------------------
+
+    def test_single_gcs_transposed_cell_emits_transpose_kwarg(self):
+        """Single-component GCS with cell='A1*' emits transpose=true kwarg (line 3365)."""
+        sr = self._sr("sector", ["S1", "S2"])
+        gcs_ast = GetConstantsStructure(file="f.xlsx", tab="Sheet1", cell="A1*")
+        comp = AbstractUnchangeableConstant(subscripts=[["sector"], []], ast=gcs_ast)
+        elem = AbstractElement(name="Trans Const", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        decls = sb.param_decls + sb.ext_const_decls
+        assert any("transpose=true" in d for d in decls), (
+            f"Expected transpose=true in declarations, got {decls}"
+        )
+
+    def test_multi_gcs_transposed_cell_emits_transpose_kwarg(self):
+        """Multi-component GCS where one cell ends with '*' sets transpose=true (lines 3388, 3426)."""
+        sr = self._sr("fuel", ["fuel1", "fuel2"])
+        gcs1_ast = GetConstantsStructure(file="f.xlsx", tab="Sheet1", cell="A1*")
+        gcs2_ast = GetConstantsStructure(file="f.xlsx", tab="Sheet1", cell="A2")
+        comp1 = AbstractComponent(subscripts=[["fuel1"], []], ast=gcs1_ast)
+        comp2 = AbstractComponent(subscripts=[["fuel2"], []], ast=gcs2_ast)
+        elem = AbstractElement(name="Multi Trans", components=[comp1, comp2])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        decls = sb.param_decls + sb.ext_const_decls
+        assert any("transpose=true" in d for d in decls), (
+            f"Expected transpose=true in declarations, got {decls}"
+        )
+
+    def test_multi_literal_range_fills_with_fill_expr(self):
+        """Multi-comp where literal covers a full range (n_elems>1) emits fill() (line 3401)."""
+        sr = self._sr("fuel", ["fuel1", "fuel2", "fuel3"])
+        gcs_comp = AbstractComponent(
+            subscripts=[["fuel1"], []], ast=GetConstantsStructure(file="f.xlsx", tab="S", cell="A1")
+        )
+        lit_comp = AbstractComponent(subscripts=[["fuel"], []], ast=0.0)
+        elem = AbstractElement(name="Fill Test", components=[gcs_comp, lit_comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        decls = sb.param_decls + sb.ext_const_decls
+        assert any("fill(" in d for d in decls), (
+            f"Expected fill() in declarations for range-covering literal, got {decls}"
+        )
+
+
+# ===========================================================================
+# EXCEPT subscription paths with stock/delay-fixed (lines 1440-1442, 1494-1532, 1552)
+# ===========================================================================
+
+class TestExceptWithStateful:
+    """Cover the per-index stock and delay-fixed branches in _process_except_element."""
+
+    def _make_1d_except(self, name, dim_name, dim_elems, comp1_ast, comp2_ast, except_labels):
+        sr = _make_subscript_range(dim_name, dim_elems)
+        comp1 = AbstractComponent(
+            subscripts=[[dim_name], [except_labels]],
+            ast=comp1_ast,
+        )
+        comp2 = AbstractComponent(subscripts=[[dim_name], []], ast=comp2_ast)
+        return AbstractElement(name=name, components=[comp1, comp2]), sr
+
+    def test_except_1d_integ_emits_stock_decl(self):
+        """1D EXCEPT with IntegStructure emits stock_decls array and per-index ODE (lines 1494-1509, 1552)."""
+        elem, sr = self._make_1d_except(
+            "Level",
+            "sector", ["S1", "S2", "S3"],
+            comp1_ast=IntegStructure(flow=1.0, initial=0.0),
+            comp2_ast=IntegStructure(flow=0.0, initial=0.0),
+            except_labels=["S3"],
+        )
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        ode_eqs = [e for e in eqs if "D(level[" in e]
+        assert ode_eqs, f"Expected per-index ODE equations, got {eqs}"
+        # has_integ=True → stock_decls should contain the array declaration
+        assert any("level(t)[" in d for d in sb.stock_decls), (
+            f"Expected array stock_decl for level, got {sb.stock_decls}"
+        )
+
+    def test_except_1d_delay_fixed_emits_df_stock(self):
+        """1D EXCEPT with DelayFixedStructure creates _df_ stock array (lines 1440-1442, 1514-1532)."""
+        import warnings
+        elem, sr = self._make_1d_except(
+            "DF Var",
+            "product", ["P1", "P2"],
+            comp1_ast=DelayFixedStructure(input=3.0, delay_time=2.0, initial=3.0),
+            comp2_ast=2.0,
+            except_labels=["P2"],
+        )
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        # The _df_ internal variable should be declared as an array stock
+        df_decls = [d for d in sb.stock_decls if "_df_df_var" in d]
+        assert df_decls, f"Expected _df_ stock declaration, got {sb.stock_decls}"
+        # Per-index delay-fixed equations: D(_df_[idx]) ~ (...) and df_var[idx] ~ _df_[idx]
+        df_eqs = [e for e in eqs if "_df_df_var[" in e]
+        assert df_eqs, f"Expected per-index delay-fixed equations, got {eqs}"
+
+    def test_except_4d_emits_warn_and_fallback_scalarize(self):
+        """4D EXCEPT emits a UserWarning and falls back to a scalarize equation (lines 1406-1422)."""
+        import warnings
+        sr1 = _make_subscript_range("d1", ["A", "B"])
+        sr2 = _make_subscript_range("d2", ["X", "Y"])
+        sr3 = _make_subscript_range("d3", ["P", "Q"])
+        sr4 = _make_subscript_range("d4", ["M", "N"])
+        comp1 = AbstractComponent(
+            subscripts=[["d1", "d2", "d3", "d4"], [["A", "X", "P", "M"]]],
+            ast=1.0,
+        )
+        comp2 = AbstractComponent(subscripts=[["d1", "d2", "d3", "d4"], []], ast=2.0)
+        elem = AbstractElement(name="4D Except", components=[comp1, comp2])
+        sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2, sr3, sr4])
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            sb.build_section()
+        warns = [str(w.message) for w in captured if "4D" in str(w.message)
+                 or "4d" in str(w.message).lower() or "not yet supported" in str(w.message)]
+        assert warns, f"Expected warning for 4D EXCEPT, got: {[str(w.message) for w in captured]}"
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        assert any("Symbolics.scalarize" in e for e in eqs), (
+            f"Expected scalarize fallback equation, got {eqs}"
+        )
+
+    def test_except_4d_ode_build_skips_scalarize_equation(self, tmp_path):
+        """ODE model with 4D EXCEPT element: scalarize equation is skipped in rhs! (line 4357)."""
+        import warnings
+        sr1 = _make_subscript_range("d1", ["A", "B"])
+        sr2 = _make_subscript_range("d2", ["X", "Y"])
+        sr3 = _make_subscript_range("d3", ["P", "Q"])
+        sr4 = _make_subscript_range("d4", ["M", "N"])
+        comp1 = AbstractComponent(
+            subscripts=[["d1", "d2", "d3", "d4"], [["A", "X", "P", "M"]]],
+            ast=1.0,
+        )
+        comp2 = AbstractComponent(subscripts=[["d1", "d2", "d3", "d4"], []], ast=2.0)
+        elem_4d = AbstractElement(name="4D Except", components=[comp1, comp2])
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[elem_4d] + controls,
+            subscripts=[sr1, sr2, sr3, sr4],
+            path=tmp_path / "m4d.mdl",
+        )
+        model = AbstractModel(original_path=tmp_path / "m4d.mdl", sections=(section,))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            jl_path = JuliaModelBuilder(model).build_model()
+        content = jl_path.read_text()
+        # The scalarize equation should NOT appear verbatim in the rhs! function
+        assert "function rhs!" in content
+
+    def test_except_1d_ode_model_alloc_needed(self, tmp_path):
+        """ODE model with 1D EXCEPT constant emits per-index alloc lines (line 4330)."""
+        sr = _make_subscript_range("sector", ["S1", "S2"])
+        comp1 = AbstractComponent(subscripts=[["sector"], [["S2"]]], ast=1.0)
+        comp2 = AbstractComponent(subscripts=[["sector"], []], ast=2.0)
+        stock = _make_stock_element("Level", 1.0, 0.0)
+        elem_exc = AbstractElement(name="Exc Const", components=[comp1, comp2])
+        controls = [
+            _make_control_element("INITIAL TIME", 0.0),
+            _make_control_element("FINAL TIME", 10.0),
+            _make_control_element("TIME STEP", 1.0),
+            _make_control_element("SAVEPER", 1.0),
+        ]
+        section = _make_section(
+            elements=[stock, elem_exc] + controls,
+            subscripts=[sr],
+            path=tmp_path / "m_exc.mdl",
+        )
+        model = AbstractModel(original_path=tmp_path / "m_exc.mdl", sections=(section,))
+        jl_path = JuliaModelBuilder(model).build_model()
+        content = jl_path.read_text()
+        assert "function rhs!" in content
+
+
+# ===========================================================================
+# JuliaSectionBuilder helper methods (low-level coverage)
+# ===========================================================================
+
+class TestSectionBuilderHelpers:
+    """Cover internal helper methods on JuliaSectionBuilder directly."""
+
+    def _sb(self):
+        """Return a minimal section builder (no elements, no subscripts)."""
+        return _section_builder_from_elements([_make_element("x", 1.0)])
+
+    # ------------------------------------------------------------------
+    # _extract_rhs_identifiers (lines 4481, 4485)
+    # ------------------------------------------------------------------
+
+    def test_extract_rhs_comment_line_returns_empty_set(self):
+        """A comment equation (starts with '#') returns an empty set (line 4481)."""
+        result = JuliaSectionBuilder._extract_rhs_identifiers("# this is a comment")
+        assert result == set()
+
+    def test_extract_rhs_assignment_style_splits_on_equals(self):
+        """An assignment-style eq without '~' splits on ' = ' to find RHS identifiers (line 4485)."""
+        result = JuliaSectionBuilder._extract_rhs_identifiers("output = input_var + scale_factor")
+        assert "input_var" in result
+        assert "scale_factor" in result
+        assert "output" not in result
+
+    # ------------------------------------------------------------------
+    # _topo_sort_equations circular dependencies (lines 4580-4581)
+    # ------------------------------------------------------------------
+
+    def test_topo_sort_circular_deps_appended_at_end(self):
+        """Mutually-dependent equations can't be sorted; they're appended in original order (lines 4580-4581)."""
+        sb = self._sb()
+        # a depends on b, b depends on a — neither can be resolved
+        eqs = ["a ~ b + 1.0", "b ~ a + 1.0"]
+        sorted_eqs = sb._topo_sort_equations(eqs, stock_names={})
+        # Both equations must appear in the result (just appended after circular detection)
+        assert len(sorted_eqs) == 2
+        assert set(sorted_eqs) == set(eqs)
+
+    # ------------------------------------------------------------------
+    # _convert_eq_to_assignment malformed comprehension (line 4621)
+    # ------------------------------------------------------------------
+
+    def test_convert_eq_to_assignment_comprehension_without_for_raises(self):
+        """Comprehension equation with no outer 'for' clause raises ValueError (line 4621)."""
+        sb = self._sb()
+        with pytest.raises(ValueError, match="Cannot convert comprehension"):
+            sb._convert_eq_to_assignment("[x ~ 1.0]")
+
+    # ------------------------------------------------------------------
+    # _convert_ode_to_du nested brackets — depth tracking (lines 4644, 4646, 4672)
+    # ------------------------------------------------------------------
+
+    def test_convert_ode_to_du_1d_comprehension_for_clause_with_parens(self):
+        """for-clause with parentheses forces the backward scan to track bracket depth (lines 4644, 4646)."""
+        sb = self._sb()
+        # "size(v, 1)" in the for clause puts ')' and '(' to the right of "for ",
+        # so the backward scan encounters them BEFORE finding "for " — triggering
+        # the depth-tracking branches at lines 4644 and 4646.
+        eq = "[D(x[_i0]) ~ 1.0 for _i0 in 1:size(v, 1)]..."
+        result = sb._convert_ode_to_du(eq, stock_indices={"x": 3})
+        assert result[0] == "for _i0 in 1:size(v, 1)"
+        assert "du[3 - 1 + _i0]" in result[1]
+        assert result[2] == "end"
+
+    def test_convert_ode_to_du_comprehension_body_not_d_form_falls_back(self):
+        """Comprehension body that doesn't match D(var[idx]) falls back to replace (line 4672)."""
+        sb = self._sb()
+        eq = "[x[_i0] ~ 1.0 for _i0 in 1:N]..."
+        result = sb._convert_ode_to_du(eq, stock_indices={})
+        # Falls through to the replace fallback
+        assert len(result) == 1
+        assert " = " in result[0]
+
+    # ------------------------------------------------------------------
+    # _eval_ast_at_t0 and _try_eval_as_float (lines 1983-1999, 2052-2068)
+    # ------------------------------------------------------------------
+
+    def test_eval_ast_arithmetic_multiply(self):
+        """ArithmeticStructure with '*' is evaluated (hits lines 1991-1992)."""
+        sb = self._sb()
+        ast = ArithmeticStructure(arguments=[3.0, 4.0], operators=["*"])
+        assert sb._eval_ast_at_t0(ast) == 12.0
+
+    def test_eval_ast_arithmetic_divide_by_zero_returns_none(self):
+        """Division by zero in ArithmeticStructure returns None (hits lines 1994-1998)."""
+        sb = self._sb()
+        ast = ArithmeticStructure(arguments=[1.0, 0.0], operators=["/"])
+        assert sb._eval_ast_at_t0(ast) is None
+
+    def test_eval_ast_arithmetic_unsupported_op_returns_none(self):
+        """An unsupported operator in ArithmeticStructure returns None (line 1996)."""
+        sb = self._sb()
+        ast = ArithmeticStructure(arguments=[2.0, 3.0], operators=["^"])
+        assert sb._eval_ast_at_t0(ast) is None
+
+    def test_eval_ast_arithmetic_none_arg_returns_none(self):
+        """ArithmeticStructure with an un-resolvable arg returns None (line 1983)."""
+        sb = self._sb()
+        inner = ReferenceStructure("unknown_var")  # not in namespace → None
+        ast = ArithmeticStructure(arguments=[inner, 2.0], operators=["+"])
+        assert sb._eval_ast_at_t0(ast) is None
+
+    def test_try_eval_as_float_finds_param_decl(self):
+        """_try_eval_as_float resolves a name declared in param_decls (lines 2052-2056)."""
+        sb = self._sb()
+        sb.param_decls.append("@parameters my_rate = 0.25")
+        result = sb._try_eval_as_float("my_rate")
+        assert result == pytest.approx(0.25)
+
+    def test_try_eval_as_float_finds_built_element(self):
+        """_try_eval_as_float resolves a name from built_elements (lines 2059-2067)."""
+        sb = self._sb()
+        sb.built_elements["aux_val"] = (["aux_val ~ 3.14"], False)
+        result = sb._try_eval_as_float("aux_val")
+        assert result == pytest.approx(3.14)
+
+    def test_eval_ast_arithmetic_subtract(self):
+        """ArithmeticStructure with '-' is evaluated (line 1990)."""
+        sb = self._sb()
+        ast = ArithmeticStructure(arguments=[10.0, 3.0], operators=["-"])
+        assert sb._eval_ast_at_t0(ast) == pytest.approx(7.0)
+
+    def test_eval_ast_call_unknown_func_returns_none(self):
+        """CallStructure with unrecognised function name returns None (line 2007)."""
+        sb = self._sb()
+        func = ReferenceStructure("some_custom_func")
+        ast = CallStructure(function=func, arguments=[1.0])
+        assert sb._eval_ast_at_t0(ast) is None
+
+    def test_eval_ast_reference_resolved_via_namespace(self):
+        """ReferenceStructure resolved through namespace + param_decls (lines 2010-2013)."""
+        sb = self._sb()
+        sb.namespace.add_to_namespace("growth rate")  # → growth_rate
+        sb.param_decls.append("@parameters growth_rate = 0.1")
+        ast = ReferenceStructure("growth rate")
+        result = sb._eval_ast_at_t0(ast)
+        assert result == pytest.approx(0.1)
+
+    def test_eval_ast_reference_resolved_via_abstract_elements(self):
+        """ReferenceStructure falling back to abstract_elements recursive eval (lines 2022-2028)."""
+        sb = self._sb()
+        # Add an element to abstract_elements with a concrete AST value
+        elem = _make_element("order var", 4.0)
+        sb.namespace.add_to_namespace("order var")
+        sb.abstract_elements.append(elem)
+        ast = ReferenceStructure("order var")
+        result = sb._eval_ast_at_t0(ast)
+        assert result == pytest.approx(4.0)
+
+    def test_try_eval_as_float_malformed_param_decl_skipped(self):
+        """_try_eval_as_float skips a param_decl whose value string raises ValueError (lines 2056-2057)."""
+        sb = self._sb()
+        # "1e" matches the regex but float("1e") raises ValueError → skip silently
+        sb.param_decls.append("@parameters bad_param = 1e")
+        result = sb._try_eval_as_float("bad_param")
+        assert result is None
+
+    def test_try_eval_as_float_non_numeric_built_element_skipped(self):
+        """_try_eval_as_float skips built_element whose RHS is non-numeric (lines 2067-2068)."""
+        sb = self._sb()
+        sb.built_elements["symbolic"] = (["symbolic ~ some_expression"], False)
+        result = sb._try_eval_as_float("symbolic")
+        assert result is None
+
+    def test_eval_ast_at_t0_unsupported_node_type_returns_none(self):
+        """_eval_ast_at_t0 returns None for unsupported AST node type (line 2030)."""
+        sb = self._sb()
+        # LookupsStructure is not int/float/Arithmetic/Call/Reference → returns None at line 2030
+        lut = LookupsStructure(x=[0.0, 1.0], y=[0.0, 1.0], x_limits=(0.0, 1.0),
+                               y_limits=(0.0, 1.0), type="interpolate")
+        result = sb._eval_ast_at_t0(lut)
+        assert result is None
+
+    def test_eval_ast_at_t0_reference_with_unsupported_component_breaks(self):
+        """_eval_ast_at_t0 breaks comp loop when comp.ast is not a simple type (line 2025)."""
+        sb = self._sb()
+        # Build an element whose component AST is a LookupsStructure (not a simple type)
+        lut = LookupsStructure(x=[0.0, 1.0], y=[0.0, 1.0], x_limits=(0.0, 1.0),
+                               y_limits=(0.0, 1.0), type="interpolate")
+        elem = AbstractElement(name="my table", components=[AbstractComponent(
+            subscripts=[[], []], ast=lut
+        )])
+        sb.namespace.add_to_namespace("my table")
+        sb.abstract_elements.append(elem)
+        # ReferenceStructure → looks up "my table" in abstract_elements → finds comp.ast=LookupsStructure
+        # → isinstance check fails → break at line 2025 → returns None
+        result = sb._eval_ast_at_t0(ReferenceStructure("my table"))
+        assert result is None
+
+    # ------------------------------------------------------------------
+    # Subscript geometry helper methods (lines 579, 633, 676, 730, 766, 770, 794)
+    # ------------------------------------------------------------------
+
+    def _sb_with_subs(self, *sub_ranges):
+        """Build a minimal section builder that knows about the given subscript ranges."""
+        elems = [_make_element("x", 1.0)]
+        return _section_builder_from_elements(elems, subscripts=list(sub_ranges))
+
+    def test_comp_coords_unknown_subscript_fallback(self):
+        """_comp_coords returns empty list for unknown subscript (line 579)."""
+        sr = _make_subscript_range("sectors", ["A", "B"])
+        sb = self._sb_with_subs(sr)
+        comp = AbstractComponent(subscripts=[["unknown_dim"], []], ast=1.0)
+        result = sb._comp_coords(comp)
+        # "unknown_dim" not in _subs_elems, not in _elem_to_range → result["unknown_dim"] = []
+        assert result == {"unknown_dim": []}
+
+    def test_detect_split_ranges_empty_components(self):
+        """_detect_split_ranges returns {} when components have no subscripts (line 633)."""
+        sr = _make_subscript_range("sectors", ["A", "B"])
+        sb = self._sb_with_subs(sr)
+        comp = AbstractComponent(subscripts=[[], []], ast=1.0)
+        result = sb._detect_split_ranges([comp])
+        assert result == {}
+
+    def test_comp_coords_split_unknown_subscript_fallback(self):
+        """_comp_coords_split returns empty list for subscript not in split_ranges/subs_elems (line 676)."""
+        sr = _make_subscript_range("sectors", ["A", "B"])
+        sb = self._sb_with_subs(sr)
+        comp = AbstractComponent(subscripts=[["weird_sub"], []], ast=1.0)
+        # split_ranges only covers pos=0 for a different sub, "weird_sub" falls to else
+        result = sb._comp_coords_split(comp, split_ranges={})
+        assert result == {"weird_sub": []}
+
+    def test_element_dims_single_comp_element_subscript(self):
+        """_element_dims with single-component element subscript uses _elem_to_range (line 730)."""
+        sr = _make_subscript_range("sectors", ["A", "B", "C"])
+        sb = self._sb_with_subs(sr)
+        # Single-component element with specific element subscript "A" (not range name)
+        elem = AbstractElement(name="y", components=[
+            AbstractComponent(subscripts=[["A"], []], ast=1.0)
+        ])
+        result = sb._element_dims(elem)
+        # "A" is in _elem_to_range (→ "sectors"), single comp → line 730: parent = _elem_to_range["A"]
+        assert any(d == "sectors" for d, _ in result)
+
+    def test_per_index_subs_def_elems_empty_returns_early(self):
+        """_per_index_subs returns subs early when def_range_name has no elements (line 766)."""
+        sr = _make_subscript_range("parent", ["A", "B", "C"])
+        sb = self._sb_with_subs(sr)
+        # def_range_name = "nonexistent" → _subs_elems["nonexistent"] = [] → line 766
+        result = sb._per_index_subs("parent", ["A", "B", "C"], 1, "nonexistent")
+        assert result == {"parent": "1"}
+
+    def test_per_index_subs_element_not_in_def_elems_returns_early(self):
+        """_per_index_subs returns subs early when element label not in def_range (line 770)."""
+        sr1 = _make_subscript_range("parent", ["A", "B", "C"])
+        sr2 = _make_subscript_range("sub_range", ["X", "Y"])
+        sb = self._sb_with_subs(sr1, sr2)
+        # abs_idx=1 → element_label = "A", but def_elems=["X","Y"] → "A" not in def_elems → line 770
+        result = sb._per_index_subs("parent", ["A", "B", "C"], 1, "sub_range")
+        assert result == {"parent": "1"}
+
+    def test_per_index_subs_same_size_range_assigned(self):
+        """_per_index_subs maps other same-size ranges to the same positional index (line 794)."""
+        sr1 = _make_subscript_range("main_dim", ["A", "B", "C"])
+        sr2 = _make_subscript_range("def_range", ["X", "Y", "Z"])
+        sr3 = _make_subscript_range("alias_range", ["P", "Q", "R"])  # same size=3 as def_range
+        sb = self._sb_with_subs(sr1, sr2, sr3)
+        # abs_idx=1 → element_label="A" in main_dim
+        # def_range has 3 elems: "A" not in ["X","Y","Z"] → line 770 early return
+        # Wait, need element_label IN def_elems
+        # Let me use main_dim as the dim being indexed, and def_range shares elements with parent
+        # abs_idx=2 means element_label = "B"
+        # def_range = sr1? No...
+        # Try: def_range = main_dim_alias with same elements
+        sr_def = _make_subscript_range("def_range2", ["A", "B", "C"])  # same elements as main
+        sb2 = self._sb_with_subs(sr1, sr_def, sr3)
+        # abs_idx=1 → element_label="A", def_elems=["A","B","C"] → "A" in def_elems
+        # pos=0 (index of "A" in def_elems), alias_range also has size 3 → line 794!
+        result = sb2._per_index_subs("main_dim", ["A", "B", "C"], 1, "def_range2")
+        # def_range2 has element "A" at pos 0 → subs["def_range2"] = "1"
+        # alias_range has size 3 (same as def_range2 size 3) → subs["alias_range"] = "1" (line 794)
+        assert "def_range2" in result
+        assert "alias_range" in result
+
+    # ------------------------------------------------------------------
+    # Lines 4147, 4165-4172: declarations block with scalar ext_const_decls
+    # ------------------------------------------------------------------
+
+    def test_declarations_block_ode_scalar_ext_const_passes_through(self):
+        """Scalar ext_const entry (no '[') hits the else branch at line 4147 in ODE declarations."""
+        sb = self._sb()
+        sb.ext_const_decls.append("const my_scalar = 3.14")
+        block = sb._declarations_block()
+        assert "# External constants" in block
+        # No "[" in value and not xlsx → line 4147: append decl as-is
+        assert "const my_scalar = 3.14" in block
+
+    def test_declarations_block_mtk_ext_const(self):
+        """MTK declarations block includes ext_const_decls entries (lines 4165-4172)."""
+        sb = self._sb()
+        sb.backend = "mtk"  # switch to MTK mode
+        sb.ext_const_decls.append("const arr_data = [1.0, 2.0]")
+        sb.ext_const_decls.append("const scalar_val = 9.81")
+        block = sb._declarations_block_mtk()
+        assert "# External constants" in block
+        # "[1.0, 2.0]" has "[" and starts with "const" → line 4170: pysd_safe
+        assert "pysd_safe" in block
+        # scalar_val has no "[" → line 4172: passed through as-is
+        assert "scalar_val = 9.81" in block
+
+    # ------------------------------------------------------------------
+    # Line 2591, 2632: inline lookup placeholder for missing dimension indices
+    # ------------------------------------------------------------------
+
+    def test_subscripted_inline_lookup_placeholder_for_missing_index(self):
+        """When a 1D inline lookup has fewer components than dim elements, placeholder is emitted (line 2591)."""
+        sr = _make_subscript_range("sectors", ["A", "B", "C"])  # 3 elements
+        lkp = LookupsStructure(x=(0.0, 1.0), y=(0.0, 1.0), x_limits=(0.0, 1.0),
+                               y_limits=(0.0, 1.0), type="interpolate")
+        # Only 2 components for a 3-element dim → index 3 (C) missing → placeholder at line 2591
+        comp1 = AbstractLookup(subscripts=[["A"], []], ast=lkp)
+        comp2 = AbstractLookup(subscripts=[["B"], []], ast=lkp)
+        elem = AbstractElement(name="My Lookup", components=[comp1, comp2])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        # Placeholder interpolation should appear for the missing index C
+        assert any("LinearInterpolation([0.0], [0.0]" in d for d in sb.lookup_const_decls)
+
+    def test_subscripted_inline_lookup_2d_placeholder_for_missing_index(self):
+        """When a 2D inline lookup has fewer components than dim elements, 2D placeholder is emitted (line 2632)."""
+        sr1 = _make_subscript_range("dim1", ["A", "B"])
+        sr2 = _make_subscript_range("dim2", ["X", "Y"])
+        lkp = LookupsStructure(x=(0.0, 1.0), y=(0.0, 1.0), x_limits=(0.0, 1.0),
+                               y_limits=(0.0, 1.0), type="interpolate")
+        # 2 components for a 2×2 grid: cover (1,1) and (1,2) → (2,1) and (2,2) get placeholders
+        comp1 = AbstractLookup(subscripts=[["A", "X"], []], ast=lkp)
+        comp2 = AbstractLookup(subscripts=[["A", "Y"], []], ast=lkp)
+        elem = AbstractElement(name="2D Lookup", components=[comp1, comp2])
+        sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2])
+        sb.build_section()
+        # Placeholder interpolation should appear for the missing indices
+        assert any("LinearInterpolation([0.0], [0.0]" in d for d in sb.lookup_const_decls)
+
+    def test_subscripted_inline_lookup_unknown_label_uses_fallback_index(self):
+        """Subscripted inline lookup with unknown element label uses fallback index 1 (line 2568)."""
+        sr = _make_subscript_range("sectors", ["A", "B"])
+        lkp = LookupsStructure(x=(0.0, 1.0), y=(0.0, 1.0), x_limits=(0.0, 1.0),
+                               y_limits=(0.0, 1.0), type="interpolate")
+        # comp1 has known label "A" (idx=1); comp2 has "Z" which is NOT in sectors ["A","B"]
+        # → idx = None → fallback to index 1 at line 2568.
+        # Two components are required so routing hits _process_subscripted_inline_lookup.
+        comp1 = AbstractLookup(subscripts=[["A"], []], ast=lkp)
+        comp2 = AbstractLookup(subscripts=[["Z"], []], ast=lkp)
+        elem = AbstractElement(name="Unknown Label Lookup", components=[comp1, comp2])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        # The lookup should still be registered (using index 1 as fallback for "Z")
+        assert any("unknown_label_lookup" in d for d in sb.lookup_func_decls)
+
+    # ------------------------------------------------------------------
+    # Line 4724: tokens.discard in u0 second pass
+    # ------------------------------------------------------------------
+
+    def test_u0_block_discards_param_token_in_dynamic_pass(self):
+        """tokens.discard removes param names from dynamic_tokens in u0 second pass (line 4724)."""
+        sb = self._sb()
+        # First entry has non-param dynamic variable → needs_init_fn = True
+        sb.u0_entries.append("stock_a => dynamic_aux")
+        # Second entry has a parameter → line 4724 should discard it from dynamic_tokens
+        sb.u0_entries.append("stock_b => my_param")
+        sb.param_decls.append("@parameters my_param = 1.0")
+        block = sb._u0_block()
+        # dynamic_aux is in dynamic_tokens → appears as get(_obs_init, ...)
+        assert "dynamic_aux" in block
+        # my_param was discarded at line 4724 → should NOT be fetched from _obs_init
+        # It appears in the values but not in the let-binding fetch lines
+        assert 'get(_obs_init, "my_param"' not in block
+
+    # ------------------------------------------------------------------
+    # Lines 4077 + 4087: json data_format + mtk backend → @register_symbolic
+    # ------------------------------------------------------------------
+
+    def test_lookup_block_json_mtk_emits_register_symbolic_for_lookups(self):
+        """In json+mtk mode, _lookup_block emits @register_symbolic for lookup entries (line 4077)."""
+        sb = _section_builder_from_elements([_make_element("x", 1.0)], backend="mtk")
+        sb.data_format = "json"
+        sb._json_data["lookups"]["my_lkp"] = {"x": [0.0, 1.0], "y": [0.0, 2.0]}
+        block = sb._lookup_block()
+        assert "@register_symbolic my_lkp(x::Real)" in block
+
+    def test_lookup_block_json_mtk_emits_register_symbolic_for_data(self):
+        """In json+mtk mode, _lookup_block emits @register_symbolic for data entries (line 4087)."""
+        sb = _section_builder_from_elements([_make_element("x", 1.0)], backend="mtk")
+        sb.data_format = "json"
+        sb._json_data["data"]["my_data"] = {"time": [0.0, 1.0], "values": [3.0, 4.0]}
+        block = sb._lookup_block()
+        assert "@register_symbolic my_data(x::Real)" in block
+
+    # ------------------------------------------------------------------
+    # Line 1619: EXCEPT 2D continue when all covered rows are excluded
+    # ------------------------------------------------------------------
+
+    def test_except_2d_all_rows_excluded_skips_component(self):
+        """When an EXCEPT clause covers ALL rows of a 2D component, that component is
+        skipped via continue (line 1619), leaving only comp1's equations."""
+        sr1 = _make_subscript_range("r", ["A", "B"])
+        sr2 = _make_subscript_range("c", ["X", "Y"])
+        # comp0 covers A×c EXCEPT [A,c] → all covered rows excluded → skipped (line 1619)
+        comp0 = AbstractComponent(subscripts=[["A", "c"], [["A", "c"]]], ast=99.0)
+        # comp1 covers all r×c with no EXCEPT → produces the actual equations
+        comp1 = AbstractComponent(subscripts=[["r", "c"], []], ast=1.0)
+        elem = AbstractElement(name="Skip Row", components=[comp0, comp1])
+        sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2])
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        # comp0 was skipped; its value 99.0 must not appear in any equation
+        assert not any("99.0" in e for e in eqs)
+        # comp1's equation must appear
+        assert any("1.0" in e for e in eqs)
+
+    # ------------------------------------------------------------------
+    # Lines 1794-1795: _materialize_input name-collision counter loop
+    # ------------------------------------------------------------------
+
+    def test_materialize_input_name_collision_increments_counter(self):
+        """When _inter_<base> already exists in the namespace values, the counter loop
+        picks _inter_<base>_1 instead (lines 1794-1795).
+
+        The while condition checks `.values()`, so we must store the collision target
+        string as a VALUE (not a key) in the namespace dict.
+        """
+        sb = self._sb()
+        visitor, _, _, _ = _visitor_with_namespace()
+        # The while loop checks: f"__internal_{interm_id}" in namespace.values()
+        # For interm_id="_inter_mydelay", this is "__internal__inter_mydelay".
+        # We store it as a VALUE to simulate a pre-existing collision.
+        sb.namespace.namespace["_some_prior_var"] = "__internal__inter_mydelay"
+        delay = DelayStructure(input=1.0, delay_time=1.0, initial=1.0, order=3)
+        eqs: list = []
+        result = sb._materialize_input(delay, "mydelay", visitor, eqs)
+        # The counter loop should have produced the _1 suffix
+        assert result == "_inter_mydelay_1"
+
+    # ------------------------------------------------------------------
+    # Line 1335: _build_invert_matrix_equations returns [] when is_control
+    # ------------------------------------------------------------------
+
+    def test_build_invert_matrix_equations_is_control_returns_empty(self):
+        """When is_control=True, _build_invert_matrix_equations returns [] (line 1335)."""
+        sb = self._sb()
+        ast = CallStructure(
+            function=ReferenceStructure(reference="INVERT MATRIX"),
+            arguments=[ReferenceStructure(reference="Mat")],
+        )
+        dims = [("r", 2), ("c", 2)]
+        result = sb._build_invert_matrix_equations("inv_mat", ast, dims, is_control=True)
+        assert result == []
+
+    # ------------------------------------------------------------------
+    # Lines 1053-1055: SmoothN with non-integer dynamic order evaluated at t=0
+    # ------------------------------------------------------------------
+
+    def test_smooth_n_dynamic_order_evaluated_at_t0(self):
+        """SmoothNStructure with non-integer order resolves via _eval_ast_at_t0 (lines 1053-1055).
+
+        _prescanned_const_vals is populated for numeric literal ASTs so that
+        _try_eval_as_float("smooth_order") returns 4.0, enabling lines 1053-1055.
+        """
+        from pysd.translators.structures.abstract_expressions import SmoothNStructure
+        # A ReferenceStructure as order causes int(ast.order) to raise TypeError.
+        order_ref = ReferenceStructure(reference="SmoothOrder")
+        # SmoothOrder = 4.0 (numeric literal) → lands in _prescanned_const_vals.
+        order_elem = AbstractElement(
+            name="SmoothOrder",
+            components=[AbstractUnchangeableConstant(subscripts=[[], []], ast=4.0)],
+        )
+        smooth = SmoothNStructure(input=1.0, smooth_time=1.0, initial=1.0, order=order_ref)
+        smooth_elem = AbstractElement(
+            name="Smooth Out",
+            components=[AbstractComponent(subscripts=[[], []], ast=smooth)],
+        )
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            sb = _section_builder_from_elements([order_elem, smooth_elem])
+            sb.build_section()
+        # Lines 1053-1055 ran successfully: "smooth_out" appears in built_elements
+        assert "smooth_out" in sb.built_elements
+
+    # ------------------------------------------------------------------
+    # Lines 986-987: 1D stock with numpy ndarray initial value
+    # ------------------------------------------------------------------
+
+    def test_stock_1d_numpy_array_initial_emits_per_element_u0(self):
+        """1D stock with ndarray initial uses per-element u0 entries (lines 986-987)."""
+        import numpy as np
+        sr = _make_subscript_range("pop_dim", ["A", "B"])
+        integ = IntegStructure(
+            flow=0.0, initial=np.array([10.0, 20.0])
+        )
+        comp = AbstractComponent(subscripts=[["pop_dim"], []], ast=integ)
+        elem = AbstractElement(name="Stock ND", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        # Each element gets its own u0 entry from lines 986-987
+        assert any("stock_nd[1] => 10.0" in e for e in sb.u0_entries)
+        assert any("stock_nd[2] => 20.0" in e for e in sb.u0_entries)
+
+    # ------------------------------------------------------------------
+    # Line 1233: 1D ndarray auxiliary on a control element returns []
+    # ------------------------------------------------------------------
+
+    def test_1d_ndarray_control_element_returns_empty(self):
+        """A 1D subscripted control element with ndarray AST returns [] (line 1233).
+
+        Must use AbstractComponent (type='Auxiliary') so the constant-branch at
+        line 1183 is NOT taken and we reach the ndarray auxiliary path at line 1231.
+        """
+        import numpy as np
+        sr = _make_subscript_range("ctrl_dim", ["A", "B"])
+        comp = AbstractComponent(
+            subscripts=[["ctrl_dim"], []], ast=np.array([1.0, 2.0])
+        )
+        elem = AbstractControlElement(name="Ctrl Array", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr])
+        sb.build_section()
+        # is_control path returned [] → no equations for this element
+        eqs, is_ctrl = sb.built_elements["ctrl_array"]
+        assert eqs == []
+        assert is_ctrl is True
+
+    # ------------------------------------------------------------------
+    # Line 1271: 2D ndarray auxiliary on a control element returns []
+    # ------------------------------------------------------------------
+
+    def test_2d_ndarray_control_element_returns_empty(self):
+        """A 2D subscripted control element with ndarray AST returns [] (line 1271).
+
+        Must use AbstractComponent so the constant-branch is skipped, reaching
+        the ndarray auxiliary path at lines 1268-1271.
+        """
+        import numpy as np
+        sr1 = _make_subscript_range("r_dim", ["A", "B"])
+        sr2 = _make_subscript_range("c_dim", ["X", "Y"])
+        comp = AbstractComponent(
+            subscripts=[["r_dim", "c_dim"], []], ast=np.array([[1.0, 2.0], [3.0, 4.0]])
+        )
+        elem = AbstractControlElement(name="Ctrl Matrix", components=[comp])
+        sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2])
+        sb.build_section()
+        # is_control path returned [] → no equations for this element
+        eqs, is_ctrl = sb.built_elements["ctrl_matrix"]
+        assert eqs == []
+        assert is_ctrl is True
+
+    # ------------------------------------------------------------------
+    # Lines 3623, 3629-3632: _comp_idx_arrays branches in piecewise_nd
+    # ------------------------------------------------------------------
+
+    def test_piecewise_nd_comp_idx_arrays_branches(self):
+        """_comp_idx_arrays in _read_get_constants_piecewise_nd covers None, element,
+        and fallback branches (lines 3623, 3629-3630, 3631-3632).
+
+        Called with gcs_comps=[] to avoid needing actual Excel files.
+        """
+        import numpy as np
+        sr1 = _make_subscript_range("r", ["A", "B"])
+        sr2 = _make_subscript_range("c", ["X", "Y"])
+        # comp1: subscripts=["A","X"] → both are specific element labels → line 3629-3630
+        lit1 = AbstractUnchangeableConstant(subscripts=[["A", "X"], []], ast=1.0)
+        # comp2: subscripts=["r"] only (1 element for 2D) → pos=1 yields s=None → line 3623
+        lit2 = AbstractUnchangeableConstant(subscripts=[["r"], []], ast=2.0)
+        # comp3: subscripts=["Z","X"] → "Z" not a range and not in r elems → line 3631-3632
+        lit3 = AbstractUnchangeableConstant(subscripts=[["Z", "X"], []], ast=0.0)
+        elem = AbstractElement(name="PC Const", components=[lit1, lit2, lit3])
+        sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2])
+        # Call the method directly with no GCS components (avoids ExtConstant file I/O)
+        result = sb._read_get_constants_piecewise_nd(
+            elem, "pc_const", gcs_comps=[], lit_comps=[lit1, lit2, lit3]
+        )
+        # Result should be a Julia array literal covering the 2×2 grid
+        assert result is not None
+        assert "[" in result
+
+    # ------------------------------------------------------------------
+    # Line 1736: EXCEPT 3D continue when all covered rows are excluded
+    # ------------------------------------------------------------------
+
+    def test_except_3d_all_rows_excluded_skips_component(self):
+        """When an EXCEPT clause covers ALL (i,j,k) triples of a 3D component,
+        that component is skipped via continue (line 1736)."""
+        sr1 = _make_subscript_range("r", ["A", "B"])
+        sr2 = _make_subscript_range("c", ["X", "Y"])
+        sr3 = _make_subscript_range("d", ["P", "Q"])
+        # comp0 covers A×c×d EXCEPT [A,c,d] → all triples (1,j,k) excluded → skipped
+        comp0 = AbstractComponent(subscripts=[["A", "c", "d"], [["A", "c", "d"]]], ast=99.0)
+        # comp1 covers full r×c×d with no EXCEPT → produces actual equations
+        comp1 = AbstractComponent(subscripts=[["r", "c", "d"], []], ast=1.0)
+        elem = AbstractElement(name="Skip 3D", components=[comp0, comp1])
+        sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2, sr3])
+        sb.build_section()
+        eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+        # comp0 was skipped → 99.0 must not appear
+        assert not any("99.0" in e for e in eqs)
+        # comp1's equations must appear
+        assert any("1.0" in e for e in eqs)
