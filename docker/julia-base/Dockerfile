@@ -20,8 +20,6 @@ ENV JULIA_DEPOT_PATH=/opt/julia-depot
 RUN julia --startup-file=no -e '\
     using Pkg; \
     Pkg.add([ \
-        "ModelingToolkit", \
-        "Symbolics", \
         "OrdinaryDiffEq", \
         "OrdinaryDiffEqLowOrderRK", \
         "DataInterpolations", \
