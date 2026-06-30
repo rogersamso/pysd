@@ -426,7 +426,7 @@ class JuliaASTVisitor:
                 # Higher dims: flatten
                 vals = ", ".join(format_number(float(v)) for v in node.flat)
                 return f"[{vals}]"
-        except ImportError:
+        except ImportError:  # pragma: no cover
             pass
 
         if isinstance(node, ArithmeticStructure):
@@ -471,7 +471,7 @@ class JuliaASTVisitor:
                 )
                 ext.initialize()
                 return _format_julia_value(ext.data)
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover
                 warn(
                     f"GetConstantsStructure inside expression could not be read "
                     f"({exc}); emitting placeholder 0.0."

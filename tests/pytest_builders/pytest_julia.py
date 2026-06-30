@@ -226,6 +226,22 @@ class TestJuliaNamespaceManager:
         assert id1 == "birth_rate"
         assert id2 == "birth_rate_1"
 
+    def test_triple_collision(self):
+        """Third registration of the same clean name gets _2 suffix (line 84 in namespace.py)."""
+        ns = JuliaNamespaceManager()
+        id1 = ns.add_to_namespace("Alpha")
+        id2 = ns.add_to_namespace("ALPHA")
+        id3 = ns.add_to_namespace("alpha")
+        assert id1 == "alpha"
+        assert id2 == "alpha_1"
+        assert id3 == "alpha_2"
+
+    def test_empty_after_sanitization_gets_var_prefix(self):
+        """Name with only special chars sanitises to empty string → falls back to '_var' (line 73)."""
+        ns = JuliaNamespaceManager()
+        ident = ns.add_to_namespace("!!!")
+        assert ident == "_var"
+
     def test_leading_digit(self):
         ns = JuliaNamespaceManager()
         ident = ns.add_to_namespace("1st var")
@@ -3343,6 +3359,96 @@ class TestCoverageGaps:
         assert "1.0" in result     # values are present
         assert ";" not in result   # no 2D matrix row-separator syntax
 
+    # --- expressions_builder: bare lookup reference paths (lines 609-621) ---
+
+    def test_bare_lookup_ref_no_dims_emits_call_t(self):
+        """Bare reference to a lookup var with no active_subs and no dims → f(t) (line 621)."""
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("my data")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            lookup_names={"my_data"},
+        )
+        result = v.visit(ReferenceStructure("my data"))
+        assert result == "my_data(t)"
+
+    def test_bare_lookup_ref_with_dims_scalar_context_emits_comprehension(self):
+        """Bare lookup ref with var_dims and no active_subs → broadcast comprehension (lines 613-619)."""
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("my series")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            lookup_names={"my_series"},
+            var_dims={"my_series": ["sector"]},
+            subs_sizes={"sector": 3},
+        )
+        result = v.visit(ReferenceStructure("my series"))
+        assert "my_series" in result
+        assert "for" in result
+        assert "_ii0" in result
+
+    # --- expressions_builder: _collect_aggregation_subscripts (lines 358-359, 373-375) ---
+
+    def test_sum_with_bare_bang_ref_collects_subscript(self):
+        """SUM(var[dim!]) where var is a bare reference → triggers _scan on ReferenceStructure
+        with '!' subscripts (lines 358-359)."""
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("myvar")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            subs_sizes={"dim": 4},
+            var_dims={"myvar": ["dim"]},
+        )
+        node = CallStructure(
+            function=ReferenceStructure("SUM"),
+            arguments=[
+                ReferenceStructure(
+                    "myvar",
+                    subscripts=SubscriptsReferenceStructure(subscripts=("dim!",)),
+                )
+            ],
+        )
+        result = v.visit(node)
+        assert "myvar" in result
+        assert "sum" in result or "for" in result
+
+    def test_sum_with_arithmetic_bang_ref_collects_subscript(self):
+        """SUM(a[dim!] * b) → _scan visits ArithmeticStructure then inner refs (lines 373-375)."""
+        ns = JuliaNamespaceManager()
+        ns.add_to_namespace("a var")
+        ns.add_to_namespace("b var")
+        registry = InlineLookupRegistry()
+        needed = set()
+        v = JuliaASTVisitor(
+            ns, registry, needed,
+            subs_sizes={"dim": 3},
+            var_dims={"a_var": ["dim"]},
+        )
+        node = CallStructure(
+            function=ReferenceStructure("SUM"),
+            arguments=[
+                ArithmeticStructure(
+                    ["*"],
+                    [
+                        ReferenceStructure(
+                            "a var",
+                            subscripts=SubscriptsReferenceStructure(subscripts=("dim!",)),
+                        ),
+                        ReferenceStructure("b var"),
+                    ],
+                )
+            ],
+        )
+        result = v.visit(node)
+        assert "a_var" in result
+        assert "b_var" in result
+
 
 # ===========================================================================
 # JSON data backend tests
@@ -3673,6 +3779,54 @@ class TestJSONDataBackendCoverage:
         # Should not raise even though the value can't be stored as float
         path = JuliaModelBuilder(model, data_format="json").build_model()
         assert path.exists()
+
+    def test_json_mode_3d_lookup_accumulates(self, mocker, tmp_path):
+        """3D GET LOOKUPS (x × dim1 × dim2) in JSON mode emits per-(i,j) sub-lookups."""
+        import json
+        import numpy as np
+        import xarray as xr
+        xs = np.array([0.0, 1.0, 2.0])
+        ys = np.ones((3, 2, 3))  # (n_x_points, n_dim1, n_dim2) → 3D
+        da = xr.DataArray(ys, coords={"lookup_dim": xs}, dims=["lookup_dim", "sub1", "sub2"])
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = da
+        mocker.patch("pysd.py_backend.external.ExtLookup", return_value=mock_ext)
+        ast = GetLookupsStructure(file="d.xlsx", tab="S", x_row_or_col="x", cell="A1")
+        comp = AbstractComponent(subscripts=[[], []], ast=ast)
+        elem = AbstractElement(name="Sub3D Lut", components=[comp])
+        section = _make_section(
+            elements=[elem] + self._controls(), path=tmp_path / "m.mdl"
+        )
+        model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
+        JuliaModelBuilder(model, data_format="json").build_model()
+        data = json.loads((tmp_path / "m_data.json").read_text())
+        # 2×3 grid → sub3d_lut_1_1 … sub3d_lut_2_3
+        assert "sub3d_lut_1_1" in data["lookups"]
+        assert "sub3d_lut_2_3" in data["lookups"]
+
+    def test_json_mode_3d_data_accumulates(self, mocker, tmp_path):
+        """3D GET DATA (time × dim1 × dim2) in JSON mode emits per-(i,j) time-series."""
+        import json
+        import numpy as np
+        import xarray as xr
+        ts = np.array([0.0, 5.0, 10.0])
+        vals = np.ones((3, 2, 3))  # (n_time, n_dim1, n_dim2) → 3D
+        da = xr.DataArray(vals, coords={"time": ts}, dims=["time", "sub1", "sub2"])
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = da
+        mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
+        ast = GetDataStructure(file="d.xlsx", tab="S", time_row_or_col="t", cell="A1")
+        comp = AbstractComponent(subscripts=[[], []], ast=ast)
+        elem = AbstractElement(name="Sub3D Series", components=[comp])
+        section = _make_section(
+            elements=[elem] + self._controls(), path=tmp_path / "m.mdl"
+        )
+        model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
+        JuliaModelBuilder(model, data_format="json").build_model()
+        data = json.loads((tmp_path / "m_data.json").read_text())
+        # 2×3 grid → sub3d_series_1_1 … sub3d_series_2_3
+        assert "sub3d_series_1_1" in data["data"]
+        assert "sub3d_series_2_3" in data["data"]
 
 
 class TestJSONAccumulateConstant:
@@ -4272,6 +4426,17 @@ class TestMacroSupport:
         unk_warnings = [x for x in w if "Unknown Vensim function" in str(x.message)]
         assert not unk_warnings, f"Unexpected unknown-function warnings: {unk_warnings}"
 
+    def test_mtk_macro_companion_uses_equations_array(self, tmp_path):
+        """MTK backend macro companion file emits an Equation[] array, not a function."""
+        model = self._two_section_model(tmp_path)
+        JuliaModelBuilder(model, backend="mtk").build_model()
+        macro_file = tmp_path / "my_model_my_macro.jl"
+        assert macro_file.exists()
+        content = macro_file.read_text()
+        assert "my_macro_eqs = Equation[" in content
+        assert "ModelingToolkit" in content
+        assert "function my_macro(" not in content
+
 
 class TestMacroSupportCoverage:
     """Cover remaining macro-section code paths."""
@@ -4316,6 +4481,291 @@ class TestMacroSupportCoverage:
         assert "DataInterpolations" in content
         assert "function lookup_macro(" in content
         assert (tmp_path / "m_lookup_macro_data.json").exists()
+
+    def test_macro_with_const_only_emits_bare_return(self, tmp_path):
+        """ODE macro where all elements are constants → empty body_lines → line 396."""
+        const_elem = _make_element("My Const", 7.0, comp_class=AbstractUnchangeableConstant)
+        main_section = _make_section(
+            elements=[
+                _make_stock_element("S", 1.0, 1.0),
+                _make_control_element("INITIAL TIME", 0.0),
+                _make_control_element("FINAL TIME", 10.0),
+                _make_control_element("TIME STEP", 1.0),
+                _make_control_element("SAVEPER", 1.0),
+            ],
+            path=tmp_path / "m.mdl",
+        )
+        macro_section = AbstractSection(
+            name="const_macro", path=tmp_path / "m.mdl",
+            type="macro", params=[], returns=["My Const"],
+            subscripts=(), elements=(const_elem,),
+            constraints=(), test_inputs=(), split=False, views_dict=None,
+        )
+        model = AbstractModel(
+            original_path=tmp_path / "m.mdl",
+            sections=(main_section, macro_section),
+        )
+        JuliaModelBuilder(model).build_model()
+        content = (tmp_path / "m_const_macro.jl").read_text()
+        assert "function const_macro(" in content
+        assert "return " in content
+
+    def test_macro_with_stock_emits_placeholder_return(self, tmp_path):
+        """ODE macro containing a stock emits a 'return 0.0' placeholder (lines 368-373)."""
+        import warnings
+        stock_elem = _make_stock_element("My Level", 1.0, 0.0)
+        main_section = _make_section(
+            elements=[
+                _make_stock_element("S", 1.0, 1.0),
+                _make_control_element("INITIAL TIME", 0.0),
+                _make_control_element("FINAL TIME", 10.0),
+                _make_control_element("TIME STEP", 1.0),
+                _make_control_element("SAVEPER", 1.0),
+            ],
+            path=tmp_path / "m.mdl",
+        )
+        macro_section = AbstractSection(
+            name="stateful_macro", path=tmp_path / "m.mdl",
+            type="macro", params=[], returns=["My Level"],
+            subscripts=(), elements=(stock_elem,),
+            constraints=(), test_inputs=(), split=False, views_dict=None,
+        )
+        model = AbstractModel(
+            original_path=tmp_path / "m.mdl",
+            sections=(main_section, macro_section),
+        )
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            JuliaModelBuilder(model).build_model()
+        content = (tmp_path / "m_stateful_macro.jl").read_text()
+        assert "return 0.0" in content
+        assert "function stateful_macro(" in content
+
+    def test_mtk_macro_with_lookup_includes_datainterpolations(self, tmp_path):
+        """MTK macro with inline lookup includes DataInterpolations (line 427)."""
+        lut_ast = InlineLookupsStructure(
+            argument=1.0,
+            lookups=LookupsStructure(
+                x=(0.0, 1.0), y=(0.0, 2.0),
+                x_limits=(0.0, 1.0), y_limits=(0.0, 2.0),
+                type="interpolate",
+            ),
+        )
+        lut_elem = AbstractElement(
+            name="Lut Var",
+            components=[AbstractComponent(subscripts=[[], []], ast=lut_ast)],
+        )
+        main_section = _make_section(
+            elements=[
+                _make_stock_element("S", 1.0, 1.0),
+                _make_control_element("INITIAL TIME", 0.0),
+                _make_control_element("FINAL TIME", 10.0),
+                _make_control_element("TIME STEP", 1.0),
+                _make_control_element("SAVEPER", 1.0),
+            ],
+            path=tmp_path / "m.mdl",
+        )
+        macro_section = AbstractSection(
+            name="lut_macro", path=tmp_path / "m.mdl",
+            type="macro", params=[], returns=["Lut Var"],
+            subscripts=(), elements=(lut_elem,),
+            constraints=(), test_inputs=(), split=False, views_dict=None,
+        )
+        model = AbstractModel(
+            original_path=tmp_path / "m.mdl",
+            sections=(main_section, macro_section),
+        )
+        JuliaModelBuilder(model, backend="mtk").build_model()
+        content = (tmp_path / "m_lut_macro.jl").read_text()
+        assert "DataInterpolations" in content
+        assert "ModelingToolkit" in content
+
+    def test_mtk_macro_with_json_includes_json3(self, tmp_path):
+        """MTK macro with json data_format includes JSON3 (line 429)."""
+        aux_elem = _make_element("Macro Var", 42.0)
+        main_section = _make_section(
+            elements=[
+                _make_stock_element("S", 1.0, 1.0),
+                _make_control_element("INITIAL TIME", 0.0),
+                _make_control_element("FINAL TIME", 10.0),
+                _make_control_element("TIME STEP", 1.0),
+                _make_control_element("SAVEPER", 1.0),
+            ],
+            path=tmp_path / "m.mdl",
+        )
+        macro_section = AbstractSection(
+            name="json_macro", path=tmp_path / "m.mdl",
+            type="macro", params=[], returns=["Macro Var"],
+            subscripts=(), elements=(aux_elem,),
+            constraints=(), test_inputs=(), split=False, views_dict=None,
+        )
+        model = AbstractModel(
+            original_path=tmp_path / "m.mdl",
+            sections=(main_section, macro_section),
+        )
+        JuliaModelBuilder(model, backend="mtk", data_format="json").build_model()
+        content = (tmp_path / "m_json_macro.jl").read_text()
+        assert "JSON3" in content
+        assert "ModelingToolkit" in content
+
+
+class TestGetConstantsPiecewise1D:
+    """Direct unit test for the 1-D piecewise GET CONSTANTS path.
+
+    This path is unreachable from the normal _read_get_constants routing
+    (which requires comp0_coords len >= 2, implying max_ndim >= 2 in the
+    piecewise function).  We call _read_get_constants_piecewise directly.
+    """
+
+    def _make_builder(self, tmp_path):
+        sr = _make_subscript_range("fuel", ["fuel1", "fuel2", "fuel3"])
+        sb = _section_builder_from_elements(
+            [
+                _make_control_element("INITIAL TIME", 0.0),
+                _make_control_element("FINAL TIME", 10.0),
+                _make_control_element("TIME STEP", 1.0),
+                _make_control_element("SAVEPER", 1.0),
+            ],
+            subscripts=[sr],
+            path=tmp_path / "m.mdl",
+        )
+        return sb
+
+    def test_piecewise_1d_array_gcs_with_literals(self, mocker, tmp_path):
+        """1-D piecewise: GCS returns 1-D DataArray, literals fill remaining slots."""
+        import xarray as xr
+        import numpy as np
+
+        sb = self._make_builder(tmp_path)
+
+        gcs_ast = GetConstantsStructure(file="f.xlsx", tab="Sheet1", cell="A1")
+        gcs_comp = AbstractComponent(subscripts=[["fuel1"], []], ast=gcs_ast)
+        lit_comp2 = AbstractComponent(subscripts=[["fuel2"], []], ast=0.0)
+        lit_comp3 = AbstractComponent(subscripts=[["fuel3"], []], ast=5.0)
+
+        elem = AbstractElement(
+            name="Fuel Costs",
+            components=[gcs_comp, lit_comp2, lit_comp3],
+        )
+
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = xr.DataArray(
+            [2.5], coords={"fuel": ["fuel1"]}, dims=["fuel"]
+        )
+        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+
+        result = sb._read_get_constants_piecewise(
+            elem, "fuel_costs",
+            gcs_comps=[gcs_comp],
+            lit_comps=[lit_comp2, lit_comp3],
+        )
+        assert result is not None
+        assert "2.5" in result
+        assert "0.0" in result or "0" in result
+        assert "5.0" in result or "5" in result
+
+    def test_piecewise_1d_scalar_gcs_single_element(self, mocker, tmp_path):
+        """1-D piecewise: GCS returns scalar (arr.ndim == 0), single result."""
+        import xarray as xr
+        import numpy as np
+
+        sb = self._make_builder(tmp_path)
+
+        gcs_ast = GetConstantsStructure(file="f.xlsx", tab="Sheet1", cell="A1")
+        gcs_comp = AbstractComponent(subscripts=[["fuel1"], []], ast=gcs_ast)
+        elem = AbstractElement(name="Fuel Cost", components=[gcs_comp])
+
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = xr.DataArray(3.14)  # 0-d scalar
+        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+
+        result = sb._read_get_constants_piecewise(
+            elem, "fuel_cost",
+            gcs_comps=[gcs_comp],
+            lit_comps=[],
+        )
+        assert result is not None
+        assert "3.14" in result or "3.1" in result
+
+    def test_piecewise_1d_range_name_literal(self, tmp_path):
+        """1-D piecewise: literal comp uses a RANGE NAME subscript (covers 3537-3538)."""
+        sr = _make_subscript_range("fuel", ["fuel1", "fuel2"])
+        sb = _section_builder_from_elements(
+            [
+                _make_control_element("INITIAL TIME", 0.0),
+                _make_control_element("FINAL TIME", 10.0),
+                _make_control_element("TIME STEP", 1.0),
+                _make_control_element("SAVEPER", 1.0),
+            ],
+            subscripts=[sr],
+            path=tmp_path / "m.mdl",
+        )
+        lit_comp = AbstractComponent(subscripts=[["fuel"], []], ast=3.0)
+        elem = AbstractElement(name="Fuel Rates", components=[lit_comp])
+
+        result = sb._read_get_constants_piecewise(
+            elem, "fuel_rates",
+            gcs_comps=[],
+            lit_comps=[lit_comp],
+        )
+        assert result is not None
+        assert "3.0" in result or "3" in result
+
+    def test_piecewise_1d_no_parent_range(self, tmp_path):
+        """1-D piecewise: elements not in any range → parent_range=None (covers 3570)."""
+        sb = _section_builder_from_elements(
+            [
+                _make_control_element("INITIAL TIME", 0.0),
+                _make_control_element("FINAL TIME", 10.0),
+                _make_control_element("TIME STEP", 1.0),
+                _make_control_element("SAVEPER", 1.0),
+            ],
+            subscripts=[],
+            path=tmp_path / "m.mdl",
+        )
+        lit_x = AbstractComponent(subscripts=[["X"], []], ast=1.0)
+        lit_y = AbstractComponent(subscripts=[["Y"], []], ast=2.0)
+        elem = AbstractElement(name="Mixed", components=[lit_x, lit_y])
+
+        result = sb._read_get_constants_piecewise(
+            elem, "mixed",
+            gcs_comps=[],
+            lit_comps=[lit_x, lit_y],
+        )
+        assert result is not None
+
+    def test_piecewise_1d_single_val(self, mocker, tmp_path):
+        """1-D piecewise: single ordered element → format_number (covers line 3576)."""
+        import xarray as xr
+
+        sr = _make_subscript_range("solo", ["only1"])
+        sb = _section_builder_from_elements(
+            [
+                _make_control_element("INITIAL TIME", 0.0),
+                _make_control_element("FINAL TIME", 10.0),
+                _make_control_element("TIME STEP", 1.0),
+                _make_control_element("SAVEPER", 1.0),
+            ],
+            subscripts=[sr],
+            path=tmp_path / "m.mdl",
+        )
+
+        gcs_ast = GetConstantsStructure(file="f.xlsx", tab="S", cell="A1")
+        gcs_comp = AbstractComponent(subscripts=[["only1"], []], ast=gcs_ast)
+        elem = AbstractElement(name="Solo Var", components=[gcs_comp])
+
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = xr.DataArray(5.0)  # scalar
+        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+
+        result = sb._read_get_constants_piecewise(
+            elem, "solo_var",
+            gcs_comps=[gcs_comp],
+            lit_comps=[],
+        )
+        assert result is not None
+        assert "5" in result
+        assert "[" not in result  # single value, no brackets
 
 
 class TestExceptConstantComponent:

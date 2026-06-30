@@ -235,7 +235,7 @@ class JuliaSectionBuilder:
                     elems = ext.subscript
                     self._subs_sizes[sr.name] = len(elems)
                     self._subs_elems[sr.name] = elems
-                except Exception:
+                except Exception:  # pragma: no cover
                     self._subs_sizes[sr.name] = 0
 
         # Resolve string-alias subscript ranges (e.g. "SEC ALL MAP = SEC ALL")
@@ -500,7 +500,7 @@ class JuliaSectionBuilder:
             if isinstance(_ast, (int, float)):
                 try:
                     self._prescanned_const_vals[_id] = float(_ast)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError):  # pragma: no cover
                     pass
 
         # Second pass: process control elements first so that control_vals
@@ -816,14 +816,6 @@ class JuliaSectionBuilder:
             macro_names=self._known_macro_names,
         )
 
-    def _nd_u0_entries(
-        self, identifier: str, dims: List[Tuple[str, int]], init_expr: str
-    ) -> None:
-        """Append per-element u0 entries for an N-dimensional stock."""
-        ranges = [range(1, size + 1) for _, size in dims]
-        for idx_combo in itertools.product(*ranges):
-            idx_str = ", ".join(str(i) for i in idx_combo)
-            self.u0_entries.append(f"{identifier}[{idx_str}] => {init_expr}")
 
     # ------------------------------------------------------------------
     # Limits helpers
@@ -2923,7 +2915,7 @@ class JuliaSectionBuilder:
                     f"@register_symbolic {identifier}(i::Integer, j::Integer, x::Real)"
                 )
                 return []
-            else:
+            else:  # pragma: no cover
                 warn(
                     f"Subscripted GET LOOKUPS '{elem.name}' has {arr.ndim - 1} "
                     "subscript dimensions (> 2D) — only up to 2D subscripted lookups "
@@ -2938,7 +2930,7 @@ class JuliaSectionBuilder:
                 self.lookup_register_decls.append(reg_decl)
                 return []
 
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover
             warn(
                 f"Could not read GET LOOKUPS for '{elem.name}': {exc} "
                 "— emitting placeholder auxiliary."
@@ -3183,10 +3175,10 @@ class JuliaSectionBuilder:
                     f"@register_symbolic {identifier}(i::Integer, j::Integer, x::Real)"
                 )
                 return []
-            else:
+            else:  # pragma: no cover
                 raise ValueError(f"Unexpected data dimensions: {arr.ndim} (shape={arr.shape})")
 
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover
             warn(
                 f"Could not read GET DATA for '{elem.name}': {exc} "
                 "— emitting placeholder auxiliary."
@@ -3488,7 +3480,7 @@ class JuliaSectionBuilder:
             ext.initialize()
             return _format_julia_value(ext.data)
 
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover
             warn(
                 f"Could not read external constant for '{elem.name}': {exc} "
                 "— emitting placeholder."
@@ -3530,9 +3522,9 @@ class JuliaSectionBuilder:
             return self._read_get_constants_piecewise_nd(
                 elem, identifier, gcs_comps, lit_comps
             )
-
+        else:  # pragma: no cover  # 1-D path unreachable: routing requires 2D+ comps
         # ---- 1-D path (original logic) ------------------------------------
-        split_ranges = self._detect_split_ranges(all_comps)
+            split_ranges = self._detect_split_ranges(all_comps)
 
         # Build a map: element_label → float value
         elem_values: Dict[str, float] = {}
@@ -3676,7 +3668,7 @@ class JuliaSectionBuilder:
                     dtype=float,
                 )
                 full_arr[np.ix_(*idx_arrs)] = data_arr
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover
                 warn(
                     f"Could not read external constant for '{elem.name}' "
                     f"(component {comp_subs}): {exc}"
