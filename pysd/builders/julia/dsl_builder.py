@@ -54,6 +54,21 @@ UNIT_WORDS = {
     "meter": "m", "meters": "m", "tonne": "t", "tonnes": "t", "ton": "t",
 }
 
+# units Unitful.jl (and PySD.jl) know, which also take SI prefixes: E + J is EJ
+_KNOWN_UNITS = {"m", "g", "s", "A", "K", "mol", "cd", "J", "W", "N", "Pa", "Hz", "L", "eV",
+                "Wh", "t", "people", "dollar", "V", "C", "Ω", "S", "F", "T", "Wb", "H", "Bq", "Gy",
+                "Sv", "kat", "bar", "atm"}
+_UNPREFIXED = {"yr", "d", "hr", "minute", "wk", "month", "ha", "ppm", "ppb", "ppt", "percent",
+               "rad", "°", "°C", "°F", "Ra", "inch", "ft", "mi", "lb", "kg"}
+_PREFIXES = ("Y", "Z", "E", "P", "T", "G", "M", "k", "h", "da", "d", "c", "m", "μ", "n", "p", "f", "a")
+
+
+def known_unit(word: str) -> bool:
+    if word in _UNPREFIXED or word in _KNOWN_UNITS:
+        return True
+    return any(word.startswith(pre) and word[len(pre):] in _KNOWN_UNITS for pre in _PREFIXES)
+
+
 _TOKEN = re.compile(r"\s*([A-Za-z$€%º°][A-Za-z0-9$€%_º° ]*|\d+(?:\.\d+)?|[*/^()])")
 
 
@@ -120,9 +135,10 @@ def translate_units(text: str) -> Tuple[Optional[str], List[str]]:
             word = UNIT_WORDS[key]
             out.append("1" if word is None else word)
         else:
-            word = re.sub(r"[^A-Za-z0-9_]", "_", tok)
+            word = re.sub(r"[^A-Za-z0-9_°]", "_", tok)
             out.append(word)
-            unknown.append(word)
+            if not known_unit(word):
+                unknown.append(word)
     unit = "".join(out)
     if re.fullmatch(r"[1*/()^ ]*", unit):
         return None, []
@@ -132,7 +148,9 @@ def translate_units(text: str) -> Tuple[Optional[str], List[str]]:
 # --- the expression writer --------------------------------------------------------
 
 # precedence: higher binds tighter
-P_ATOM, P_POW, P_UNARY, P_MUL, P_ADD, P_CMP, P_AND, P_OR = 100, 90, 80, 70, 60, 50, 40, 30
+# Julia's: & binds as *, | as +, both tighter than comparisons
+P_ATOM, P_POW, P_UNARY, P_MUL, P_ADD, P_CMP = 100, 90, 80, 70, 60, 50
+P_AND, P_OR = P_MUL, P_ADD
 
 
 @dataclass
@@ -143,6 +161,14 @@ class Code:
 
     def wrap(self, prec: int) -> str:
         return f"({self.text})" if self.prec < prec else self.text
+
+
+def invert_matrix(text: str, dims) -> str:
+    """Vensim's INVERT MATRIX: the inverse under the same dimensions.  Julia's
+    inv of a DimArray swaps them (its rows are the columns of the matrix), so
+    the names and labels are swapped back, position by position."""
+    r, c = dims
+    return f"set(inv({text}), :{c} => {r}, :{r} => {c})"
 
 
 class DSLError(Exception):
@@ -188,24 +214,23 @@ class DSLBuilder:
                 raise DSLError(f"subscript range {r.name}: {r.subscripts!r} is not supported yet")
         for c, of in self.copies.items():
             self.ranges[c] = self.ranges[of]
+        # subscript mappings (lower -> upper): position by position, both ways
+        self.mapped = set()
+        for r in self.section.subscripts:
+            for m in r.mapping or []:
+                if isinstance(m, str):
+                    self.mapped.add((r.name, m))
+                    self.mapped.add((m, r.name))
         names = list(self.ranges)
-        # a subrange: its elements are part of a larger range's (copies are dimensions of their own)
-        self.main: Dict[str, str] = {}
-        for r in names:
-            parents = [o for o in names if o != r and o not in self.copies
-                       and set(self.ranges[r]) < set(self.ranges[o])]
-            self.main[r] = max(parents, key=lambda o: len(self.ranges[o])) if parents else r
-        self.dimname = {r: identifier(r, self.taken) for r in names if self.main[r] == r}
-        self.subname = {r: identifier(r, self.taken) for r in names if self.main[r] != r}
-        self.elem_range: Dict[str, str] = {}
-        for r in names:
-            if self.main[r] == r and r not in self.copies:
-                for e in self.ranges[r]:
-                    cur = self.elem_range.get(e)
-                    if cur is None or len(self.ranges[r]) > len(self.ranges[cur]):
-                        self.elem_range[e] = r
+        # every range is a dimension (as in Python PySD), with its elements as labels;
+        # a range whose elements are part of another's is a selection of it there
+        self.dimname = {r: identifier(r, self.taken) for r in names}
+        self.elements_name = {r: identifier(r + "_elements", self.taken)
+                              for r in names if r not in self.copies}
+        for c, of in self.copies.items():
+            self.elements_name[c] = self.elements_name[of]
         self.lower_range = {r.lower(): r for r in names}
-        self.lower_elem = {e.lower(): e for e in self.elem_range}
+        self.lower_elem = {e.lower(): e for r in names for e in self.ranges[r]}
 
     def _range_of(self, sub: str) -> Optional[str]:
         return self.lower_range.get(sub.lower().rstrip("!").strip())
@@ -213,29 +238,33 @@ class DSLBuilder:
     def _elem(self, sub: str) -> Optional[str]:
         return self.lower_elem.get(sub.lower().strip())
 
-    def _main_dim(self, sub: str) -> str:
-        r = self._range_of(sub)
-        if r is not None:
-            return self.main[r]
-        e = self._elem(sub)
-        if e is None:
-            raise DSLError(f"unknown subscript {sub!r}")
-        return self.elem_range[e]
 
     # --- elements ----------------------------------------------------------------------
 
     def _elements(self):
         self.controls: Dict[str, object] = {}
+        self.kind_errors: List[str] = []
+        self.hidden: Dict[str, List[str]] = {}       # view → declarations the translator adds
+        self.positions: Dict[str, str] = {}          # range → its positions parameter
         self.elements: Dict[str, Element] = {}      # clean name → element
         for el in self.section.elements:
             if isinstance(el, AbstractControlElement):
                 self.controls[clean(el.name)] = el
                 continue
             dims = self._declared_dims(el)
-            kind = self._kind(el)
+            try:
+                kind = self._kind(el)
+            except DSLError as err:
+                self.kind_errors.append(str(err))
+                kind = "parameter"
             e = Element(el.name, identifier(el.name, self.taken), kind,
                         tuple(self.dimname[d] for d in dims), el)
             e.vensim_dims = dims
+            split = self._split_position(el) if kind == "parameter" and len(el.components) > 1 else None
+            e.split = split
+            if split:                                    # the dimension it is split along, first
+                order = [split] + [i for i in range(len(dims)) if i != split]
+                e.dims = tuple(e.dims[i] for i in order)
             self.elements[clean(el.name)] = e
         views = self.section.views_dict or {}
         where = {}
@@ -247,26 +276,73 @@ class DSLBuilder:
         self._time_dependence()
 
     def _declared_dims(self, el) -> List[str]:
-        dims = None
-        for c in el.components:
-            subs = c.subscripts[0]
-            d = [self._main_dim(s) for s in subs]
-            if dims is None:
-                dims = d
-            elif d != dims:
-                raise DSLError(f"{el.name}: its parts have different dimensions")
-        return dims or []
+        """At each position, the range the equations cover: the one written on the
+        left when there is one equation, else the range of all their elements."""
+        n = len(el.components[0].subscripts[0])
+        dims = []
+        for p in range(n):
+            written = [c.subscripts[0][p] for c in el.components if len(c.subscripts[0]) > p]
+            covered: List[str] = []
+            for sub in written:
+                for x in self._selected(sub, None):
+                    if x not in covered:
+                        covered.append(x)
+            named = [self._range_of(w) for w in written if self._range_of(w) is not None]
+            exact = [r for r in named if set(self.ranges[r]) == set(covered)] or \
+                    [r for r in self.ranges if set(self.ranges[r]) == set(covered)]
+            if exact:
+                dims.append(exact[0])
+                continue
+            # no range has exactly these elements: a dimension of its own, of the elements defined
+            # (references to it name its elements one at a time)
+            r = f"{el.name} elements"
+            self.ranges[r] = covered
+            self.dimname[r] = identifier(r if p == 0 else f"{el.name} elements {p + 1}", self.taken)
+            self.elements_name[r] = identifier(self.dimname[r] + "_labels", self.taken)
+            self.lower_range[r.lower()] = r
+            dims.append(r)
+        # a range used at two positions: a copy of it for the second (one name per dimension)
+        for p, r in enumerate(dims):
+            if r in dims[:p]:
+                k = dims[:p].count(r) + 1
+                copy = f"{r} {k}"
+                if copy not in self.ranges:
+                    self.ranges[copy] = self.ranges[r]
+                    self.copies[copy] = r
+                    self.dimname[copy] = identifier(copy, self.taken)
+                    self.elements_name[copy] = self.elements_name[r]
+                dims[p] = copy
+        return dims
 
     def _kind(self, el) -> str:
         asts = [c.ast for c in el.components]
         if any(isinstance(a, ae.IntegStructure) for a in asts):
             return "stock"
-        if isinstance(el.components[0], (AbstractLookup, AbstractData)) or all(
-                isinstance(a, (int, float, np.ndarray, ae.GetConstantsStructure,
-                               ae.LookupsStructure, ae.GetLookupsStructure, ae.GetDataStructure))
-                for a in asts):
+        inputs = (ae.LookupsStructure, ae.GetLookupsStructure, ae.GetDataStructure)
+        if all(isinstance(a, (int, float, np.ndarray, ae.GetConstantsStructure) + inputs) for a in asts):
+            if len(asts) > 1 and self._split_position(el) is None:
+                if any(isinstance(a, inputs) for a in asts):
+                    raise DSLError(f"{el.name}: lookups or data in parts other than one element each are not supported yet")
+                return "constant_parts"          # a constant variable with one equation per part
             return "parameter"
         return "variable"
+
+    def _split_position(self, el) -> Optional[int]:
+        """The position where each part is one element (all of them, once) and the
+        others are whole ranges: a parameter in parts is then a vector of values."""
+        comps = el.components
+        n = len(comps[0].subscripts[0])
+        if any(c.subscripts[1] for c in comps):
+            return None
+        for p in range(n):
+            elems = [self._elem(c.subscripts[0][p]) if self._range_of(c.subscripts[0][p]) is None else None
+                     for c in comps]
+            if None in elems or len(set(elems)) != len(elems):
+                continue
+            others = {tuple(c.subscripts[0][q] for q in range(n) if q != p) for c in comps}
+            if len(others) == 1 and all(self._range_of(x) is not None for x in next(iter(others))):
+                return p
+        return None
 
     def _time_dependence(self):
         """A variable changes with time if its equations use time, a stateful
@@ -286,8 +362,12 @@ class DSLBuilder:
         def timed(k, seen=()):
             if k in memo:
                 return memo[k]
-            if k not in self.elements or self.elements[k].kind == "parameter":
+            if k not in self.elements:
                 return False
+            el = self.elements[k]
+            if el.kind == "parameter":                    # a data series changes with time
+                return isinstance(el.abstract.components[0], AbstractData) and \
+                    isinstance(el.abstract.components[0].ast, ae.GetDataStructure)
             if direct[k]:
                 memo[k] = True
                 return True
@@ -297,7 +377,7 @@ class DSLBuilder:
             return memo[k]
 
         for k, e in self.elements.items():
-            e.timevarying = e.kind != "parameter" and timed(k)
+            e.timevarying = e.kind not in ("parameter", "constant_parts") and timed(k)
 
     STATEFUL = (ae.IntegStructure, ae.DelayStructure, ae.DelayNStructure, ae.DelayFixedStructure,
                 ae.SmoothStructure, ae.SmoothNStructure, ae.TrendStructure, ae.SampleIfTrueStructure,
@@ -341,9 +421,15 @@ class DSLBuilder:
         out.mkdir(parents=True, exist_ok=True)
         self.out = out
         decls_by_view: Dict[str, List[Element]] = {}
+        problems = list(self.kind_errors)
         for e in self.elements.values():
-            self._write_element(e)
+            try:
+                self._write_element(e)
+            except DSLError as err:
+                problems.append(str(err))
             decls_by_view.setdefault(e.view, []).append(e)
+        if problems:
+            raise DSLError(f"{len(problems)} elements can't be written in the DSL yet:\n  " + "\n  ".join(problems))
         files = []
         for view, els in decls_by_view.items():
             name = identifier(view or "equations", set()) if view else "equations"
@@ -364,15 +450,19 @@ class DSLBuilder:
     def _view_text(self, value, view, els):
         params = [e for e in els if e.kind == "parameter"]
         variables = [e for e in els if e.kind != "parameter"]
+        hidden_params = [d for d in self.hidden.get(view, []) if " = " in d.split(",")[0]]
+        hidden_vars = [d for d in self.hidden.get(view, []) if d not in hidden_params]
         out = [f"# {'View ' + repr(view) if view else 'The equations'}: {len(els)} variables.", "",
                f"{value} = @equations begin"]
-        if params:
+        if params or hidden_params:
             out.append("    @parameters begin")
             out += ["        " + e.declaration.replace("\n", "\n        ") for e in params]
+            out += ["        " + d.replace("\n", "\n        ") for d in hidden_params]
             out.append("    end")
-        if variables:
+        if variables or hidden_vars:
             out.append("    @variables begin")
             out += ["        " + e.declaration for e in variables]
+            out += ["        " + d for d in hidden_vars]
             out.append("    end")
         out.append("")
         for e in variables:
@@ -384,11 +474,11 @@ class DSLBuilder:
         out = ["# Dimensions (Vensim subscript ranges) and subsets: plain Julia values.",
                "using DimensionalData: Dim", ""]
         for r, d in self.dimname.items():
-            labels = ", ".join(label(e) for e in self.ranges[r])
-            out.append(f"const {d} = Dim{{:{d}}}([{labels}])")
-        for r, s in self.subname.items():
-            labels = ", ".join(label(e) for e in self.ranges[r])
-            out.append(f"const {s} = [{labels}]{' ' * 2}# a subset of {self.dimname[self.main[r]]}")
+            if r not in self.copies:
+                labels = ", ".join(label(e) for e in self.ranges[r])
+                out.append(f"const {self.elements_name[r]} = [{labels}]")
+            note = f"  # a copy of {self.dimname[self.copies[r]]}" if r in self.copies else ""
+            out.append(f"const {d} = Dim{{:{d}}}({self.elements_name[r]}){note}")
         return "\n".join(out) + "\n"
 
     def _inputs_text(self):
@@ -469,13 +559,16 @@ class DSLBuilder:
             t += "[" + ", ".join(e.dims) + "]"
         return t
 
+    def _hide(self, view: str, declaration: str):
+        self.hidden.setdefault(view, []).append(declaration)
+
     def _write_element(self, e: Element):
         meta = self._meta(e)
         if e.kind == "parameter":
             e.declaration = f"{self._decl_target(e)} = {self._parameter_value(e)},\n    {meta}"
             return
         e.declaration = f"{self._decl_target(e)}, {meta}"
-        inits = []
+        inits, init_parts = [], []
         for c in e.abstract.components:
             lhs = e.ident + self._lhs_selection(e, c)
             ctx = Context(self, e, c)
@@ -485,19 +578,50 @@ class DSLBuilder:
                 init = Context(self, e, c, initial=True).visit(ast.initial).text
                 if init not in inits:
                     inits.append(init)
+                init_parts.append((self._lhs_selection(e, c), init, c))
+            elif isinstance(ast, ae.CallStructure) and clean(ast.function.reference) == "invert_matrix" \
+                    and len(e.dims) > 2:
+                # one inverse per element of the leading dimensions: a loop, as in the design
+                m = ctx.visit(ast.arguments[0])
+                lead = [d for d in e.dims[:-2]]
+                if len(lead) != 1 or m.dims[:1] != (lead[0],):
+                    raise DSLError(f"{e.name}: INVERT MATRIX over {len(e.dims)} dimensions is not supported yet")
+                d = lead[0]
+                r = next(r for r, n in self.dimname.items() if n == d)
+                var = f"each_{d}"
+                sel = f"[{d} = At({var})]"
+                target = lhs + sel if not lhs.endswith("]") else lhs[:-1] + f", {d} = At({var})]"
+                e.lines.append(f"for {var} in {self.elements_name[r]}\n"
+                               f"    {target} ~ {invert_matrix(m.wrap(P_ATOM) + sel, m.dims[1:])}\nend")
             elif isinstance(ast, ae.CallStructure) and clean(ast.function.reference) == "active_initial":
                 e.lines.append(f"{lhs} ~ {ctx.visit(ast.arguments[0]).text}")
                 e.lines.append(f"{e.ident}(t₀) ~ {ctx.visit(ast.arguments[1]).text}")
             else:
                 e.lines.append(f"{lhs} ~ {ctx.visit(ast).text}")
         if len(inits) > 1:
-            raise DSLError(f"{e.name}: a stock whose parts have different initial values is not supported yet")
-        if inits:
+            # the initial value has parts too: a variable of its own
+            init = identifier(e.name + " initial", self.taken)
+            timed = any(self._scan(c.ast.initial)[1] or any(
+                self.elements[r].timevarying for r in self._scan(c.ast.initial)[0] if r in self.elements)
+                for _, _, c in init_parts)
+            dims = "[" + ", ".join(e.dims) + "]" if e.dims else ""
+            unit = meta.split(",")[0].lstrip("[")
+            self._hide(e.view, f"{init}{'(t)' if timed else ''}{dims}, [{unit}, description = "
+                               f"\"The initial value of {e.ident}, by parts.\"]")
+            e.lines += [f"{init}{sel} ~ {txt}" for sel, txt, _ in init_parts]
+            e.lines.append(f"{e.ident}(t₀) ~ {init}")
+        elif inits:
             e.lines.append(f"{e.ident}(t₀) ~ {inits[0]}")
 
     def _lhs_selection(self, e: Element, c) -> str:
+        sels = [sel for _, _, _, sel in self._lhs_parts(e, c) if sel]
+        return "[" + ", ".join(sels) + "]" if sels else ""
+
+    def _lhs_parts(self, e: Element, c):
+        """For each position of the part defined: its range (None for an element),
+        the declared dimension, the elements, and the selector (None: all)."""
         subs, exceptions = c.subscripts
-        sels = []
+        out = []
         for p, s in enumerate(subs):
             dim_v = e.vensim_dims[p]
             dim = self.dimname[dim_v]
@@ -505,19 +629,26 @@ class DSLBuilder:
             sel = self._selected(s, dim_v)
             excluded = set()
             for exc in exceptions or []:
-                if p < len(exc):
+                # an exception removes its elements at the positions where it is narrower
+                # than the part: [dac_final_sources, sectors] removes two sources, every sector
+                narrower = [q for q in range(len(exc))
+                            if not set(self._selected(subs[q])) <= set(self._selected(exc[q]))]
+                if len(narrower) > 1:
+                    raise DSLError(f"{e.name}: an :EXCEPT: narrower at several positions is not supported yet")
+                if narrower == [p]:
                     excluded |= set(self._selected(exc[p], dim_v))
             chosen = [x for x in sel if x not in excluded]
-            if len(chosen) == len(full):
-                continue
-            if excluded and len(sel) == len(full) and len(excluded) < len(chosen):
+            r = self._range_of(s)
+            if chosen == list(full):
+                out.append((r, dim, chosen, None))
+            elif excluded and len(sel) == len(full) and len(excluded) < len(chosen):
                 ex = sorted(excluded, key=full.index)
-                sels.append(f"{dim} = Not(At({self._labels(ex)}))")
+                out.append((r, dim, chosen, f"{dim} = Not(At({self._labels(ex)}))"))
             else:
-                sels.append(f"{dim} = At({self._labels(chosen, s)})")
-        return "[" + ", ".join(sels) + "]" if sels else ""
+                out.append((r, dim, chosen, f"{dim} = At({self._labels(chosen, s)})"))
+        return out
 
-    def _selected(self, s, dim_v) -> List[str]:
+    def _selected(self, s, dim_v=None) -> List[str]:
         r = self._range_of(s)
         if r is not None:
             return list(self.ranges[r])
@@ -529,8 +660,9 @@ class DSLBuilder:
     def _labels(self, elems, sub=None) -> str:
         if len(elems) == 1 and (sub is None or self._range_of(sub) is None):
             return label(elems[0])
-        if sub is not None and self._range_of(sub) in self.subname:
-            return self.subname[self._range_of(sub)]
+        r = self._range_of(sub) if sub is not None else None
+        if r is not None and list(self.ranges[r]) == list(elems):
+            return self.elements_name[r]
         return "[" + ", ".join(label(x) for x in elems) + "]"
 
     def _sheet(self, file, tab) -> str:
@@ -545,13 +677,12 @@ class DSLBuilder:
         vals = [self._one_value(e, c) for c in comps]
         if len(vals) == 1:
             return vals[0]
-        # parts along the first dimension: one value per element of it
-        subs0 = [c.subscripts[0][0] if c.subscripts[0] else None for c in comps]
-        firsts = [self._elem(s) for s in subs0]
-        if None in firsts or len(set(firsts)) != len(firsts) or \
-                set(firsts) != set(self.ranges[e.vensim_dims[0]]):
-            raise DSLError(f"{e.name}: parameters defined in parts are supported along the first dimension only")
-        order = self.ranges[e.vensim_dims[0]]
+        # one part per element of a dimension (declared first): one value per element
+        p = e.split
+        firsts = [self._elem(c.subscripts[0][p]) for c in comps]
+        order = self.ranges[e.vensim_dims[p]]
+        if set(firsts) != set(order):
+            raise DSLError(f"{e.name}: its parts don't define every element of {self.dimname[e.vensim_dims[p]]}")
         by = dict(zip(firsts, vals))
         return "[" + ", ".join(by[x] for x in order) + "]"
 
@@ -584,6 +715,13 @@ class DSLBuilder:
         raise DSLError(f"{e.name}: {type(ast).__name__} as a parameter is not supported yet")
 
 
+@dataclass
+class _Literal:
+    """An expression to write as a parameter's value (what _one_value takes)."""
+    ast: object
+    keyword: Optional[str] = None
+
+
 ARITH = {"+": "+", "-": "-", "*": "*", "/": "/", "^": "^", "**": "^"}
 LOGIC = {"=": "==", "<>": "!=", "<": "<", ">": ">", "<=": "≤", ">=": "≥",
          ":and:": "&", ":or:": "|", "and": "&", "or": "|"}
@@ -603,6 +741,9 @@ class Context:
         self.e = element
         self.c = component
         self.initial = initial
+        # the ranges the part defined iterates over: its dimension, elements, selector
+        self.part = {r: (dim, elems, sel) for r, dim, elems, sel in builder._lhs_parts(element, component)
+                     if r is not None}
 
     def visit(self, node) -> Code:
         if isinstance(node, (bool, np.bool_)):
@@ -610,6 +751,21 @@ class Context:
         if isinstance(node, (int, float)):
             text = number(node)
             return Code(text, (), P_ATOM if not text.startswith("-") else P_UNARY)
+        if isinstance(node, np.ndarray):                    # values for a part
+            return Code(self.b._one_value(self.e, _Literal(node)))
+        if isinstance(node, ae.GetConstantsStructure):
+            text = self.b._one_value(self.e, _Literal(node))
+            if not self.e.timevarying:
+                return Code(text)
+            # read once: a parameter of its own (a part that is one element)
+            sel = self.b._lhs_selection(self.e, self.c)
+            if any(ch in sel for ch in "[,") and "At(:" not in sel or sel.count("=") > 1:
+                raise DSLError(f"{self.e.name}: Excel constants in a part of several elements of a "
+                               "variable that changes with time are not supported yet")
+            name = identifier(self.e.name + " " + (sel.split("At(:")[-1].rstrip(")]") if sel else "input"), self.b.taken)
+            unit = self.b._meta(self.e).split(",")[0].lstrip("[")
+            self.b._hide(self.e.view, f"{name} = {text},\n    [{unit}, description = \"Read from Excel for {self.e.ident}.\"]")
+            return Code(name)
         if isinstance(node, ae.ArithmeticStructure):
             return self._arithmetic(node)
         if isinstance(node, ae.LogicStructure):
@@ -633,12 +789,9 @@ class Context:
         if isinstance(node, ae.DelayFixedStructure):
             if not isinstance(node.input, ae.ReferenceStructure):
                 raise DSLError(f"{self.e.name}: DELAY FIXED of an expression is not supported yet")
-            x = self._reference(node.input)
             tau, init = self.visit(node.delay_time), self.visit(node.initial)
-            name, sel = x.text.split("[", 1) if "[" in x.text and not x.text.startswith("set(") else (x.text, None)
-            if sel is not None or x.text.startswith("set("):
-                raise DSLError(f"{self.e.name}: DELAY FIXED of a part of an array is not supported yet")
-            return Code(f"{name}(t - {tau.wrap(P_ADD + 1)}; init = {init.text})", x.dims)
+            # the whole array delayed, then the part: x(t - τ; init)[d = At(…)]
+            return self._of_whole(node.input, f"(t - {tau.wrap(P_ADD + 1)}; init = {init.text})")
         if isinstance(node, ae.InitialStructure):
             return self._initial(node.initial)
         raise DSLError(f"{self.e.name}: {type(node).__name__} is not supported yet")
@@ -674,14 +827,25 @@ class Context:
 
     def _initial(self, node) -> Code:
         if isinstance(node, ae.ReferenceStructure):
-            r = self._reference(node)
             el = self.b.elements.get(clean(node.reference))
-            if el is None or not el.timevarying:
-                return r
-            if "[" in r.text or r.text.startswith("set("):
-                raise DSLError(f"{self.e.name}: INITIAL of a part of an array is not supported yet")
-            return Code(f"{r.text}(t₀)", r.dims)
+            if el is None or not (el.timevarying or self._is_data(el)):
+                return self._reference(node)
+            return self._of_whole(node, "(t₀)")
         raise DSLError(f"{self.e.name}: INITIAL of an expression is not supported yet")
+
+    @staticmethod
+    def _is_data(el) -> bool:
+        return el.kind == "parameter" and isinstance(el.abstract.components[0], AbstractData)
+
+    def _of_whole(self, node: ae.ReferenceStructure, call: str) -> Code:
+        """`x(t₀)` or `x(t - τ; init)` of a reference: of the whole array, then the
+        selection and the renames of the reference."""
+        el = self.b.elements[clean(node.reference)]
+        ref = self._reference(node)
+        whole = el.ident + call
+        base = f"{el.ident}(t)" if self._is_data(el) else el.ident
+        text = ref.text.replace(base, whole, 1)
+        return Code(text, ref.dims)
 
     # dotted when an operand is an array
     @staticmethod
@@ -713,21 +877,81 @@ class Context:
             out = Code(f"{out.wrap(prec)} {self._op(jop, out, a)} {right}", self._union(out.dims, a.dims), prec)
         return out
 
-    def _logic(self, node) -> Code:
-        ops, args = [o.lower() for o in node.operators], [self.visit(a) for a in node.arguments]
-        if len(args) == 1 and ops and ops[0] in (":not:", "not"):
-            a = args[0]
-            return Code(("." if a.dims else "") + "!" + a.wrap(P_UNARY), a.dims, P_UNARY)
-        out = args[0]
-        for op, a in zip(ops, args[1:]):
-            jop = LOGIC[op]
-            prec = P_AND if jop == "&" else P_OR if jop == "|" else P_CMP
-            out = Code(f"{out.wrap(prec + 1)} {self._op(jop, out, a)} {a.wrap(prec + 1)}",
-                       self._union(out.dims, a.dims), prec)
-        return out
+    def _condition(self, node) -> Code:
+        """A condition: true or false.  Vensim also takes a number (nonzero: true)."""
+        c = self.visit(node)
+        if isinstance(node, ae.LogicStructure) or (isinstance(node, (bool, np.bool_))):
+            return c
+        return Code(f"{c.wrap(P_CMP + 1)} {self._op('!=', c)} 0", c.dims, P_CMP)
 
-    def _lhs_ranges(self) -> List[str]:
-        return [self.b._range_of(s) for s in self.c.subscripts[0]]
+    def _logic(self, node) -> Code:
+        """Comparisons, then :AND:, then :OR: (Vensim gives them as one flat list)."""
+        ops = [o.lower() for o in node.operators]
+        if len(node.arguments) == 1 and ops and ops[0] in (":not:", "not"):
+            a = self._condition(node.arguments[0])
+            return Code(("." if a.dims else "") + "!" + a.wrap(P_UNARY), a.dims, P_UNARY)
+        items = [self.visit(node.arguments[0])]
+        raw = [node.arguments[0]]
+        for op, a in zip(ops, node.arguments[1:]):
+            items += [op, self.visit(a)]
+            raw.append(a)
+
+        def bool_of(code, ast):
+            if isinstance(ast, (ae.LogicStructure, bool, np.bool_)) or code.prec == P_CMP:
+                return code
+            return Code(f"{code.wrap(P_CMP + 1)} {self._op('!=', code)} 0", code.dims, P_CMP)
+
+        # comparisons
+        vals, opers, asts = [items[0]], [], [raw[0]]
+        for i in range(1, len(items), 2):
+            op, b = items[i], items[i + 1]
+            if op in (":and:", ":or:", "and", "or"):
+                opers.append(op)
+                vals.append(b)
+                asts.append(raw[(i + 1) // 2])
+            else:
+                a = vals[-1]
+                jop = LOGIC[op]
+                vals[-1] = Code(f"{a.wrap(P_CMP + 1)} {self._op(jop, a, b)} {b.wrap(P_CMP + 1)}",
+                                self._union(a.dims, b.dims), P_CMP)
+                asts[-1] = None
+        vals = [bool_of(v, a) if a is not None else v for v, a in zip(vals, asts)]
+        # :AND: before :OR:
+        for group in (("and", ":and:"), ("or", ":or:")):
+            i = 0
+            while i < len(opers):
+                if opers[i] in group:
+                    a, b = vals[i], vals[i + 1]
+                    jop = LOGIC[opers[i]]
+                    prec = P_AND if jop == "&" else P_OR
+                    vals[i:i + 2] = [Code(f"{a.wrap(prec)} {self._op(jop, a, b)} {b.wrap(prec + 1)}",
+                                          self._union(a.dims, b.dims), prec)]
+                    del opers[i]
+                else:
+                    i += 1
+        return vals[0]
+
+    def _lhs_declared(self, r: str) -> str:
+        for p, s in enumerate(self.c.subscripts[0]):
+            if self.b._range_of(s) == r:
+                return self.e.vensim_dims[p]
+        return r
+
+    def _mapped_to(self, r: str):
+        """The range of the part being defined that `r` maps to, and its dimension."""
+        for p, s in enumerate(self.c.subscripts[0]):
+            lr = self.b._range_of(s)
+            if lr is not None and lr != r and (r, lr) in self.b.mapped:
+                return lr, self.b.dimname[self.e.vensim_dims[p]]
+        return None
+
+    def _target(self, r: str) -> str:
+        """The dimension a range in a reference lines up with: the declared one at
+        the position where the part being defined iterates over it, else its own."""
+        for p, s in enumerate(self.c.subscripts[0]):
+            if self.b._range_of(s) == r:
+                return self.b.dimname[self.e.vensim_dims[p]]
+        return self.b.dimname[r]
 
     def _reference(self, node: ae.ReferenceStructure, bang_ok=False) -> Code:
         name = clean(node.reference)
@@ -738,18 +962,20 @@ class Context:
         if name == "initial_time":
             return Code("t₀")
         el = self.b.elements.get(name)
+        rng = next((r for r in self.b.ranges if clean(r) == name), None)
+        if el is None and rng is not None:
+            return self._positions(rng)
         if el is None:
             if name in self.b.controls:
                 raise DSLError(f"{self.e.name}: {node.reference} in an equation is not supported yet")
             raise DSLError(f"{self.e.name}: unknown name {node.reference!r}")
         subs = node.subscripts.subscripts if node.subscripts else []
         base = el.ident
-        if isinstance(el.abstract.components[0], AbstractData):
+        if self._is_data(el):
             base = f"{el.ident}(t)"                       # a data series: its value now
         if not subs:
             return Code(base, el.dims)
         sels, renames, dims = [], [], []
-        lhs = self._lhs_ranges()
         for p, s in enumerate(subs):
             dv = el.vensim_dims[p]
             d = self.b.dimname[dv]
@@ -758,22 +984,61 @@ class Context:
                 e = self.b._elem(s)
                 sels.append(f"{d} = At({label(e)})")
                 continue
-            if r == dv:
-                dims.append(d)
-            elif self.b.main[r] == dv:                      # a subset
-                sels.append(f"{d} = At({self.b.subname[r]})")
-                dims.append(d)
-            elif self.b.main[r] == r and len(self.b.ranges[r]) == len(self.b.ranges[dv]):
-                renames.append(f":{d} => :{self.b.dimname[r]}")   # a copy of the dimension
-                dims.append(self.b.dimname[r])
-            else:
+            target = self._target(r)
+            want, have = self.b.ranges[r], self.b.ranges[dv]
+            if r in self.part:                              # the part's elements only
+                pdim, want, psel = self.part[r]
+                if list(want) != list(have):
+                    if not set(want) <= set(have):
+                        raise DSLError(f"{self.e.name}: {node.reference}[{s}]: elements it hasn't")
+                    same_dim = list(have) == list(self.b.ranges[self._lhs_declared(r)])
+                    sels.append(psel.replace(f"{pdim} =", f"{d} =", 1) if psel and same_dim
+                                else f"{d} = At({self.b._labels(want, s if list(want) == list(self.b.ranges[r]) else None)})")
+                if pdim != d:
+                    renames.append(f":{d} => :{pdim}")
+                dims.append(pdim)
+                continue
+            partner = self._mapped_to(r)
+            if partner is not None:
+                # a mapping: these elements, with the labels of the range they map to
+                lhs_range, lhs_dim = partner
+                if list(want) != list(have):
+                    if not set(want) <= set(have):
+                        raise DSLError(f"{self.e.name}: {node.reference}[{s}]: this mapping is not supported yet")
+                    sels.append(f"{d} = At({self.b.elements_name[r]})")
+                if len(self.b.ranges[lhs_range]) != len(want):
+                    raise DSLError(f"{self.e.name}: {node.reference}[{s}]: a mapping between ranges of different sizes")
+                new = lhs_dim if self.b.ranges[lhs_range] == self.b.ranges[self._lhs_declared(lhs_range)] and \
+                    lhs_dim == self.b.dimname[self._lhs_declared(lhs_range)] else \
+                    f"Dim{{:{lhs_dim}}}({self.b.elements_name[lhs_range]})"
+                renames.append(f":{d} => {new}")
+                dims.append(lhs_dim)
+                continue
+            if not set(want) <= set(have):
                 raise DSLError(f"{self.e.name}: {node.reference}[{s}]: subscript mappings are not supported yet")
+            if list(want) != list(have):                    # some of its elements, or in another order
+                sels.append(f"{d} = At({self.b.elements_name[r]})")
+            if target != d:                                 # under the name it lines up with
+                renames.append(f":{d} => :{target}")
+            dims.append(target)
         text = base
         if sels:
             text += "[" + ", ".join(sels) + "]"
         if renames:
             text = f"set({text}, {', '.join(renames)})"
         return Code(text, tuple(dims))
+
+    def _positions(self, r: str) -> Code:
+        """A subscript used as a value: the positions of its elements (1, 2, …)."""
+        if r not in self.b.positions:
+            name = identifier(r + " position", self.b.taken)
+            self.b.positions[r] = name
+            d = self.b.dimname[r]
+            self.b._hide(self.e.view, f"{name}[{d}] = 1:length({d}),\n    [unit = NoUnits, "
+                                      f"description = \"The position of each element of {d}.\"]")
+        name, d, target = self.b.positions[r], self.b.dimname[r], self._target(r)
+        text = name if target == d else f"set({name}, :{d} => :{target})"
+        return Code(text, (target,))
 
     def _call(self, node: ae.CallStructure) -> Code:
         fname = clean(node.function.reference)
@@ -783,11 +1048,13 @@ class Context:
             fref = self._reference(node.function) if node.function.subscripts else Code(f.ident, f.dims)
             x = self.visit(args[0])
             if f.dims:
-                return Code(f"{fref.text}({x.text})", self._union(fref.dims, x.dims))
+                # called first, then the part: set(f(x)[d = At(…)], …)
+                text = fref.text.replace(f.ident, f"{f.ident}({x.text})", 1)
+                return Code(text, self._union(fref.dims, x.dims))
             dot = "." if x.dims else ""
             return Code(f"{fref.text}{dot}({x.text})", x.dims)
         if fname in ("if_then_else",):
-            c, a, b = (self.visit(x) for x in args)
+            c, a, b = self._condition(args[0]), self.visit(args[1]), self.visit(args[2])
             dot = "." if (c.dims or a.dims or b.dims) else ""
             return Code(f"ifelse{dot}({c.text}, {a.text}, {b.text})", self._union(c.dims, a.dims, b.dims))
         if fname in FUNCTIONS:
@@ -815,8 +1082,7 @@ class Context:
             return Code(f"({t0.text} ≤ t < {t0.wrap(P_ADD)} + {w.wrap(P_ADD + 1)})", ())
         if fname in REDUCTIONS:
             x = self.visit(args[0])
-            summed = [self.b.dimname.get(self.b.main[self.b._range_of(s)], None) or self.b.dimname[self.b._range_of(s)]
-                      for s in self._bangs(args[0])]
+            summed = [self._target(self.b._range_of(s)) for s in self._bangs(args[0])]
             if not summed:
                 raise DSLError(f"{self.e.name}: {fname.upper()} without a subscript with !")
             text, dims = x.text, list(x.dims)
@@ -830,10 +1096,10 @@ class Context:
             r = self.b._range_of(args[0].reference if isinstance(args[0], ae.ReferenceStructure) else str(args[0]))
             if r is None:
                 raise DSLError(f"{self.e.name}: ELMCOUNT of {args[0]!r}")
-            return Code(f"length({self.b.dimname.get(r) or self.b.subname[r]})")
+            return Code(f"length({self.b.dimname[r]})")
         if fname == "invert_matrix":
             m = self.visit(args[0])
-            return Code(f"inv({m.text})", tuple(reversed(m.dims)))
+            return Code(invert_matrix(m.text, m.dims), m.dims)
         if fname == "active_initial":
             raise DSLError(f"{self.e.name}: ACTIVE INITIAL inside an expression is not supported yet")
         raise DSLError(f"{self.e.name}: the function {node.function.reference.upper()} is not supported yet")
