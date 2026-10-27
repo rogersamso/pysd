@@ -240,6 +240,9 @@ def translate_to_julia(
         runs), ``initial_state`` and one ``model!(d, s, p, t)`` over the
         stocks by name (ComponentArrays), solved by ``OrdinaryDiffEq.jl``.
         ``"mtk"`` emits a ``ModelingToolkit.jl`` ``ODESystem``.
+        ``"dsl"`` writes the model in PySD.jl's DSL (``@equations`` and
+        ``Model``): a folder ``<model>_dsl/`` with one file per view (with
+        ``split_views=True``), the dimensions and the input sheets.
 
     subview_sep: list (optional)
         Passed to ``parse_sketch`` when ``split_views=True`` (Vensim only).
@@ -281,6 +284,9 @@ def translate_to_julia(
             "Supported formats: .mdl, .xmile, .stmx"
         )
 
+    if backend == "dsl":
+        from pysd.builders.julia.dsl_builder import DSLBuilder
+        return DSLBuilder(abs_model).build_model()
     return JuliaModelBuilder(abs_model, data_format=data_format,
                              backend=backend).build_model()
 
