@@ -3,7 +3,7 @@ Julia Builder
 
 PySD can translate Vensim (``.mdl``) and Stella (``.xmile`` / ``.stmx``) models
 into standalone Julia files that run without Python or PySD at runtime.
-Two backends are available:
+Three backends are available:
 
 .. list-table::
    :header-rows: 1
@@ -22,6 +22,11 @@ Two backends are available:
        symbolic simplification before solving
      - Small-to-medium models where you want symbolic analysis, LaTeX
        export, or automatic sparsity detection
+   * - ``"dsl"``
+     - Writes the model in PySD.jl's language for models (``@equations``,
+       one file per view), to read and edit as Julia code; PySD.jl builds and
+       runs it (see `The DSL backend`_)
+     - Models you want to keep working on in Julia; Vensim models only
 
 .. note::
    The MTK backend runs ``structural_simplify`` before solving, which can
@@ -82,7 +87,7 @@ From Python
 **Parameters**
 
 ``backend``
-   ``"ode"`` (default) or ``"mtk"``.
+   ``"ode"`` (default), ``"mtk"`` or ``"dsl"``.
 
 ``split_views``
    When ``True`` and the model has multiple Vensim views, the output is
@@ -145,6 +150,73 @@ The ``run_model`` function accepts keyword arguments:
 
    # Other keywords go to OrdinaryDiffEq's solve, e.g. save whole years only
    sol = run_model(saveat=1995.0:1.0:2050.0)
+
+
+The DSL backend
+---------------
+
+``backend="dsl"`` writes the model as Julia code in PySD.jl's language for
+models, meant to be read and edited: each Vensim variable is a declaration
+with its unit and description, and an equation (see PySD.jl's README,
+"Writing models in Julia").  Only Vensim models can be translated this way
+for now.
+
+.. code-block:: python
+
+   path = pysd.translate_to_julia("model.mdl", backend="dsl", split_views=True)
+
+It writes a folder, ``model_dsl/``:
+
+``model.jl``
+   Builds the model: includes the other files and calls ``Model(…)`` with
+   the time settings.
+``<view>.jl``
+   The equations of each Vensim view (with ``split_views=True``; otherwise
+   one ``equations.jl``).
+``dims.jl``, ``inputs.jl``, ``units.jl``
+   The subscript ranges as dimensions; the Excel sheets the model reads;
+   the units Unitful.jl doesn't know (each its own dimension).
+``names.tsv``
+   Each Vensim name and its Julia name.
+``Project.toml``, ``src/Model.jl``
+   The folder as a Julia package (see below).
+
+To run it:
+
+.. code-block:: julia
+
+   using PySD
+   m = include("model_dsl/model.jl")      # builds the model
+   r = run_model(m)
+   r[:population]                         # a variable, at each saved time
+
+   # again, with other values: no rebuild
+   r2 = run_model(m; params = (; growth_rate = 0.02))
+   r3 = run_model(m; inputs = (; scenario = excel("scen.xlsx", "High")))
+
+Building and compiling a large model takes minutes, in every new Julia
+session.  To do it only once, use the folder as a package: Julia then saves
+the model built and compiled the first time, and later sessions load it in
+seconds.
+
+.. code-block:: julia
+
+   using Pkg; Pkg.develop(path = "model_dsl")   # once, where PySD.jl is installed
+
+   using Model                                  # the first time: as long as a build
+   r = run_model(Model.model)                   # later sessions: seconds
+
+For a model of 1,867 names, the first ``using`` takes about 8 minutes;
+later sessions load it in about 8 s, and its first run takes about 6 s.
+``src/Model.jl`` builds the model with PySD.jl's ``@precompile_model``, which
+runs it once while Julia precompiles the package so that all it compiles is
+saved.  The package's name is the model's file name in CamelCase.  Julia builds the
+model again, once, when one of its files or Excel sheets changes; changing
+parameters or inputs at run time never needs it.
+
+Checked so far against Vensim on eleven of the test models (delays, smooths,
+trends, 2-D arrays, Excel inputs, matrix inversion), and on a large model
+(1,867 names) against Python PySD: all its 31,140 saved values, to 1e-9.
 
 
 Structure of the generated model (ODE backend)

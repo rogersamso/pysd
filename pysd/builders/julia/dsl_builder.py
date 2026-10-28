@@ -445,7 +445,35 @@ class DSLBuilder:
         (out / "names.tsv").write_text("\n".join(names) + "\n", encoding="utf-8")
         main = out / (identifier(self.path.stem, set()) + ".jl")
         main.write_text(self._main_text(files), encoding="utf-8")
+        self._write_package(out, main)
         return main
+
+    # The folder is also a Julia package, so that Julia can save the model built
+    # and compiled: `using Pkg; Pkg.develop(path = …)` once, then `using Name`
+    # loads it in seconds, and builds it again only when a file changes.
+    _PACKAGES = {"PySD": "d7e3e0f0-7a2b-4e3a-9c1d-5a6b8c9d0e1f",
+                 "DimensionalData": "0703355e-b756-11e9-17c0-8b28908087d0",
+                 "Unitful": "1986cc42-f94f-5a68-af5c-568840ba703d"}
+
+    def _package_name(self):
+        name = "".join(w[:1].upper() + w[1:] for w in re.split(r"[^0-9A-Za-z]+", self.path.stem) if w)
+        return name if name and name[0].isalpha() else "Model" + name
+
+    def _write_package(self, out, main):
+        import uuid
+        name = self._package_name()
+        deps = "\n".join(f'{k} = "{v}"' for k, v in self._PACKAGES.items())
+        (out / "Project.toml").write_text(
+            f'name = "{name}"\nuuid = "{uuid.uuid5(uuid.NAMESPACE_URL, "pysd-dsl-model:" + name)}"\n'
+            f'version = "0.1.0"\n\n[deps]\n{deps}\n', encoding="utf-8")
+        (out / "src").mkdir(exist_ok=True)
+        (out / "src" / f"{name}.jl").write_text("\n".join([
+            f"# {self.path.name} as a package: `using {name}` loads the model built and",
+            "# compiled, as Julia saved it the first time (and again when a file changes).",
+            f"module {name}",
+            "using PySD",
+            f'@precompile_model model = include("../{main.name}")',
+            "end"]) + "\n", encoding="utf-8")
 
     def _view_text(self, value, view, els):
         params = [e for e in els if e.kind == "parameter"]
@@ -497,7 +525,11 @@ class DSLBuilder:
             dim = f"𝐔{i}"
             out.append(f'@dimension {dim} "{u}" Dim{u}')
             out.append(f'@refunit {u} "{u}" Unit{u} {dim} false')
-        out += ["end", "Unitful.register(ModelUnits)"]
+        # registered now, and again when a precompiled package loads it (__init__)
+        out += ["", "const localfactors = copy(Unitful.basefactors)",
+                "function __init__()", "    merge!(Unitful.basefactors, localfactors)",
+                "    Unitful.register(ModelUnits)", "end", "end",
+                "Unitful.register(ModelUnits)"]
         return "\n".join(out) + "\n"
 
     def _control(self, name, default=None):
