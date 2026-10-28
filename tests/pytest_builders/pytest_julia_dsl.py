@@ -59,10 +59,10 @@ stock = INTEG(1, 0)
 	~	Dmnl
 	~		|
 """, name="my_small_model")
-    project = (folder / "Project.toml").read_text()
+    project = (folder / "Project.toml").read_text(encoding="utf-8")
     assert 'name = "MySmallModel"' in project
     assert re.search(r'^PySD = "[0-9a-f-]{36}"$', project, re.M)
-    source = (folder / "src" / "MySmallModel.jl").read_text()
+    source = (folder / "src" / "MySmallModel.jl").read_text(encoding="utf-8")
     assert "module MySmallModel" in source
     assert '@precompile_model model = include("../my_small_model.jl")' in source
 
@@ -146,7 +146,7 @@ stock = INTEG(1, 0)
 	~	widgets
 	~		|
 """)
-    units = (folder / "units.jl").read_text()
+    units = (folder / "units.jl").read_text(encoding="utf-8")
     assert "function __init__()" in units              # when a package loads it
     assert units.rstrip().endswith("Unitful.register(ModelUnits)")   # and when it's defined
 
@@ -225,5 +225,5 @@ def test_unknown_time_unit_is_declared(tmp_path):
     path = tmp_path / "turns.mdl"
     path.write_text("{UTF-8}\nx = 1\n\t~\tDmnl\n\t~\t\t|\n" + CONTROL.replace("Month", "Turn"), encoding="utf-8")
     main = pysd.translate_to_julia(str(path), backend="dsl")
-    units = (main.parent / "units.jl").read_text()
+    units = (main.parent / "units.jl").read_text(encoding="utf-8")
     assert "@refunit Turn" in units
