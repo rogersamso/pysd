@@ -15,7 +15,8 @@ seconds is reported as a timeout and the remaining models continue in a new
 process.
 
 Environment variables:
-    PYSD_JULIA_BACKENDS  comma-separated backends to test (default "ode,mtk")
+    PYSD_JULIA_BACKENDS  comma-separated backends to test (default "ode,mtk";
+                         "dsl" for the DSL backend)
     PYSD_JULIA_MTK       "all" (default) or "subset" (MTK_SUBSET only)
     PYSD_JULIA_TIMEOUT   per-model timeout in seconds (default 600)
     PYSD_JULIA_STARTUP   extra seconds for the first model of each Julia
@@ -114,6 +115,62 @@ KNOWN_FAILURES = {
     # MTK: numeric conversion of a symbolic value (#502)
     ("vensim:allocate_by_priority", "mtk"): "MTK: numeric conversion of a symbolic value (#502)",
     ("vensim:subscripted_round", "mtk"): "values differ from the reference (#499)",
+    # the DSL backend (PYSD_JULIA_BACKENDS=dsl)
+    ("vensim:allocate_available", "dsl"): "DSL: not translated yet: ALLOCATE AVAILABLE",
+    ("vensim:allocate_by_priority", "dsl"): "DSL: not translated yet: ALLOCATE BY PRIORITY",
+    ("vensim:arithmetics_exp", "dsl"): "DSL: values missing from the results",
+    ("vensim:arguments", "dsl"): "DSL: not translated yet: INITIAL of an expression",
+    ("vensim:conditional_subscripts", "dsl"): "DSL: not translated yet: a subscript used as a value in a conditional subscript",
+    ("vensim:control_vars", "dsl"): "DSL: time settings that are expressions",
+    ("vensim:data_from_other_model", "dsl"): "DSL: values differ from the reference",
+    ("vensim:delay_pipeline", "dsl"): "DSL: values differ from the reference",
+    ("vensim:delays", "dsl"): "DSL: values differ from the reference",
+    ("vensim:dynamic_final_time", "dsl"): "DSL: time settings that are expressions",
+    ("vensim:except", "dsl"): "DSL: not translated yet: :EXCEPT: narrower at several positions",
+    ("vensim:except_multiple", "dsl"): "DSL: not translated yet: :EXCEPT: narrower at several positions",
+    ("vensim:exponentiation", "dsl"): "DSL: values differ from the reference",
+    ("vensim:forecast", "dsl"): "DSL: not translated yet: FORECAST",
+    ("vensim:game", "dsl"): "DSL: not translated yet: GAME",
+    ("vensim:get_constants_subranges", "dsl"): "DSL: values differ from the reference",
+    ("vensim:get_mixed_definitions", "dsl"): "DSL translation: list indices must be integers or slices, not NoneType",
+    ("vensim:get_subscript_3d_arrays_xls", "dsl"): "DSL: a subscript range read from Excel",
+    ("vensim:get_time_value", "dsl"): "DSL: not translated yet: GET TIME VALUE",
+    ("vensim:input_functions", "dsl"): "DSL: not translated yet: PULSE TRAIN",
+    ("vensim:macro_cross_reference", "dsl"): "DSL: not translated yet: macros",
+    ("vensim:macro_expression", "dsl"): "DSL: not translated yet: macros",
+    ("vensim:macro_multi_expression", "dsl"): "DSL: not translated yet: macros",
+    ("vensim:macro_multi_macros", "dsl"): "DSL: not translated yet: macros",
+    ("vensim:macro_stock", "dsl"): "DSL: not translated yet: macros",
+    ("vensim:macro_trailing_definition", "dsl"): "DSL: not translated yet: macros",
+    ("vensim:na", "dsl"): "DSL translation: cannot convert float NaN to integer",
+    ("vensim:odd_number_quotes", "dsl"): "DSL translation: cannot convert float infinity to integer",
+    ("vensim:partial_range_definitions", "dsl"): "DSL: the model does not build: MethodError: no method matching AbstractFloat(::PySD.PiecewiseLinear) The type `",
+    ("vensim:power", "dsl"): "DSL: not translated yet: FINAL TIME in an equation",
+    ("vensim:rounding", "dsl"): "DSL: values differ from the reference",
+    ("vensim:subscript_definition", "dsl"): "DSL: not translated yet: ELMCOUNT of a copy of a range",
+    ("vensim:subscript_individually_defined_1_of_2d_arrays_from_floats", "dsl"): "DSL: the model does not build: `rate_a`: values of size (2,) for dimensions of size (2, 3)",
+    ("vensim:subscript_individually_defined_stocks", "dsl"): "DSL: the translation does not parse as Julia",
+    ("vensim:subscript_logicals", "dsl"): "DSL: values differ from the reference",
+    ("vensim:subscript_mapping_simple", "dsl"): "DSL: values differ from the reference",
+    ("vensim:subscript_mapping_vensim", "dsl"): "DSL: values differ from the reference",
+    ("vensim:subscript_updimensioning", "dsl"): "DSL: the model does not build: ArgumentError: (↓ dim2 [:d, :e]) dims were not found in object.",
+    ("vensim:subscripted_if_then_else", "dsl"): "DSL: the model does not build: MethodError: no method matching broadcast_dims(::typeof(ifelse), ::Bool, ::Dimen",
+    ("vensim:subscripted_lookups", "dsl"): "DSL translation: list indices must be integers or slices, not NoneType",
+    ("vensim:subscripted_ramp_step", "dsl"): "DSL: the model does not build: equations.jl:49: can't tell the dimensions of `clamp(t - start1, 0, finish2 - st",
+    ("vensim:subscripted_round", "dsl"): "DSL: not translated yet: QUANTUM",
+    ("vensim:subscripted_xidz", "dsl"): "DSL: the model does not build: MethodError: no method matching broadcast_dims(::typeof(PySD.pysd_xidz), ::Float",
+    ("vensim:tabbed_arrays", "dsl"): "DSL: the model does not build: DimensionMismatch: stack expects uniform slices, got axes(x) == (1:3, 1:4) while",
+    ("vensim:time", "dsl"): "DSL: not translated yet: FINAL TIME in an equation",
+    ("vensim:vector_order", "dsl"): "DSL translation: list indices must be integers or slices, not NoneType",
+    ("vensim:vector_select", "dsl"): "DSL: not translated yet: VECTOR SELECT",
+    ("vensim:with_lookup", "dsl"): "DSL: the model does not build: ArgumentError: (↓ dim3 [:g, …, :i]) dims were not found in object.",
+    ("xmile:arithmetics_exp", "dsl"): "DSL: values missing from the results",
+    ("xmile:comparisons", "dsl"): "DSL: the unit 'Time' (XMILE) is not known",
+    ("xmile:eval_order", "dsl"): "DSL: the unit 'Time' (XMILE) is not known",
+    ("xmile:exponentiation", "dsl"): "DSL: values differ from the reference",
+    ("xmile:min_max_1arg", "dsl"): "DSL: not translated yet: MIN and MAX of one argument (XMILE)",
+    ("xmile:pi", "dsl"): "DSL: not translated yet: PI",
+    ("xmile:rounding", "dsl"): "DSL: values differ from the reference",
 }
 
 
@@ -142,6 +199,7 @@ JULIA_PACKAGES = {
     "ode": ["PySD", "OrdinaryDiffEq", "NCDatasets", "DataInterpolations", "ComponentArrays"],
     "mtk": ["PySD", "OrdinaryDiffEq", "NCDatasets", "DataInterpolations",
             "ModelingToolkit", "Symbolics"],
+    "dsl": ["PySD", "DimensionalData"],
 }
 
 
@@ -290,6 +348,72 @@ def _id_map(model_file, columns):
     return ids
 
 
+def _clean(name):
+    """A name or element as the DSL translation writes it (lower case, other
+    characters as _)."""
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]", "_", name.strip().strip('"').lower())).strip("_")
+
+
+def _dsl_id_map(names_file, columns):
+    """Reference column -> the DSL's name and labels ('Stock A[B1,C2]' -> 'stock_a[b1,c2]'),
+    with names.tsv (Vensim's name -> Julia's) from the translation."""
+    names = pd.read_csv(names_file, sep="\t", comment="#")
+    to_julia = {_clean(v): j for v, j in zip(names["vensim"], names["julia"])}
+    ids = {}
+    for col in columns:
+        control = col.upper().replace("_", " ")
+        if control in CONTROL_COLUMNS:
+            ids[col] = "@" + CONTROL_COLUMNS[control]                # the model's time settings
+            continue
+        base, _, rest = col.partition("[")
+        jl = to_julia.get(_clean(base))
+        if jl is None:
+            continue
+        if rest:
+            jl += "[" + ",".join(_clean(lb) for lb in rest.rstrip("]").split(",")) + "]"
+        ids[col] = jl
+    return ids
+
+
+def _dsl_block(name, jl_path, ids, t_ref, data):
+    """A DSL model: built (its main file), run (its data files as the sources of
+    its data variables), and its values at the reference times by label."""
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    ids_jl = "String[" + ", ".join(f'"{i}"' for i in ids) + "]"
+    t_jl = "Float64[" + ", ".join(repr(float(t)) for t in t_ref) + "]"
+    parents = "(" + "".join(f'PySD.series_file("{d}"),' for d in data) + ")"
+    return f'''
+println("===START={name}===")
+module _M_{safe}
+    using PySD, DimensionalData
+    load_error = nothing
+    model = nothing
+    try
+        global model = include("{jl_path.as_posix()}")
+    catch e
+        global load_error = e
+    end
+end
+try
+    _M_{safe}.load_error === nothing || throw(_M_{safe}.load_error)
+    local t0 = time()
+    local m = _M_{safe}.model
+    local inputs = haskey(m.inputs, :parents) ? (; parents = {parents}) : (;)
+    local res = Base.invokelatest(PySD.run_model, m; inputs)
+    local vals = Base.invokelatest(_pysd_dsl_values, res, {ids_jl}, {t_jl})
+    println("===MODEL={name}===")
+    for r in axes(vals, 1)
+        println(join([@sprintf("%.17g", x) for x in vals[r, :]], ","))
+    end
+    println("===END=", round(time() - t0; digits=2), "===")
+catch e
+    msg = replace(sprint(showerror, e), "\\n" => " ")
+    println("===ERROR={name}===", first(msg, 600))
+end
+flush(stdout)
+'''
+
+
 def _data_files(spec, folder):
     files = spec.get("data_files")
     if not files:
@@ -301,6 +425,49 @@ def _data_files(spec, folder):
 
 _JULIA_PRELUDE = r'''
 using Printf
+import PySD
+
+# an element by its labels, in Vensim's order of the dimensions or in another
+# (the DSL can order them otherwise: a parameter in parts has its parts' dimension first)
+function _pysd_dsl_pick(v, labels)
+    D = PySD.DimensionalData
+    ds = D.dims(v)
+    perms(n) = n == 1 ? [[1]] : [insert!(copy(p), k, n) for p in perms(n - 1) for k in 1:n]
+    for p in sort!(perms(length(labels)))
+        if all(k -> labels[p[k]] in D.lookup(ds[k]), eachindex(p))
+            return Float64(v[D.At.(labels[p])...])
+        end
+    end
+    error("no element $(labels)")
+end
+
+# a DSL model's values: by name and labels ("stock_a[b1,c2]"), at the reference times
+function _pysd_dsl_values(res, ids::Vector{String}, t_ref::Vector{Float64})
+    At = PySD.DimensionalData.At
+    rows = [argmin(abs.(res.time .- t)) for t in t_ref]
+    out = fill(NaN, length(rows), length(ids))
+    controls = Dict("@initial_time" => :t0, "@final_time" => :tf, "@time_step" => :dt, "@saveper" => :saveat)
+    for (c, id) in enumerate(ids)
+        if haskey(controls, id)
+            out[:, c] .= getfield(res.model, controls[id])
+            continue
+        end
+        mt = match(r"^([^\[]+)(?:\[(.*)\])?$", id)
+        name = Symbol(mt[1])
+        haskey(res, name) || continue
+        labels = mt[2] === nothing ? Symbol[] : Symbol.(split(mt[2], ","))
+        x = try res[name] catch; continue end              # a lookup has no values
+        pick(v) = isempty(labels) ? Float64(v) : _pysd_dsl_pick(v, labels)
+        if x isa AbstractVector && !(x isa PySD.DimensionalData.AbstractDimArray)   # over time
+            for (r, i) in enumerate(rows)
+                try out[r, c] = pick(x[i]) catch end
+            end
+        else                                                # a constant
+            try out[:, c] .= pick(x) catch end
+        end
+    end
+    return out
+end
 
 function _pysd_values(m, sol, ids::Vector{String}, t_ref::Vector{Float64})
     rows = [argmin(abs.(sol.t .- t)) for t in t_ref]
@@ -527,11 +694,17 @@ class _Batch:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     jl_path = translate_to_julia(model, backend=backend)
-                    ids = _id_map(model, list(canon.columns))
+                    ids = _dsl_id_map(jl_path.parent / "names.tsv", list(canon.columns)) \
+                        if backend == "dsl" else _id_map(model, list(canon.columns))
             except Exception as exc:  # translation error is a test result
                 results[case] = f"translation failed: {type(exc).__name__}: {exc}"
                 continue
             self.columns[case] = list(ids)
+            if backend == "dsl":
+                data = _data_files(spec, folder)
+                blocks.append((case, _dsl_block(case, jl_path, list(ids.values()),
+                                                canon.index.values, data)))
+                continue
             kwargs = {}  # run_model defaults to Euler(), as Vensim
             data = _data_files(spec, folder)
             if data:

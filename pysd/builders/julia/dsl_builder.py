@@ -318,7 +318,7 @@ class DSLBuilder:
         asts = [c.ast for c in el.components]
         if any(isinstance(a, ae.IntegStructure) for a in asts):
             return "stock"
-        inputs = (ae.LookupsStructure, ae.GetLookupsStructure, ae.GetDataStructure)
+        inputs = (ae.LookupsStructure, ae.GetLookupsStructure, ae.GetDataStructure, ae.DataStructure)
         if all(isinstance(a, (int, float, np.ndarray, ae.GetConstantsStructure) + inputs) for a in asts):
             if len(asts) > 1 and self._split_position(el) is None:
                 if any(isinstance(a, inputs) for a in asts):
@@ -367,7 +367,7 @@ class DSLBuilder:
             el = self.elements[k]
             if el.kind == "parameter":                    # a data series changes with time
                 return isinstance(el.abstract.components[0], AbstractData) and \
-                    isinstance(el.abstract.components[0].ast, ae.GetDataStructure)
+                    isinstance(el.abstract.components[0].ast, (ae.GetDataStructure, ae.DataStructure))
             if direct[k]:
                 memo[k] = True
                 return True
@@ -515,6 +515,11 @@ class DSLBuilder:
         import os
         entries = [f"{ident} = excel(joinpath(@__DIR__, {jl_string(os.path.relpath(self.path.parent / file, self.out))}), "
                    f"{jl_string(tab)})" for (file, tab), ident in self.sheets.items()]
+        if getattr(self, "uses_parents", False):
+            out += ["# The data variables without an equation come from outside the model, by name:",
+                    "# runs of other models or files of series, run_model(model; inputs = (; parents =",
+                    "# (run_model(world),))) or (; parents = (series_file(\"world.tab\"),))."]
+            entries.append("parents = ()")
         out.append("inputs = (; " + ",\n            ".join(entries) + ")" if entries else "inputs = (;)")
         return "\n".join(out) + "\n"
 
@@ -735,6 +740,10 @@ class DSLBuilder:
                    ("; transpose = true)" if tr else ")")
         if isinstance(ast, ae.GetLookupsStructure):
             return f"lookup({self._sheet(ast.file, ast.tab)}, {jl_string(str(ast.x_row_or_col))}, {jl_string(ast.cell)})"
+        if isinstance(ast, ae.DataStructure):
+            # no equation: a parent model's results give it (by its name there)
+            self.uses_parents = True
+            return f"data(parents, :{e.ident})"
         if isinstance(ast, ae.GetDataStructure):
             kw = getattr(c, "keyword", None)
             method = {"interpolate": ":interpolate", "hold_backward": ":hold_backward",
@@ -795,9 +804,17 @@ class Context:
                 raise DSLError(f"{self.e.name}: Excel constants in a part of several elements of a "
                                "variable that changes with time are not supported yet")
             name = identifier(self.e.name + " " + (sel.split("At(:")[-1].rstrip(")]") if sel else "input"), self.b.taken)
-            unit = self.b._meta(self.e).split(",")[0].lstrip("[")
+            unit = self.b._meta(self.e).split(",")[0].strip("[]")
             self.b._hide(self.e.view, f"{name} = {text},\n    [{unit}, description = \"Read from Excel for {self.e.ident}.\"]")
             return Code(name)
+        if isinstance(node, ae.InlineLookupsStructure):
+            # WITH LOOKUP: the lookup a parameter of its own, called with the argument
+            arg = self.visit(node.argument)
+            name = identifier(self.e.name + " lookup", self.b.taken)
+            unit = self.b._meta(self.e).split(",")[0].strip("[]")
+            text = self.b._one_value(self.e, _Literal(node.lookups))
+            self.b._hide(self.e.view, f"{name} = {text},\n    [{unit}, description = \"The lookup of {self.e.ident}.\"]")
+            return Code(f"{name}({arg.text})", arg.dims)
         if isinstance(node, ae.ArithmeticStructure):
             return self._arithmetic(node)
         if isinstance(node, ae.LogicStructure):
@@ -822,8 +839,14 @@ class Context:
             if not isinstance(node.input, ae.ReferenceStructure):
                 raise DSLError(f"{self.e.name}: DELAY FIXED of an expression is not supported yet")
             tau, init = self.visit(node.delay_time), self.visit(node.initial)
+            # the initial value as the delayed value: of the whole array, as it, when
+            # it's the same reference (Vensim's usual DELAY FIXED(x, τ, x))
+            same = isinstance(node.initial, ae.ReferenceStructure) and \
+                node.initial.reference == node.input.reference and \
+                node.initial.subscripts == node.input.subscripts
+            init_text = self.b.elements[clean(node.input.reference)].ident if same else init.text
             # the whole array delayed, then the part: x(t - τ; init)[d = At(…)]
-            return self._of_whole(node.input, f"(t - {tau.wrap(P_ADD + 1)}; init = {init.text})")
+            return self._of_whole(node.input, f"(t - {tau.wrap(P_ADD + 1)}; init = {init_text})")
         if isinstance(node, ae.InitialStructure):
             return self._initial(node.initial)
         raise DSLError(f"{self.e.name}: {type(node).__name__} is not supported yet")
@@ -1117,13 +1140,15 @@ class Context:
             summed = [self._target(self.b._range_of(s)) for s in self._bangs(args[0])]
             if not summed:
                 raise DSLError(f"{self.e.name}: {fname.upper()} without a subscript with !")
-            text, dims = x.text, list(x.dims)
+            dims = list(x.dims)
             for d in summed:
                 if d not in dims:
                     raise DSLError(f"{self.e.name}: summing over {d}, which {x.text} hasn't")
-                text = f"{REDUCTIONS[fname]}({text}, {d})"
                 dims.remove(d)
-            return Code(text, tuple(dims))
+            # over several dimensions at once, as Vensim and Python (the order of
+            # the additions, and so the last digits, are numpy's)
+            over = summed[0] if len(summed) == 1 else "(" + ", ".join(summed) + ")"
+            return Code(f"{REDUCTIONS[fname]}({x.text}, {over})", tuple(dims))
         if fname == "elmcount":
             r = self.b._range_of(args[0].reference if isinstance(args[0], ae.ReferenceStructure) else str(args[0]))
             if r is None:

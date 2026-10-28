@@ -5,6 +5,16 @@ v3.15.0 (unreleased)
 --------------------
 New Features
 ~~~~~~~~~~~~
+- Julia builder, DSL backend (``translate_to_julia(model, backend="dsl")``):
+  writes a Vensim or XMILE model in PySD.jl's language for models, to read and edit as
+  Julia code: one file per view (``split_views=True``), every name declared
+  with its unit and description, the dimensions, the Excel sheets, the units
+  Unitful.jl doesn't know, and ``names.tsv`` with Vensim's names.  Data
+  variables without an equation come from other models' runs or files of
+  series (``data(parents, :name)``).  The folder is also a Julia package, so
+  that Julia saves the model built and compiled (``@precompile_model``) and
+  later sessions load it in seconds.  See :doc:`julia_builder`, "The DSL
+  backend".
 - **Experimental Julia/ModelingToolkit backend.** New ``pysd.translate_to_julia()``
   function translates Vensim ``.mdl`` files to standalone Julia scripts that use
   `ModelingToolkit.jl <https://github.com/SciML/ModelingToolkit.jl>`_ and

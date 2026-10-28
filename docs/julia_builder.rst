@@ -26,7 +26,7 @@ Three backends are available:
      - Writes the model in PySD.jl's language for models (``@equations``,
        one file per view), to read and edit as Julia code; PySD.jl builds and
        runs it (see `The DSL backend`_)
-     - Models you want to keep working on in Julia; Vensim models only
+     - Models you want to keep working on in Julia
 
 .. note::
    The MTK backend runs ``structural_simplify`` before solving, which can
@@ -158,8 +158,8 @@ The DSL backend
 ``backend="dsl"`` writes the model as Julia code in PySD.jl's language for
 models, meant to be read and edited: each Vensim variable is a declaration
 with its unit and description, and an equation (see PySD.jl's README,
-"Writing models in Julia").  Only Vensim models can be translated this way
-for now.
+"Writing models in Julia").  Vensim and XMILE models translate this way;
+see below for what it translates and what not yet.
 
 .. code-block:: python
 
@@ -194,6 +194,17 @@ To run it:
    r2 = run_model(m; params = (; growth_rate = 0.02))
    r3 = run_model(m; inputs = (; scenario = excel("scen.xlsx", "High")))
 
+Data variables without an equation (in Vensim, filled from a dataset, often
+another model's results) are read with ``data(parents, :name)``: ``parents``,
+in ``inputs.jl``, is given their sources, runs of other models in memory or
+files of series (``.csv`` or ``.tab``, as ``data_files`` in Python):
+
+.. code-block:: julia
+
+   w = run_model(world)
+   r = run_model(region; inputs = (; parents = (w,)))
+   r = run_model(region; inputs = (; parents = (series_file("world.tab"),)))
+
 Building and compiling a large model takes minutes, in every new Julia
 session.  To do it only once, use the folder as a package: Julia then saves
 the model built and compiled the first time, and later sessions load it in
@@ -214,9 +225,61 @@ saved.  The package's name is the model's file name in CamelCase.  Julia builds 
 model again, once, when one of its files or Excel sheets changes; changing
 parameters or inputs at run time never needs it.
 
-Checked so far against Vensim on eleven of the test models (delays, smooths,
-trends, 2-D arrays, Excel inputs, matrix inversion), and on a large model
-(1,867 names) against Python PySD: all its 31,140 saved values, to 1e-9.
+What a translated model gives you, besides running:
+
+- **Units**: every name has its unit (Vensim's, in Unitful.jl's notation; the
+  units Unitful.jl doesn't know are declared in ``units.jl``, each its own
+  dimension).  ``check_units(m)`` checks that every equation's units add up;
+  ``run_model(m; check_units = true)`` checks them before running (``:warn``
+  to only print what doesn't).
+- **Other values without rebuilding**: ``run_model(m; params = (; name =
+  value))`` and ``run_model(m; inputs = (; sheet = excel(…)))`` run the model
+  again, in seconds.  A parameter that fixes the structure of an operator
+  (the time of a DELAY FIXED, the order of a SMOOTH N) needs the model built
+  again, and ``run_model`` says so.
+- **Python's digits**: models are built with ``numerics = :python``, so sums,
+  powers, logarithms, exponentials and inverses round as in Python PySD
+  (numpy's order of additions, the C library's functions, LAPACK's solver).
+- **Names**: ``names.tsv`` maps each Vensim name to its Julia name, to compare
+  results with Vensim's or Python's.
+
+What it translates: stocks, auxiliaries and constants; subscripts (ranges,
+subranges, mappings, arrays of up to 3 dimensions, ``:EXCEPT:``, variables
+defined in parts or element by element); lookups (also inline, ``WITH
+LOOKUP``); ``GET DIRECT CONSTANTS``, ``LOOKUPS`` and ``DATA``; data variables
+without an equation (from other models' runs or files, above); ``SMOOTH``,
+``SMOOTHI``, ``SMOOTH3``, ``SMOOTH N``, ``DELAY1``, ``DELAY3``, ``DELAY N``,
+``DELAY FIXED`` (also of a constant), ``TREND``, ``SAMPLE IF TRUE``,
+``INITIAL``; ``SUM``, ``PROD``, ``VMIN``, ``VMAX`` (over one or several
+dimensions); ``INVERT MATRIX``; ``IF THEN ELSE``, ``STEP``, ``RAMP``,
+``PULSE``, ``ZIDZ``, ``XIDZ``, ``MIN``, ``MAX``, ``MODULO``, ``ELMCOUNT``,
+``LN``, ``LOG``, ``EXP``, ``SQRT``, the trigonometric functions.
+
+What it doesn't translate yet (the translation stops and lists the elements):
+macros; ``ACTIVE INITIAL``; ``FORECAST``; ``ALLOCATE``; ``PULSE TRAIN``;
+``GET TIME VALUE``; ``VECTOR SELECT`` and the other vector functions;
+``QUANTUM``; ``GAME``; the random functions; ``FINAL TIME`` in an equation;
+time settings that are expressions; ``DELAY FIXED`` and ``INITIAL`` of an
+expression (of a variable they work); ``:EXCEPT:`` narrower at several
+positions; constants written as a table of numbers of more than 2
+dimensions; ``INVERT MATRIX`` over more than 3 dimensions; XMILE's ``PI`` and
+``MIN``/``MAX`` of one argument.
+
+The reference tests run every test model with the DSL backend
+(``PYSD_JULIA_BACKENDS=dsl``): 131 match Vensim's output (91 Vensim models,
+40 XMILE), and the others are listed in ``KNOWN_FAILURES`` with the reason.
+Three large models (a global model and two regional models that take data
+from it, 1,900 to 2,000 names each) match Python PySD to 1e-12 in every saved
+value.
+
+Limits to know:
+
+- A model whose data variables come from other models can't be saved as a
+  package yet (the package would need its sources while it's precompiled).
+- A model that compares values that should be exactly equal (``IF x < 0``,
+  where ``x`` is a difference of two equal sums) can still take another
+  branch than Python at a step where the last digit differs, and diverge from
+  there.
 
 
 Structure of the generated model (ODE backend)
