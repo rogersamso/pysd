@@ -438,6 +438,9 @@ class DSLBuilder:
             (out / fname).write_text(self._view_text(name + "_view", view, els), encoding="utf-8")
         (out / "dims.jl").write_text(self._dims_text(), encoding="utf-8")
         (out / "inputs.jl").write_text(self._inputs_text(), encoding="utf-8")
+        # the time unit too (XMILE's "Time", for instance)
+        _, unknown = translate_units(self.controls["time_step"].units if "time_step" in self.controls else "")
+        self.unknown_units.update(unknown)
         if self.unknown_units:
             (out / "units.jl").write_text(self._units_text(), encoding="utf-8")
         names = ["# Vensim's names of the model's variables, for results and comparisons", "vensim\tjulia"]
@@ -1021,8 +1024,8 @@ class Context:
         if el is None and rng is not None:
             return self._positions(rng)
         if el is None:
-            if name in self.b.controls:
-                raise DSLError(f"{self.e.name}: {node.reference} in an equation is not supported yet")
+            if name in self.b.controls:                 # FINAL TIME, SAVEPER: their value
+                return Code(number(self.b._control(name)))
             raise DSLError(f"{self.e.name}: unknown name {node.reference!r}")
         subs = node.subscripts.subscripts if node.subscripts else []
         base = el.ident
@@ -1112,6 +1115,27 @@ class Context:
             c, a, b = self._condition(args[0]), self.visit(args[1]), self.visit(args[2])
             dot = "." if (c.dims or a.dims or b.dims) else ""
             return Code(f"ifelse{dot}({c.text}, {a.text}, {b.text})", self._union(c.dims, a.dims, b.dims))
+        if fname == "pi":
+            return Code("π")
+        if fname in ("pulse_train", "quantum"):
+            # PySD.jl's, as Vensim (the parser gives PULSE TRAIN's arguments
+            # as start, interval, width, end)
+            cs = [self.visit(x) for x in args]
+            dims = self._union(*(c.dims for c in cs))
+            dot = "." if dims else ""
+            first = ["t"] if fname == "pulse_train" else []
+            return Code(f"pysd_{fname}{dot}({', '.join(first + [c.text for c in cs])})", dims)
+        if fname in ("vmin_xmile", "vmax_xmile"):
+            # XMILE's MIN and MAX: of all the elements of one array, or element by element
+            cs = [self.visit(x) for x in args]
+            f = "min" if fname == "vmin_xmile" else "max"
+            if len(cs) == 1:
+                if not cs[0].dims:
+                    return cs[0]
+                over = cs[0].dims[0] if len(cs[0].dims) == 1 else "(" + ", ".join(cs[0].dims) + ")"
+                return Code(f"{'minimum' if f == 'min' else 'maximum'}_over({cs[0].text}, {over})", ())
+            dims = self._union(*(c.dims for c in cs))
+            return Code(f"{f}{'.' if dims else ''}({', '.join(c.text for c in cs)})", dims)
         if fname in FUNCTIONS:
             cs = [self.visit(x) for x in args]
             dims = self._union(*(c.dims for c in cs))
@@ -1126,14 +1150,23 @@ class Context:
             return Code(f"log{dot}({a.text}) {'./' if dot else '/'} log{dot}({b.text})", self._union(a.dims, b.dims), P_MUL)
         if fname == "step":
             h, t0 = self.visit(args[0]), self.visit(args[1])
-            return Code(f"{h.wrap(P_MUL)} {self._op('*', h)} (t ≥ {t0.text})", h.dims, P_MUL)
+            dims = self._union(h.dims, t0.dims)
+            ge = ".≥" if t0.dims else "≥"
+            return Code(f"{h.wrap(P_MUL)} {'.*' if dims else '*'} (t {ge} {t0.text})", dims, P_MUL)
         if fname == "ramp":
             s, t0 = self.visit(args[0]), self.visit(args[1])
             t1 = self.visit(args[2]) if len(args) > 2 else None
-            hi = f"{t1.wrap(P_ADD + 1)} - {t0.wrap(P_ADD + 1)}" if t1 else "Inf"
-            return Code(f"{s.wrap(P_MUL)} {self._op('*', s)} clamp(t - {t0.wrap(P_ADD + 1)}, 0, {hi})", s.dims, P_MUL)
+            times = self._union(t0.dims, t1.dims if t1 else ())
+            sub = ".-" if times else "-"
+            hi = f"{t1.wrap(P_ADD + 1)} {sub} {t0.wrap(P_ADD + 1)}" if t1 else "Inf"
+            dims = self._union(s.dims, times)
+            clamp = f"clamp{'.' if times else ''}(t {sub} {t0.wrap(P_ADD + 1)}, 0, {hi})"
+            return Code(f"{s.wrap(P_MUL)} {'.*' if dims else '*'} {clamp}", dims, P_MUL)
         if fname == "pulse":
             t0, w = self.visit(args[0]), self.visit(args[1])
+            dims = self._union(t0.dims, w.dims)
+            if dims:
+                return Code(f"({t0.text} .≤ t .< {t0.wrap(P_ADD)} .+ {w.wrap(P_ADD + 1)})", dims)
             return Code(f"({t0.text} ≤ t < {t0.wrap(P_ADD)} + {w.wrap(P_ADD + 1)})", ())
         if fname in REDUCTIONS:
             x = self.visit(args[0])

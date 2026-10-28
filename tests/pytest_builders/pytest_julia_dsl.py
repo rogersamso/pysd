@@ -176,3 +176,54 @@ by_a[A] = SUM(x[A, B!])
 """)
     assert re.search(r"total ~ sum_over\(x, \(a, b\)\)", code), code
     assert re.search(r"by_a ~ sum_over\(x, b\)", code), code
+
+
+def test_functions_and_time_settings(tmp_path):
+    _, code = translate(tmp_path, """
+pulses = PULSE TRAIN(1, 2, 5, 10)
+	~	Dmnl
+	~		|
+
+steps = QUANTUM(Time, 3)
+	~	Dmnl
+	~		|
+
+left = FINAL TIME - Time
+	~	Month
+	~		|
+""")
+    assert "pulses ~ pysd_pulse_train(t, 1, 5, 2, 10)" in code     # start, interval, width, end
+    assert "steps ~ pysd_quantum(t, 3)" in code
+    assert "left ~ 10 - t" in code                                  # FINAL TIME: its value
+
+
+def test_step_and_ramp_with_times_of_an_array(tmp_path):
+    _, code = translate(tmp_path, """
+A: a1, a2
+	~	
+	~		|
+
+start[A] = 1, 3
+	~	Month
+	~		|
+
+s[A] = STEP(2, start[A])
+	~	Dmnl
+	~		|
+
+r[A] = RAMP(1, start[A], 8)
+	~	Dmnl
+	~		|
+""")
+    assert re.search(r"s ~ 2 \.\* \(t \.≥ start\)", code), code
+    assert re.search(r"r ~ 1 \.\* clamp\.\(t \.- start, 0, 8 \.- start\)", code), code
+
+
+def test_unknown_time_unit_is_declared(tmp_path):
+    # a time unit Unitful doesn't know (XMILE's "Time", for instance) is declared
+    # in units.jl, as any other unknown unit
+    path = tmp_path / "turns.mdl"
+    path.write_text("{UTF-8}\nx = 1\n\t~\tDmnl\n\t~\t\t|\n" + CONTROL.replace("Month", "Turn"), encoding="utf-8")
+    main = pysd.translate_to_julia(str(path), backend="dsl")
+    units = (main.parent / "units.jl").read_text()
+    assert "@refunit Turn" in units

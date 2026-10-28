@@ -252,22 +252,22 @@ without an equation (from other models' runs or files, above); ``SMOOTH``,
 ``DELAY FIXED`` (also of a constant), ``TREND``, ``SAMPLE IF TRUE``,
 ``INITIAL``; ``SUM``, ``PROD``, ``VMIN``, ``VMAX`` (over one or several
 dimensions); ``INVERT MATRIX``; ``IF THEN ELSE``, ``STEP``, ``RAMP``,
-``PULSE``, ``ZIDZ``, ``XIDZ``, ``MIN``, ``MAX``, ``MODULO``, ``ELMCOUNT``,
-``LN``, ``LOG``, ``EXP``, ``SQRT``, the trigonometric functions.
+``PULSE``, ``PULSE TRAIN``, ``QUANTUM``, ``ZIDZ``, ``XIDZ``, ``MIN``, ``MAX``
+(also XMILE's of one argument), ``MODULO``, ``ELMCOUNT``, ``LN``, ``LOG``,
+``EXP``, ``SQRT``, the trigonometric functions, ``PI``; ``TIME``, ``TIME
+STEP``, ``INITIAL TIME``, ``FINAL TIME`` and ``SAVEPER`` in equations.
 
 What it doesn't translate yet (the translation stops and lists the elements):
-macros; ``ACTIVE INITIAL``; ``FORECAST``; ``ALLOCATE``; ``PULSE TRAIN``;
-``GET TIME VALUE``; ``VECTOR SELECT`` and the other vector functions;
-``QUANTUM``; ``GAME``; the random functions; ``FINAL TIME`` in an equation;
-time settings that are expressions; ``DELAY FIXED`` and ``INITIAL`` of an
-expression (of a variable they work); ``:EXCEPT:`` narrower at several
-positions; constants written as a table of numbers of more than 2
-dimensions; ``INVERT MATRIX`` over more than 3 dimensions; XMILE's ``PI`` and
-``MIN``/``MAX`` of one argument.
+macros; ``ACTIVE INITIAL``; ``FORECAST``; ``ALLOCATE``; ``GET TIME VALUE``;
+``VECTOR SELECT`` and the other vector functions; ``GAME``; the random
+functions; time settings that are expressions; ``DELAY FIXED`` and
+``INITIAL`` of an expression (of a variable they work); ``:EXCEPT:`` narrower
+at several positions; constants written as a table of numbers of more than 2
+dimensions; ``INVERT MATRIX`` over more than 3 dimensions.
 
 The reference tests run every test model with the DSL backend
-(``PYSD_JULIA_BACKENDS=dsl``): 131 match Vensim's output (91 Vensim models,
-40 XMILE), and the others are listed in ``KNOWN_FAILURES`` with the reason.
+(``PYSD_JULIA_BACKENDS=dsl``): 141 match Vensim's output (97 Vensim models,
+44 XMILE), and the others are listed in ``KNOWN_FAILURES`` with the reason.
 Three large models (a global model and two regional models that take data
 from it, 1,900 to 2,000 names each) match Python PySD to 1e-12 in every saved
 value.
@@ -543,8 +543,8 @@ These read ``.xlsx``, ``.xlsm``, ``.xls`` and delimited text files.
   ``filename`` is given
 
 
-Exporting equations to LaTeX (MTK only)
-----------------------------------------
+Exporting equations to LaTeX (MTK and DSL)
+-------------------------------------------
 
 .. code-block:: julia
 
@@ -559,6 +559,16 @@ Exporting equations to LaTeX (MTK only)
 The exported equations correspond to the **structurally simplified** system
 after ModelingToolkit's index reduction — redundant auxiliaries are
 substituted away.
+
+A model of the DSL backend exports its equations as they are written, a
+section per view with a table of its names, units and descriptions (needs
+Latexify.jl):
+
+.. code-block:: julia
+
+   using PySD, Latexify
+   m = include("model_dsl/model.jl")
+   pysd_export_latex(m; filename = "model.tex")
 
 
 Supported Vensim features
