@@ -286,7 +286,7 @@ at several positions; constants written as a table of numbers of more than 2
 dimensions; ``INVERT MATRIX`` over more than 3 dimensions.
 
 The reference tests run every test model with the DSL backend
-(``PYSD_JULIA_BACKENDS=dsl``): 141 match Vensim's output (97 Vensim models,
+(``PYSD_JULIA_BACKENDS=dsl``): 143 match Vensim's output (99 Vensim models,
 44 XMILE), and the others are listed in ``KNOWN_FAILURES`` with the reason.
 Three large models (a global model and two regional models that take data
 from it, 1,900 to 2,000 names each) match Python PySD to 1e-12 in every saved

@@ -149,8 +149,6 @@ KNOWN_FAILURES = {
     ("vensim:subscript_individually_defined_1_of_2d_arrays_from_floats", "dsl"): "DSL: the model does not build: `rate_a`: values of size (2,) for dimensions of size (2, 3)",
     ("vensim:subscript_individually_defined_stocks", "dsl"): "DSL: the translation does not parse as Julia",
     ("vensim:subscript_logicals", "dsl"): "DSL: values differ from the reference",
-    ("vensim:subscript_mapping_simple", "dsl"): "DSL: values differ from the reference",
-    ("vensim:subscript_mapping_vensim", "dsl"): "DSL: values differ from the reference",
     ("vensim:subscript_updimensioning", "dsl"): "DSL: the model does not build: ArgumentError: (↓ dim2 [:d, :e]) dims were not found in object.",
     ("vensim:subscripted_lookups", "dsl"): "DSL translation: list indices must be integers or slices, not NoneType",
     ("vensim:subscripted_round", "dsl"): "DSL: values differ from the reference (as with MTK, #499)",
