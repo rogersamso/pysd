@@ -242,6 +242,26 @@ What a translated model gives you, besides running:
   (numpy's order of additions, the C library's functions, LAPACK's solver).
 - **Names**: ``names.tsv`` maps each Vensim name to its Julia name, to compare
   results with Vensim's or Python's.
+- **Derivatives and uncertainties**: a run computes in the number type of
+  its parameters.  With ForwardDiff.jl,
+  ``ForwardDiff.derivative(k -> run_model(m; params = (; k))[:x][end], 0.1)``
+  is the exact derivative of a result in a parameter, for calibration or to
+  see what a result is most sensitive to; with Measurements.jl,
+  ``params = (; k = 0.1 ± 0.01)`` carries the uncertainty to every result, in
+  one run.
+- **Other solvers**: with a SciML solver package loaded,
+  ``run_model(m, Euler())`` gives the same values with SciML's Euler, and
+  ``run_model(m, BS3(); reltol = 1e-8)`` solves the ODE with adaptive steps,
+  to check that ``TIME STEP`` is small enough; ``ODEProblem(m)`` is the model
+  as a SciML problem, for callbacks and ensembles of runs.  Only Euler with
+  steps of ``TIME STEP`` gives Vensim's values for ``DELAY FIXED``,
+  ``SAMPLE IF TRUE`` and comparisons with ``Time``.
+- **Results as tables**: ``DataFrame(r)`` and ``CSV.write(path, r)`` give a
+  column per variable and element, with the Julia names in Python PySD's
+  form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
+  layer per variable over the time and its dimensions.
+
+These need PySD.jl 0.3.1, which the model's package requires.
 
 What it translates: stocks, auxiliaries and constants; subscripts (ranges,
 subranges, mappings, arrays of up to 3 dimensions, ``:EXCEPT:``, variables

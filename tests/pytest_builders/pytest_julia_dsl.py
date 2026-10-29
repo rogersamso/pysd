@@ -9,6 +9,7 @@ import re
 import pytest
 
 import pysd
+from pysd.builders.julia.julia_model_builder import PYSD_JL_VERSION
 
 CONTROL = r"""
 ********************************************************
@@ -62,6 +63,8 @@ stock = INTEG(1, 0)
     project = (folder / "Project.toml").read_text(encoding="utf-8")
     assert 'name = "MySmallModel"' in project
     assert re.search(r'^PySD = "[0-9a-f-]{36}"$', project, re.M)
+    # the PySD.jl the translation is written for, at least
+    assert f'[compat]\nPySD = "{PYSD_JL_VERSION}"' in project
     source = (folder / "src" / "MySmallModel.jl").read_text(encoding="utf-8")
     assert "module MySmallModel" in source
     assert '@precompile_model model = include("../my_small_model.jl")' in source

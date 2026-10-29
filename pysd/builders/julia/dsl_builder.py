@@ -25,6 +25,8 @@ from pysd.translators.structures.abstract_model import (
     AbstractControlElement, AbstractData, AbstractLookup, AbstractModel,
     AbstractSection)
 
+from .julia_model_builder import PYSD_JL_VERSION
+
 # names the DSL uses for its own functions (and Julia keywords): elements
 # with these names get a suffix
 RESERVED = frozenset("""
@@ -468,7 +470,8 @@ class DSLBuilder:
         deps = "\n".join(f'{k} = "{v}"' for k, v in self._PACKAGES.items())
         (out / "Project.toml").write_text(
             f'name = "{name}"\nuuid = "{uuid.uuid5(uuid.NAMESPACE_URL, "pysd-dsl-model:" + name)}"\n'
-            f'version = "0.1.0"\n\n[deps]\n{deps}\n', encoding="utf-8")
+            f'version = "0.1.0"\n\n[deps]\n{deps}\n\n'
+            f'[compat]\nPySD = "{PYSD_JL_VERSION}"\n', encoding="utf-8")
         (out / "src").mkdir(exist_ok=True)
         (out / "src" / f"{name}.jl").write_text("\n".join([
             f"# {self.path.name} as a package: `using {name}` loads the model built and",

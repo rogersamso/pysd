@@ -15,6 +15,12 @@ New Features
   that Julia saves the model built and compiled (``@precompile_model``) and
   later sessions load it in seconds.  See :doc:`julia_builder`, "The DSL
   backend".
+- Julia builder, DSL backend: translated models need PySD.jl 0.3.1 (the
+  ``[compat]`` of the model's package), which adds derivatives and
+  uncertainties through a run (ForwardDiff.jl, Measurements.jl), SciML's ODE
+  solvers (``run_model(m, solver)``, ``ODEProblem(m)``) and results as tables
+  (``DataFrame(r)``, ``DimStack(r)``).  See :doc:`julia_builder`, "The DSL
+  backend".
 - **Experimental Julia/ModelingToolkit backend.** New ``pysd.translate_to_julia()``
   function translates Vensim ``.mdl`` files to standalone Julia scripts that use
   `ModelingToolkit.jl <https://github.com/SciML/ModelingToolkit.jl>`_ and
