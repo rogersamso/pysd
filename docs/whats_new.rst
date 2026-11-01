@@ -212,11 +212,11 @@ Performance
   every time step, and each equation is compiled once.  On a large model
   (1,800 variables) a run takes about 2 s instead of about 56 s once
   compiled, and loading and compiling is faster too.
-- Julia builder: the stages of a ``DELAY FIXED`` are one array stock and one
-  loop in the generated code, instead of one variable and one equation per
-  stage.  Models with long fixed delays generate far less code (a large model
-  with 1,760-stage delays went from about 400,000 to 12,000 lines), which
-  Julia can compile.
+- Julia builder: a ``DELAY FIXED`` is a record of its input at the model's
+  ticks, instead of one stock per step of its delay.  Models with long fixed
+  delays generate far less code (a large model with 1,760-step delays went
+  from about 400,000 lines, which Julia could not compile, to about 12,000)
+  and have no stocks for them.
 
 Internal Changes
 ~~~~~~~~~~~~~~~~
@@ -225,6 +225,14 @@ Internal Changes
   outputs; known failures are tracked in :issue:`499`, :issue:`500`, :issue:`501`
   and :issue:`502`.  Generated models run and save only when executed as a
   script, and now require PySD.jl 0.2.0.
+- Julia builder: a CI job runs every test model with the DSL backend and the
+  tests of what the DSL translation writes, its coverage merged with the
+  others'.  The Julia jobs also run the tests of fixed delays, samples,
+  switches and ``RANDOM`` with any solver.
+- CI: the Python tests run on Ubuntu 24.04 (``ubuntu-latest`` is now Ubuntu
+  26.04, which has no Python 3.9); the link check skips nbviewer's links,
+  which answer 202 or 503 while a notebook renders; the random statistics
+  tests are seeded (:issue:`507`), so they no longer fail now and then.
 
 v3.14.3 (2025/03/23)
 --------------------
