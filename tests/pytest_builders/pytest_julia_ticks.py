@@ -367,3 +367,28 @@ report("rk4", run_model(solver = RK4()))
     for label in ("again", "half", "rk4"):
         np.testing.assert_array_equal(out[f"{label}:noise"], noise)
         np.testing.assert_allclose(out[f"{label}:stock"], out["euler:stock"], rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("backend", ["ode", "mtk"])
+def test_every_random_function(tmp_path, backend):
+    _, code = _translate(tmp_path, """{UTF-8}
+my seed = 5
+	~	Dmnl
+	~		|
+
+unit = RANDOM 0 1()
+	~	Dmnl
+	~		|
+
+waits = RANDOM EXPONENTIAL(1, 9, 2, 3)
+	~	Dmnl
+	~		|
+
+seeded by a name = RANDOM UNIFORM(0, 1, my seed)
+	~	Dmnl
+	~		|
+""" + CONTROL, backend)
+    assert "pysd_tick_uniform(PySDRecord(_ticks, 1000003, 0), t)" in code       # no seed: 0
+    assert "min(max(1.0 + 2.0 * pysd_tick_exponential(PySDRecord(_ticks, 2000009, 0), t), 1.0), 9.0)" in code
+    # a seed that isn't a number counts as 0
+    assert "pysd_tick_uniform(PySDRecord(_ticks, 3000009, 0), t)" in code
