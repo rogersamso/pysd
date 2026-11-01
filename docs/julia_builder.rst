@@ -262,7 +262,7 @@ What a translated model gives you, besides running:
   form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
   layer per variable over the time and its dimensions.
 
-These need PySD.jl 0.5.0, which the model's package requires.
+These need PySD.jl 0.6.0, which the model's package requires.
 
 What it translates: stocks, auxiliaries and constants; subscripts (ranges,
 subranges, mappings, arrays of up to 3 dimensions, ``:EXCEPT:``, variables

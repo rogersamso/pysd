@@ -15,12 +15,23 @@ New Features
   that Julia saves the model built and compiled (``@precompile_model``) and
   later sessions load it in seconds.  See :doc:`julia_builder`, "The DSL
   backend".
-- Julia builder, DSL backend: translated models need PySD.jl 0.5.0 (the
+- Julia builder, DSL backend: translated models need PySD.jl 0.6.0 (the
   ``[compat]`` of the model's package), which adds derivatives and
   uncertainties through a run (ForwardDiff.jl, Measurements.jl), SciML's ODE
   solvers (``run_model(m, solver)``, ``ODEProblem(m)``) and results as tables
   (``DataFrame(r)``, ``DimStack(r)``).  See :doc:`julia_builder`, "The DSL
   backend".
+- Julia builder, DSL backend: ``RANDOM 0 1``, ``RANDOM UNIFORM``, ``RANDOM
+  NORMAL`` and ``RANDOM EXPONENTIAL`` (drawn once per tick, the same in every
+  run and with any solver; an equation for all of an array draws per
+  element), ``FORECAST``, ``ACTIVE INITIAL`` inside an expression, and ``GET
+  TIME VALUE(0, offset, 0)``.  PySD.jl 0.6.0.
+- Julia builder: a function it does not translate stops the model, as the
+  Python builder: the translation warns that the model will crash and writes
+  ``pysd_not_implemented("NAME", ...)``, which raises an error naming it
+  when the model evaluates it.  Before, the ODE and MTK backends wrote a call
+  to an undefined name, or 0.0 for a structure they did not handle, and the
+  DSL backend stopped the translation.
 - Julia builder, ODE and MTK backends: switches on the time (``STEP``,
   ``PULSE``, comparisons with ``Time``) are exact at the model's ticks with
   any solver; the ``RANDOM`` functions draw once per tick, seeded, the same in
@@ -103,6 +114,10 @@ Deprecations
 
 Bug fixes
 ~~~~~~~~~
+- Julia builder, ODE and MTK backends: ``RANDOM NORMAL`` is a normal
+  truncated to [min, max] and ``RANDOM EXPONENTIAL`` takes Vensim's (min,
+  max, shift, stretch, seed), as the Python builder; the translation with
+  PySD.jl 0.5.0 cut the draws at the bounds and took the shift as the scale.
 - Fix setting parmas with dimensions (:issue:`484`). (`@enekomartinmartinez <https://github.com/enekomartinmartinez>`_)
 - No deprecation warnings with pandas 3.1: results are indexed by time
   without ``inplace``, and spreadsheets are read with an explicit engine
