@@ -230,3 +230,196 @@ def test_unknown_time_unit_is_declared(tmp_path):
     main = pysd.translate_to_julia(str(path), backend="dsl")
     units = (main.parent / "units.jl").read_text(encoding="utf-8")
     assert "@refunit Turn" in units
+
+
+# --- names, labels and units -----------------------------------------------
+
+def test_names_that_clash_get_a_number(tmp_path):
+    # `end` is reserved in Julia (end_var), and `end var` cleans to the same
+    _, code = translate(tmp_path, """
+end = 1
+	~	Dmnl
+	~		|
+
+end var = 2
+	~	Dmnl
+	~		|
+
+total = end + end var
+	~	Dmnl
+	~		|
+""")
+    assert re.search(r"total ~ end_var \+ end_var_1|total ~ end_var_1 \+ end_var", code)
+
+
+def test_numeric_elements_are_symbols(tmp_path):
+    _, code = translate(tmp_path, """
+layer: (l1-l3)
+	~	~		|
+
+depth: 1, 2, 3
+	~	~		|
+
+thickness[depth] = 1, 2, 3
+	~	m
+	~		|
+""")
+    assert 'Symbol("1"), Symbol("2"), Symbol("3")' in code
+
+
+def test_helpers():
+    from pysd.builders.julia.dsl_builder import number, translate_units
+    assert number(True) == "true" and number(False) == "false"
+    # units it can't read are left without a unit
+    assert translate_units("Month @ 2") == (None, [])
+
+
+# --- time settings -----------------------------------------------------------
+
+def test_time_step_as_a_fraction_and_saveper_by_default(tmp_path):
+    path = tmp_path / "fraction.mdl"
+    path.write_text("{UTF-8}\nstock = INTEG(1, 0)\n\t~\tDmnl\n\t~\t\t|\n\n" + CONTROL
+                    .replace("TIME STEP  = 0.5", "TIME STEP  = 1/4")
+                    .replace("SAVEPER  = 1", "SAVEPER  = TIME STEP"), encoding="utf-8")
+    main = pysd.translate_to_julia(str(path), backend="dsl")
+    text = main.read_text(encoding="utf-8")
+    assert "time = 0:0.25:10, saveat = 0.25," in text
+
+
+# --- parameters and expressions ----------------------------------------------
+
+def test_parameter_in_parts_with_except(tmp_path):
+    _, code = translate(tmp_path, """
+dim: a, b, c
+	~	~		|
+
+x[dim] :EXCEPT: [a] = 1
+	~	Dmnl
+	~		|
+
+x[a] = 2
+	~	Dmnl
+	~		|
+""")
+    assert "x[dim = At(:a)]" in code or "x[dim = Not(At(:a))]" in code
+
+
+def test_excel_constant_in_a_variable_that_changes_with_time(tmp_path):
+    _, code = translate(tmp_path, """
+growth = GET DIRECT CONSTANTS('inputs.xlsx', 'Sheet1', 'B2') * Time
+	~	Dmnl
+	~		|
+""")
+    assert 'description = "Read from Excel for growth."' in code
+    assert re.search(r"growth ~ growth_input \* t", code)
+
+
+def test_initial_of_a_constant_is_the_constant(tmp_path):
+    _, code = translate(tmp_path, """
+k = 3
+	~	Dmnl
+	~		|
+
+start = INITIAL(k)
+	~	Dmnl
+	~		|
+
+stock = INTEG(start, 0)
+	~	Dmnl
+	~		|
+""")
+    assert "∂t(stock) ~ start" in code
+    assert re.search(r"start ~ k\b|start = k\b", code)
+
+
+def test_unary_plus(tmp_path):
+    _, code = translate(tmp_path, """
+a = 2
+	~	Dmnl
+	~		|
+
+b = +a * Time
+	~	Dmnl
+	~		|
+""")
+    assert re.search(r"b ~ a \* t", code)
+
+
+def test_pulse_with_times_of_an_array(tmp_path):
+    _, code = translate(tmp_path, """
+dim: a, b
+	~	~		|
+
+start[dim] = 1, 2
+	~	Month
+	~		|
+
+p[dim] = PULSE(start[dim], 1)
+	~	Dmnl
+	~		|
+""")
+    assert "(start .≤ t .< start .+ 1)" in code
+
+
+# --- what isn't translated yet: an error that names the equation -------------
+
+@pytest.mark.parametrize("equations, message", [
+    ("""
+a = 1
+	~	Dmnl
+	~		|
+
+b = 2
+	~	Dmnl
+	~		|
+
+late = DELAY FIXED(a + b, 2, 0)
+	~	Dmnl
+	~		|
+""", "late: DELAY FIXED of an expression"),
+    ("""
+x = 1
+	~	Dmnl
+	~		|
+
+y = ACTIVE INITIAL(x, 1) + 1
+	~	Dmnl
+	~		|
+""", "y: ACTIVE INITIAL inside an expression"),
+    ("""
+a: a1, a2
+	~	~		|
+
+b: b1, b2
+	~	~		|
+
+x[a] = 1, 2
+	~	Dmnl
+	~		|
+
+y[b] = x[b]
+	~	Dmnl
+	~		|
+""", r"y: x\[b\]: elements it hasn.t"),
+    ("""
+a: a1, a2
+	~	~		|
+
+b: b1, b2
+	~	~		|
+
+c: c1, c2
+	~	~		|
+
+m[b, c] = 1, 0; 0, 1;
+	~	Dmnl
+	~		|
+
+inverse[a, b, c] = INVERT MATRIX(m[b, c], 2)
+	~	Dmnl
+	~		|
+""", "inverse: INVERT MATRIX over 3 dimensions"),
+])
+def test_not_translated_yet(tmp_path, equations, message):
+    with pytest.raises(Exception, match=message):
+        translate(tmp_path, equations)

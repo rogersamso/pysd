@@ -101,6 +101,7 @@ jobs:
         run: |
           pytest tests/pytest_builders/pytest_julia_reference.py \
                  tests/pytest_builders/pytest_julia_params.py \
+                 tests/pytest_builders/pytest_julia_ticks.py \
                  "tests/pytest_builders/pytest_julia.py::TestTidy" --cov=pysd
           coverage xml
       - name: Coveralls
@@ -112,9 +113,64 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # The DSL backend (backend="dsl"): every test model, translated to PySD.jl's
+  # DSL, run and compared with its reference output, and the tests of what
+  # the translation writes.  A job of its own, in parallel with the others.
+  julia-dsl:
+    name: Julia builder, DSL backend (reference models)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write  # lets julia-actions/cache delete old caches
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+      - name: Cache Julia depot
+        uses: julia-actions/cache@v3
+      - name: Install Julia packages
+        run: |
+          julia --startup-file=no -e '
+            using Pkg
+            Pkg.activate("pysd_ci", shared=true)
+            Pkg.develop(PackageSpec(path="pysd/builders/julia/PySD.jl"))
+            Pkg.add(["DimensionalData", "Unitful"])
+            Pkg.precompile()
+          '
+      - name: Install Python dependencies
+        run: |
+          pip install -U pip wheel
+          pip install --prefer-binary -r tests/requirements.txt
+          pip install --prefer-binary -e .
+      - name: Test and coverage
+        env:
+          JULIA_PROJECT: "@pysd_ci"
+          PYSD_JULIA_REQUIRED: "1"
+          PYSD_JULIA_BACKENDS: dsl
+        run: |
+          pytest tests/pytest_builders/pytest_julia_reference.py \
+                 tests/pytest_builders/pytest_julia_dsl.py --cov=pysd
+          coverage xml
+      - name: Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          file: coverage.xml
+          flag-name: julia-dsl
+          parallel: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   coverage:
     name: Merge coverage
-    needs: [test, julia]
+    needs: [test, julia, julia-dsl]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -122,7 +178,7 @@ jobs:
         uses: coverallsapp/github-action@v2
         with:
           parallel-finished: true
-          carryforward: python,julia
+          carryforward: python,julia,julia-dsl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
