@@ -1185,6 +1185,21 @@ class Context:
             # the additions, and so the last digits, are numpy's)
             over = summed[0] if len(summed) == 1 else "(" + ", ".join(summed) + ")"
             return Code(f"{REDUCTIONS[fname]}({x.text}, {over})", tuple(dims))
+        if fname in ("random_0_1", "random_uniform", "random_normal", "random_exponential"):
+            # PySD.jl's RANDOM: one draw per tick, held in between, the same in
+            # every run, with any solver; a draw per element of the variable
+            # when the equation is for all of it (its arguments numbers)
+            cs = [self.visit(x) for x in args]
+            vals, seed = (cs[:-1], cs[-1]) if fname != "random_0_1" else (cs, None)
+            dims = self._union(*(c.dims for c in vals))
+            kws = [] if seed is None else [f"seed = {seed.text}"]
+            if self.e.dims and not self.b._lhs_selection(self.e, self.c) and not self.initial:
+                extra = tuple(d for d in self.e.dims if d not in dims)
+                if extra:
+                    kws.append("dims = " + (extra[0] if len(extra) == 1 else "(" + ", ".join(extra) + ")"))
+                    dims = self._union(dims, extra)
+            kw = ("; " + ", ".join(kws)) if kws else ""
+            return Code(f"{fname}({', '.join(c.text for c in vals)}{kw})", dims)
         if fname == "elmcount":
             r = self.b._range_of(args[0].reference if isinstance(args[0], ae.ReferenceStructure) else str(args[0]))
             if r is None:

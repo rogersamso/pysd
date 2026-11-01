@@ -326,7 +326,8 @@ def test_random_calls_are_drawn_at_the_ticks(tmp_path, backend):
     _, code = _translate(tmp_path, RANDOMS, backend)
     # standard draws, once per tick, from each call's stream (its number and its seed)
     assert "0.0 + (1.0 - 0.0) * pysd_tick_uniform(PySDRecord(_ticks, 1000010, 0), t)" in code
-    assert "min(max(0.0 + 1.0 * pysd_tick_normal(PySDRecord(_ticks, 2000009, 0, _i0), t), -5.0), 5.0)" in code
+    # a normal truncated to [-5, 5], as Python PySD's
+    assert "pysd_tick_normal(PySDRecord(_ticks, 2000009, 0, _i0), pysd_xidz(-5.0 - 0.0, 1.0, -Inf), pysd_xidz(5.0 - 0.0, 1.0, Inf), t)" in code
     assert "pysd_random_" not in code
     assert "_ticks_callback(" in code
 
@@ -380,7 +381,7 @@ unit = RANDOM 0 1()
 	~	Dmnl
 	~		|
 
-waits = RANDOM EXPONENTIAL(1, 9, 2, 3)
+waits = RANDOM EXPONENTIAL(1, 9, 2, 3, 4)
 	~	Dmnl
 	~		|
 
@@ -389,6 +390,7 @@ seeded by a name = RANDOM UNIFORM(0, 1, my seed)
 	~		|
 """ + CONTROL, backend)
     assert "pysd_tick_uniform(PySDRecord(_ticks, 1000003, 0), t)" in code       # no seed: 0
-    assert "min(max(1.0 + 2.0 * pysd_tick_exponential(PySDRecord(_ticks, 2000009, 0), t), 1.0), 9.0)" in code
+    # (min, max, shift, stretch, seed): from max(min, shift), stretch times an exponential, below max
+    assert "max(1.0, 2.0) + 3.0 * pysd_tick_exponential(PySDRecord(_ticks, 2000010, 0), pysd_xidz(9.0 - max(1.0, 2.0), 3.0, Inf), t)" in code
     # a seed that isn't a number counts as 0
     assert "pysd_tick_uniform(PySDRecord(_ticks, 3000009, 0), t)" in code

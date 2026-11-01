@@ -423,3 +423,31 @@ inverse[a, b, c] = INVERT MATRIX(m[b, c], 2)
 def test_not_translated_yet(tmp_path, equations, message):
     with pytest.raises(Exception, match=message):
         translate(tmp_path, equations)
+
+
+def test_random_functions(tmp_path):
+    _, code = translate(tmp_path, """
+dim: a, b
+	~	~		|
+
+noise = RANDOM UNIFORM(0, 1, 7)
+	~	Dmnl
+	~		|
+
+shocks[dim] = 10 + RANDOM NORMAL(-5, 5, 0, 1, 3)
+	~	Dmnl
+	~		|
+
+waits = RANDOM EXPONENTIAL(0, 9, 1, 2, 4)
+	~	Dmnl
+	~		|
+
+fraction = RANDOM 0 1()
+	~	Dmnl
+	~		|
+""")
+    assert "noise ~ random_uniform(0, 1; seed = 7)" in code
+    # an equation for all of an array: a draw per element
+    assert "random_normal(-5, 5, 0, 1; seed = 3, dims = dim)" in code
+    assert "waits ~ random_exponential(0, 9, 1, 2; seed = 4)" in code
+    assert "fraction ~ random_0_1()" in code

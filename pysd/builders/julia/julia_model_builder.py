@@ -2465,8 +2465,8 @@ class JuliaSectionBuilder:
         """The RANDOM calls the visitors queued (``_lift_random``): each a
         variable of its own, a standard draw of PySD.jl's
         (``pysd_tick_uniform``, ``_normal``, ``_exponential``: once per tick,
-        from the call's stream, the element and the tick) that the equation
-        scales and cuts as Vensim does.  It holds between ticks, and the draws
+        from the call's stream, the element and the tick, the last two
+        truncated) that the equation scales as Python PySD does.  It holds between ticks, and the draws
         are the same in every run and with any solver.  The stream is the
         call's number and its seed (a seed that isn't a number counts as 0)."""
         for key, (name, func, args, subs) in enumerate(getattr(self.namespace, "pending_random", []), 1):
@@ -2480,19 +2480,27 @@ class JuliaSectionBuilder:
             idx_vars = list(subs.values())
             at = "".join(f", {i}" for i in idx_vars)
 
-            def draw(kind):
-                return f"pysd_tick_{kind}(PySDRecord(_ticks, {stream}, 0{at}), t)"
+            def draw(kind, *bounds):
+                return f"pysd_tick_{kind}(PySDRecord(_ticks, {stream}, 0{at}), {''.join(b + ', ' for b in bounds)}t)"
             if func == "pysd_random_0_1":
                 expr = draw("uniform")
             elif func == "pysd_random_uniform":
                 lo, hi = args[0], args[1]
                 expr = f"({lo} + ({hi} - {lo}) * {draw('uniform')})"
             elif func == "pysd_random_normal":
+                # (min, max, mean, sd, seed): a normal truncated to [min, max], as
+                # Python PySD's (drawn again while outside)
                 lo, hi, mean, std = args[0], args[1], args[2], args[3]
-                expr = f"min(max({mean} + {std} * {draw('normal')}, {lo}), {hi})"
+                a = f"pysd_xidz({lo} - {mean}, {std}, -Inf)"
+                b = f"pysd_xidz({hi} - {mean}, {std}, Inf)"
+                expr = f"({mean} + {std} * {draw('normal', a, b)})"
             else:                                           # pysd_random_exponential
-                lo, hi, mean = args[0], args[1], args[2]
-                expr = f"min(max({lo} + {mean} * {draw('exponential')}, {lo}), {hi})"
+                # (min, max, shift, stretch, seed): shift + stretch times an
+                # exponential, from at least min, truncated at max, as Python PySD's
+                lo, hi, shift, stretch = args[0], args[1], args[2], args[3]
+                loc = f"max({lo}, {shift})"
+                b = f"pysd_xidz({hi} - {loc}, {stretch}, Inf)"
+                expr = f"({loc} + {stretch} * {draw('exponential', b)})"
             if subs:
                 dims = [(d, self._subs_sizes[d]) for d in subs]
                 idx = ", ".join(idx_vars)
