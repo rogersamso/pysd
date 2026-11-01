@@ -640,8 +640,9 @@ class TestJuliaASTVisitor:
             arguments=(0.0, 1.0, 42.0),
         )
         result = v.visit(node)
-        assert "pysd_random_uniform" in result
-        assert "pysd_random_uniform" in needed
+        # a variable of its own, drawn once per tick (the model builder writes it)
+        assert result == "_rnd0"
+        assert v.namespace.pending_random == [("_rnd0", "pysd_random_uniform", ["0.0", "1.0", "42.0"], {})]
 
     def test_vector_sort_order_registered(self):
         v, _, _, needed = _visitor_with_namespace()
@@ -1702,7 +1703,7 @@ class TestJuliaSectionBuilderExpansions:
         sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
         assert "_df_in_delayed_fixed ~ 5.0" in all_eqs
-        assert "delayed_fixed ~ pysd_fixed_delay(_ticks, 1, 2, 5.0, t)" in all_eqs
+        assert "delayed_fixed ~ pysd_fixed_delay(PySDRecord(_ticks, 1, 2), 5.0, t)" in all_eqs
         assert sb._tick_records == ["_df_in_delayed_fixed"]
         assert not any("_df_pipe_" in d for d in sb.stock_decls)
 
@@ -1825,7 +1826,7 @@ class TestJuliaSectionBuilderExpansions:
         sb = _section_builder_from_elements([elem], backend=backend)
         sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert "sample_out ~ pysd_sampled(_ticks, 1, 1.0, 5.0, 5.0, t)" in all_eqs
+        assert "sample_out ~ pysd_sampled(PySDRecord(_ticks, 1, 0), 1.0, 5.0, 5.0, t)" in all_eqs
         assert sb._tick_records == ["sample_out"]
 
     def test_allocate_available_emits_helper_call(self):
@@ -4947,7 +4948,7 @@ class TestMdlFileTranslation:
         jl_path = self._translate(mdl, tmp_path)
         content = jl_path.read_text()
         # ODE: recorded at the ticks (no stock of its own)
-        assert "pysd_sampled(_ticks, " in content
+        assert "pysd_sampled(PySDRecord(_ticks, " in content
         assert "_sit_" not in content
 
     def test_except_2d_integ_no_unsupported_warning(self, tmp_path):
@@ -5145,7 +5146,7 @@ class TestXmileDelayFixed:
         # input (_df_in__edf0) is recorded at the model's ticks.
         assert "_edf0" in content
         assert "_df_in__edf0" in content
-        assert "pysd_fixed_delay(_ticks, " in content
+        assert "pysd_fixed_delay(PySDRecord(_ticks, " in content
 
 
 class TestEmbeddedDelayDrain2D:
@@ -6368,7 +6369,7 @@ class TestSubscriptedExpansions:
         sb.build_section()
         eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
         assert any("[_df_in_df_sub[_i0] ~ 5.0 for _i0 in 1:N_SECTOR]..." == e for e in eqs), eqs
-        assert any("pysd_fixed_delay(_ticks, 1, 2, 5.0, t, _i0) for _i0 in 1:N_SECTOR" in e for e in eqs), eqs
+        assert any("pysd_fixed_delay(PySDRecord(_ticks, 1, 2, _i0), 5.0, t) for _i0 in 1:N_SECTOR" in e for e in eqs), eqs
         assert not any("_df_pipe_" in d for d in sb.stock_decls)
         assert sb._tick_records == ["_df_in_df_sub"]
 
@@ -6388,7 +6389,7 @@ class TestSubscriptedExpansions:
                  _make_control_element("TIME STEP", 1.0)], backend=backend)
             sb.build_section()
             eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-            assert "dst ~ pysd_fixed_delay(_ticks, 1, 2, 5.0, t)" in eqs, eqs
+            assert "dst ~ pysd_fixed_delay(PySDRecord(_ticks, 1, 2), 5.0, t)" in eqs, eqs
 
     # ------------------------------------------------------------------
     # Subscripted SAMPLE IF TRUE (lines 2388-2415)
@@ -6404,7 +6405,7 @@ class TestSubscriptedExpansions:
         sb.build_section()
         eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
         # one record of the whole array, read element by element
-        assert any("pysd_sampled(_ticks, 1, 1.0, 7.0, 0.0, t, _i0) for _i0 in 1:" in e for e in eqs), eqs
+        assert any("pysd_sampled(PySDRecord(_ticks, 1, 0, _i0), 1.0, 7.0, 0.0, t) for _i0 in 1:" in e for e in eqs), eqs
         assert not any("_sit_" in d for d in sb.stock_decls)
 
     # ------------------------------------------------------------------
@@ -7650,7 +7651,7 @@ class TestSubscriptedDelayFixedArguments:
         # the input recorded at the ticks is each element's, and so is the
         # initial value read before the first two ticks
         assert "_df_in_r_delayed_subs[_i0] = r_subs[_i0]" in content
-        assert "pysd_fixed_delay(_ticks, 1, 2, r_subs[_i0], t, _i0)" in content
+        assert "pysd_fixed_delay(PySDRecord(_ticks, 1, 2, _i0), r_subs[_i0], t)" in content
 
 
 class TestSumOverSubrange:

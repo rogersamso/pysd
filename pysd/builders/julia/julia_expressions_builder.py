@@ -261,6 +261,11 @@ def lookup_interpolation_code(
 # AST visitor
 # ---------------------------------------------------------------------------
 
+#: Vensim's RANDOM functions: drawn once per tick (``_lift_random``)
+_RANDOM_FUNCTIONS = ("pysd_random_0_1", "pysd_random_uniform",
+                     "pysd_random_normal", "pysd_random_exponential")
+
+
 class JuliaASTVisitor:
     """Recursively converts an AMR AST node to a Julia expression string.
 
@@ -349,6 +354,19 @@ class JuliaASTVisitor:
         # The model builder drains this list after each element to lift them out
         # into dedicated auxiliary pipeline stocks.
         self._pending_delay_fixed: List[tuple] = []
+
+    def _lift_random(self, func: str, args: List[str]) -> str:
+        """A RANDOM function: a variable of its own (``_rnd<n>``, an array over
+        the dimensions of the element being written), drawn once per tick of
+        the model and held in between (PySD.jl's ``pysd_tick_random_*``).  It
+        is queued on the namespace, shared by every visitor, and the model
+        builder writes its equation (``_lift_randoms``)."""
+        pending = self.namespace.__dict__.setdefault("pending_random", [])
+        name = f"_rnd{len(pending)}"
+        self.namespace.namespace[f"__internal{name}"] = name
+        subs = dict(self.active_subs)
+        pending.append((name, func, args, subs))
+        return f"{name}[{', '.join(subs.values())}]" if subs else name
 
     def _jl_n(self, dim_name: str) -> str:
         """Julia constant name for the size of *dim_name* (``N_DIMNAME``)."""
@@ -1126,6 +1144,9 @@ class JuliaASTVisitor:
             x, m = (self.visit(a) for a in node.arguments)
             return f"({x} - pysd_quantum({x}, {m}))"
         julia_func = BUILTIN_FUNCTIONS.get(func_upper)
+
+        if julia_func in _RANDOM_FUNCTIONS:
+            return self._lift_random(julia_func, [self.visit(a) for a in node.arguments])
 
         if julia_func is None:
             # Check whether the function name is a model variable (lookup table).

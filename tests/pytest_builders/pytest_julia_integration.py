@@ -525,7 +525,7 @@ class TestNewConstructsTranslation:
         assert "_df_in_output" in content
         assert "DELAY FIXED is not supported" not in content
         # delay_time=2 and time_step=0.0625 → 32 ticks
-        assert re.search(r"pysd_fixed_delay\(_ticks, 1, 32, ", content)
+        assert re.search(r"pysd_fixed_delay\(PySDRecord\(_ticks, 1, 32\), ", content)
         assert "pysd_record!(_ticks, 1, hasproperty(v, :_df_in_output) ? v._df_in_output : p._df_in_output)" in content
         assert "_df_pipe_" not in content
 
@@ -590,7 +590,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_sample_if_true test model not found")
         content = self._translate(mdl, tmp_path)
-        assert re.search(r"sample_simple = pysd_sampled\(_ticks, \d+, ", content)
+        assert re.search(r"sample_simple = pysd_sampled\(PySDRecord\(_ticks, \d+, 0\), ", content)
         assert re.search(r"pysd_record!\(_ticks, \d+, hasproperty\(v, :sample_simple\)", content)
         assert "_sit_" not in content
 

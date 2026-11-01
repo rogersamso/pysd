@@ -416,6 +416,8 @@ class JuliaSectionBuilder:
         # whether an equation switches on the time (STEP, PULSE, Time >= 2015):
         # the model then stops at the ticks too (see _finish_ticks)
         self._time_switches: bool = False
+        # whether the model draws random numbers (once per tick: _lift_randoms)
+        self._randoms: bool = False
         # the equations written for Euler steps of TIME STEP, by kind
         # (_scan_stepwise): named in a warning when another solver runs
         self._stepwise: Dict[str, List[str]] = {}
@@ -2191,7 +2193,7 @@ class JuliaSectionBuilder:
             self.aux_decls.append(f"@variables {in_name}(t)")
             eqs.append(f"{in_name} ~ {delay_time_expr}")
         times = [delay_time_expr] + [
-            f"pysd_fixed_delay(_ticks, {key}, {k}, {u0_delay_expr}, t{at})" for k in range(1, max(order, 2))]
+            f"pysd_fixed_delay(PySDRecord(_ticks, {key}, {k}{at}), {u0_delay_expr}, t)" for k in range(1, max(order, 2))]
         return times[:order], times[1]
 
     # ------------------------------------------------------------------
@@ -2441,7 +2443,7 @@ class JuliaSectionBuilder:
     def _uses_ticks(self) -> bool:
         """Whether the model stops at its ticks: it records fixed delays or
         samples, or it switches on the time."""
-        return bool(self._tick_records) or self._time_switches
+        return bool(self._tick_records) or self._time_switches or self._randoms
 
     def _finish_ticks(self) -> None:
         """After every equation is built: a model that switches on the time
@@ -2449,6 +2451,7 @@ class JuliaSectionBuilder:
         ``pysd_tick_time`` (a solver's step that ends at a tick sees the time
         just before it, so a switch at a tick is exact).  Also the equations
         written for Euler steps of TIME STEP."""
+        self._lift_randoms()
         equations = [e for eqs, control in self.built_elements.values() if not control for e in eqs]
         self._time_switches = any(self._SWITCH_RE.search(e) for e in equations)
         if self._time_switches:          # (fixed delays and samples read the tick count)
@@ -2457,6 +2460,49 @@ class JuliaSectionBuilder:
                     self.built_elements[name] = (
                         [self._TIME_RE.sub("pysd_tick_time(_ticks, t)", e) for e in eqs], control)
         self._stepwise = self._scan_stepwise()
+
+    def _lift_randoms(self) -> None:
+        """The RANDOM calls the visitors queued (``_lift_random``): each a
+        variable of its own, a standard draw of PySD.jl's
+        (``pysd_tick_uniform``, ``_normal``, ``_exponential``: once per tick,
+        from the call's stream, the element and the tick) that the equation
+        scales and cuts as Vensim does.  It holds between ticks, and the draws
+        are the same in every run and with any solver.  The stream is the
+        call's number and its seed (a seed that isn't a number counts as 0)."""
+        for key, (name, func, args, subs) in enumerate(getattr(self.namespace, "pending_random", []), 1):
+            self._randoms = True
+            seed = args[-1] if func != "pysd_random_0_1" else "0"
+            try:
+                seed = int(float(seed))
+            except ValueError:
+                seed = 0
+            stream = key * 1_000_003 + seed
+            idx_vars = list(subs.values())
+            at = "".join(f", {i}" for i in idx_vars)
+
+            def draw(kind):
+                return f"pysd_tick_{kind}(PySDRecord(_ticks, {stream}, 0{at}), t)"
+            if func == "pysd_random_0_1":
+                expr = draw("uniform")
+            elif func == "pysd_random_uniform":
+                lo, hi = args[0], args[1]
+                expr = f"({lo} + ({hi} - {lo}) * {draw('uniform')})"
+            elif func == "pysd_random_normal":
+                lo, hi, mean, std = args[0], args[1], args[2], args[3]
+                expr = f"min(max({mean} + {std} * {draw('normal')}, {lo}), {hi})"
+            else:                                           # pysd_random_exponential
+                lo, hi, mean = args[0], args[1], args[2]
+                expr = f"min(max({lo} + {mean} * {draw('exponential')}, {lo}), {hi})"
+            if subs:
+                dims = [(d, self._subs_sizes[d]) for d in subs]
+                idx = ", ".join(idx_vars)
+                self.aux_decls.append(f"@variables {name}(t)[{self._range_str(dims)}]")
+                eqs = [f"[{name}[{idx}] ~ {expr} for {self._for_clause(dims, idx_vars)}]..."]
+            else:
+                self.aux_decls.append(f"@variables {name}(t)")
+                eqs = [f"{name} ~ {expr}"]
+            self.built_elements[name] = (eqs, False)
+        self.namespace.__dict__["pending_random"] = []
 
     def _scan_stepwise(self) -> Dict[str, List[str]]:
         """The equations written for Euler steps of TIME STEP, which may mean
@@ -2570,14 +2616,14 @@ class JuliaSectionBuilder:
             self.aux_decls.append(f"@variables {identifier}(t)[{self._range_str(dims)}]")
             return [
                 f"[{in_name}[{idx}] ~ {input_expr} for {for_clause}]...",
-                f"[{identifier}[{idx}] ~ pysd_fixed_delay(_ticks, {key}, {N}, {initial_expr}, t, {idx}) "
+                f"[{identifier}[{idx}] ~ pysd_fixed_delay(PySDRecord(_ticks, {key}, {N}, {idx}), {initial_expr}, t) "
                 f"for {for_clause}]...",
             ]
         self.aux_decls.append(f"@variables {in_name}(t)")
         self.aux_decls.append(f"@variables {identifier}(t)")
         return [
             f"{in_name} ~ {input_expr}",
-            f"{identifier} ~ pysd_fixed_delay(_ticks, {key}, {N}, {initial_expr}, t)",
+            f"{identifier} ~ pysd_fixed_delay(PySDRecord(_ticks, {key}, {N}), {initial_expr}, t)",
         ]
 
     # ------------------------------------------------------------------
@@ -2701,13 +2747,13 @@ class JuliaSectionBuilder:
             idx = ", ".join(idx_vars)
             self.aux_decls.append(f"@variables {identifier}(t)[{self._range_str(dims)}]")
             return [
-                f"[{identifier}[{idx}] ~ pysd_sampled(_ticks, {key}, {vnd.visit(ast.condition)}, "
-                f"{vnd.visit(ast.input)}, {vnd.visit(ast.initial)}, t, {idx}) "
+                f"[{identifier}[{idx}] ~ pysd_sampled(PySDRecord(_ticks, {key}, 0, {idx}), "
+                f"{vnd.visit(ast.condition)}, {vnd.visit(ast.input)}, {vnd.visit(ast.initial)}, t) "
                 f"for {self._for_clause(dims, idx_vars)}]...",
             ]
         self.aux_decls.append(f"@variables {identifier}(t)")
         return [
-            f"{identifier} ~ pysd_sampled(_ticks, {key}, {visitor.visit(ast.condition)}, "
+            f"{identifier} ~ pysd_sampled(PySDRecord(_ticks, {key}, 0), {visitor.visit(ast.condition)}, "
             f"{visitor.visit(ast.input)}, {visitor.visit(ast.initial)}, t)",
         ]
 
@@ -5824,7 +5870,7 @@ class JuliaSectionBuilder:
                 return nothing
             end
             """).replace("{RECORDS}", records) if self._tick_records else \
-            "_record_ticks!(u, t, p = _params) = nothing          # (switches on the time only)\n"
+            "_record_ticks!(u, t, p = _params) = nothing          # (nothing to record: switches on the time or random draws only)\n"
         return textwrap.dedent("""\
             # Fixed delays and samples move at the model's ticks, every TIME STEP,
             # as Vensim: a solver stops at each, where they are recorded from the
@@ -5947,7 +5993,7 @@ class JuliaSectionBuilder:
                     return nothing
                 end
                 """).replace("{VALUES}", values).replace("{RECORDS}", records) if self._tick_records else \
-                "_record_ticks!(u, t, p = prob.p) = nothing          # (switches on the time only)\n"
+                "_record_ticks!(u, t, p = prob.p) = nothing          # (nothing to record: switches on the time or random draws only)\n"
             ticks = textwrap.dedent("""\
                 # Fixed delays and samples move at the model's ticks, every TIME STEP,
                 # as Vensim: a solver stops at each, where they are recorded from the

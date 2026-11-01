@@ -103,8 +103,8 @@ def _translate(tmp_path, text, backend, name="model"):
 def test_records_delays_and_samples_at_the_ticks(tmp_path, backend):
     _, code = _translate(tmp_path, STEPWISE, backend)
     assert "const _ticks = PySDTicks(initial_time, time_step)" in code
-    assert "pysd_fixed_delay(_ticks, 1, 4, 0.0, " in code
-    assert "pysd_sampled(_ticks, 2, " in code
+    assert "pysd_fixed_delay(PySDRecord(_ticks, 1, 4), 0.0, " in code
+    assert "pysd_sampled(PySDRecord(_ticks, 2, 0), " in code
     # no stocks of their own, and any solver
     assert "_df_pipe_" not in code and "_sit_" not in code
     assert "_check_euler" not in code
@@ -129,7 +129,7 @@ def test_mtk_records_the_observed_values(tmp_path):
 def test_records_a_changing_delay_time(tmp_path, backend):
     _, code = _translate(tmp_path, CHANGING_DELAY, backend)
     assert "_dlt_in_delayed" in code
-    assert "pysd_fixed_delay(_ticks, 1, 1, " in code and "pysd_fixed_delay(_ticks, 1, 2, " in code
+    assert "pysd_fixed_delay(PySDRecord(_ticks, 1, 1), " in code and "pysd_fixed_delay(PySDRecord(_ticks, 1, 2), " in code
     assert "_check_euler" not in code
 
 
@@ -299,3 +299,71 @@ end
     # Euler with steps of TIME STEP is Vensim's: no warning; the others warn
     assert out["euler:warned"] == "0"
     assert out["rk4:warned"] == "1" and out["half:warned"] == "1"
+
+
+# --- RANDOM: one draw per tick, the same in every run -----------------------------
+
+RANDOMS = """{UTF-8}
+dim: a, b
+	~	~	|
+
+noise = RANDOM UNIFORM(0, 1, 7)
+	~	Dmnl
+	~		|
+
+shocks[dim] = 10 + RANDOM NORMAL(-5, 5, 0, 1, 3)
+	~	Dmnl
+	~		|
+
+stock = INTEG(noise, 0)
+	~	Dmnl
+	~		|
+""" + CONTROL
+
+
+@pytest.mark.parametrize("backend", ["ode", "mtk"])
+def test_random_calls_are_drawn_at_the_ticks(tmp_path, backend):
+    _, code = _translate(tmp_path, RANDOMS, backend)
+    # standard draws, once per tick, from each call's stream (its number and its seed)
+    assert "0.0 + (1.0 - 0.0) * pysd_tick_uniform(PySDRecord(_ticks, 1000010, 0), t)" in code
+    assert "min(max(0.0 + 1.0 * pysd_tick_normal(PySDRecord(_ticks, 2000009, 0, _i0), t), -5.0), 5.0)" in code
+    assert "pysd_random_" not in code
+    assert "_ticks_callback(" in code
+
+
+@pytest.mark.julia
+@pytest.mark.parametrize("backend", ["ode", "mtk"])
+def test_random_draws_hold_between_ticks_and_repeat(tmp_path, backend):
+    _require_julia(backend)
+    jl, _ = _translate(tmp_path, RANDOMS, backend)
+    script = f"""
+include({json.dumps(str(jl))})
+using OrdinaryDiffEq
+{_VALUES[backend]}
+function report(label, sol)
+    for n in ("noise", "stock")
+        println("@", label, ":", n, "=", join(vals_of(sol, n), ","))
+    end
+end
+report("euler", run_model())
+report("again", run_model())
+report("half", run_model(dt = time_step / 2))
+report("rk4", run_model(solver = RK4()))
+"""
+    path = tmp_path / "run_random.jl"
+    path.write_text(script, encoding="utf-8")
+    run = subprocess.run(["julia", "--startup-file=no", str(path)],
+                         capture_output=True, text=True, timeout=1800)
+    assert run.returncode == 0, run.stdout[-3000:] + run.stderr[-3000:]
+    out = {}
+    for line in run.stdout.splitlines():
+        if line.startswith("@"):
+            name, values = line[1:].split("=", 1)
+            out[name] = np.array([float(x) for x in values.split(",")])
+    noise = out["euler:noise"]
+    assert np.all((0 <= noise) & (noise < 1)) and len(np.unique(noise)) > 5
+    # the same draws in every run, with any solver; the stock of a noise held
+    # between ticks is the same with any of them
+    for label in ("again", "half", "rk4"):
+        np.testing.assert_array_equal(out[f"{label}:noise"], noise)
+        np.testing.assert_allclose(out[f"{label}:stock"], out["euler:stock"], rtol=1e-12, atol=1e-12)
