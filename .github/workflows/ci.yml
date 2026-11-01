@@ -14,7 +14,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # ubuntu-latest (Ubuntu 26.04) has no Python 3.9 build: 24.04 has
+        os: [ubuntu-24.04, windows-latest]
         python-version: ['3.9', '3.12']
 
     steps:
@@ -34,19 +35,19 @@ jobs:
       - name: Test
         run: |
           pytest tests/ -n 2
-        if: ${{ matrix.python-version != 3.9 || matrix.os != 'ubuntu-latest' }}
+        if: ${{ matrix.python-version != 3.9 || matrix.os != 'ubuntu-24.04' }}
       - name: Test and coverage
         run: |
           pytest tests/ --cov=pysd -n 2
           coverage xml
-        if: ${{ matrix.python-version == 3.9 && matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.python-version == 3.9 && matrix.os == 'ubuntu-24.04' }}
       - name: Coveralls
         uses: coverallsapp/github-action@v2
         with:
           file: coverage.xml
           flag-name: python
           parallel: true
-        if: ${{ matrix.python-version == 3.9 && matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.python-version == 3.9 && matrix.os == 'ubuntu-24.04' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
