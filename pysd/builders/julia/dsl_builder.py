@@ -14,6 +14,7 @@ Python PySD's last digits.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -1240,7 +1241,15 @@ class Context:
                                "(0, offset, 0) is not supported yet")
             o = self.visit(off)
             return Code(f"t {'.+' if o.dims else '+'} {o.wrap(P_ADD + 1)}", o.dims, P_ADD)
-        raise DSLError(f"{self.e.name}: the function {node.function.reference.upper()} is not supported yet")
+        # as Python PySD: a warning, and a call that stops the model with an
+        # error naming the function when it is evaluated
+        cs = [self.visit(x) for x in args]
+        name = node.function.reference.upper().replace("_", " ")
+        warnings.warn(f"Trying to translate '{name}' which it is not implemented in the DSL "
+                      "backend. The translated model will crash...")
+        quoted = name.replace('"', '\\"').replace("$", "\\$")
+        return Code(f'pysd_not_implemented("{quoted}"' + "".join(", " + c.text for c in cs) + ")",
+                    self._union(*(c.dims for c in cs)))
 
     def _bangs(self, node) -> List[str]:
         """The subscripts marked with ! in an expression, once each (SUM's)."""

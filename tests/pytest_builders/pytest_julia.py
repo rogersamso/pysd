@@ -548,9 +548,10 @@ class TestJuliaASTVisitor:
             function=ReferenceStructure(reference="SOME_UNKNOWN_FUNC"),
             arguments=(1.0,),
         )
-        with pytest.warns(UserWarning, match="Unknown Vensim function"):
+        # as Python PySD: a warning, and a call that stops the model, naming it
+        with pytest.warns(UserWarning, match="SOME UNKNOWN FUNC.*will crash"):
             result = v.visit(node)
-        assert "some_unknown_func" in result
+        assert result == 'pysd_not_implemented("SOME UNKNOWN FUNC", 1.0)'
 
     # --- helper functions registered in needed_helpers ----------------------
 
@@ -1312,11 +1313,11 @@ class TestJuliaASTVisitorExtended:
         result = v.visit(node)
         assert result == "0.0"
 
-    def test_unknown_node_warns_and_returns_zero(self):
+    def test_unknown_node_warns_and_stops_the_model(self):
         v, *_ = _visitor_with_namespace()
-        with pytest.warns(UserWarning, match="Unsupported AST node type"):
+        with pytest.warns(UserWarning, match="'object'.*will crash"):
             result = v.visit(object())
-        assert result == "0.0"
+        assert result == 'pysd_not_implemented("object")'
 
     def test_unary_not(self):
         v, *_ = _visitor_with_namespace()
@@ -1899,11 +1900,11 @@ class TestJuliaSectionBuilderUnsupported:
         ast = DataStructure()
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Data Var", components=[comp])
-        with pytest.warns(UserWarning, match="not supported"):
+        with pytest.warns(UserWarning, match="DataStructure.*will crash"):
             sb = _section_builder_from_elements([elem])
             sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("UNSUPPORTED" in e for e in all_eqs)
+        assert any('pysd_not_implemented("DataStructure (Data Var)")' in e for e in all_eqs)
 
     def test_abstract_data_with_data_structure_emits_tab_val(self):
         """AbstractData + DataStructure emits _tab_val call (tab-file read), no warning."""
@@ -7808,8 +7809,8 @@ class TestGetTimeValue:
         v, *_ = _visitor_with_namespace()
         node = CallStructure(function=ReferenceStructure("GET TIME VALUE"),
                              arguments=[2, 0, 1])
-        with pytest.warns(UserWarning, match="GET TIME VALUE"):
-            assert v.visit(node) == "NaN"
+        with pytest.warns(UserWarning, match="GET TIME VALUE.*will crash"):
+            assert v.visit(node) == 'pysd_not_implemented("GET TIME VALUE(2, offset, 1)")'
 
 
 class TestVectorFunctions:

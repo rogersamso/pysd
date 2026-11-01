@@ -470,3 +470,21 @@ ahead = GET TIME VALUE(0, 0.5, 0)
     assert "buffered_active_initial(t₀) ~ 5" in code
     assert "buffered ~ buffered_active_initial + 1" in code
     assert "ahead ~ t + 0.5" in code
+
+
+def test_a_function_not_translated_stops_the_model(tmp_path):
+    # as Python PySD: a warning, and a call that stops the model, naming it
+    with pytest.warns(UserWarning, match="VECTOR SELECT.*will crash"):
+        _, code = translate(tmp_path, """
+dim: a, b
+	~	~		|
+
+x[dim] = 1, 2
+	~	Dmnl
+	~		|
+
+pick = VECTOR SELECT(x[dim!], x[dim!], 0, 0, 0)
+	~	Dmnl
+	~		|
+""")
+    assert 'pysd_not_implemented("VECTOR SELECT"' in code

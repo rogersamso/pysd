@@ -261,6 +261,16 @@ def lookup_interpolation_code(
 # AST visitor
 # ---------------------------------------------------------------------------
 
+def _not_implemented(name: str, args: List[str]) -> str:
+    """What the Julia builder writes for a function it does not translate, as
+    Python PySD: a warning now, and a call that stops the model with an error
+    naming it when it is evaluated (PySD.jl's ``pysd_not_implemented``)."""
+    warn(f"Trying to translate '{name}' which it is not implemented in the Julia "
+         "builder. The translated model will crash...")
+    quoted = name.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'pysd_not_implemented("{quoted}"' + "".join(", " + a for a in args) + ")"
+
+
 #: Vensim's RANDOM functions: drawn once per tick (``_lift_random``)
 _RANDOM_FUNCTIONS = ("pysd_random_0_1", "pysd_random_uniform",
                      "pysd_random_normal", "pysd_random_exponential")
@@ -585,12 +595,9 @@ class JuliaASTVisitor:
             return edf_name
 
         # Structures that are handled at the element level should not appear
-        # inside other expressions; warn and emit a placeholder.
-        warn(
-            f"Unsupported AST node type '{type(node).__name__}' inside expression "
-            "— emitting placeholder 0.0."
-        )
-        return "0.0"
+        # inside other expressions: as Python PySD, a call that stops the model
+        # with an error naming it (PySD.jl's pysd_not_implemented)
+        return _not_implemented(type(node).__name__, [])
 
     # ------------------------------------------------------------------
     # Node handlers
@@ -1048,11 +1055,7 @@ class JuliaASTVisitor:
         relativeto, offset, measure = node.arguments
         if relativeto == 0 and measure == 0:
             return f"(t + {self.visit(offset)})"
-        warn(
-            f"GET TIME VALUE({relativeto}, …, {measure}) is not supported by "
-            "the Julia builder (only relative to 0 with measure 0); emitting NaN."
-        )
-        return "NaN"
+        return _not_implemented(f"GET TIME VALUE({relativeto}, offset, {measure})", [])
     def _index_in_var_dim(self, idx: str, sub: str, var_dims_list: List[str],
                           pos: int) -> str:
         """Index into the referenced variable's own dimension.
@@ -1349,8 +1352,8 @@ class JuliaASTVisitor:
             if clean_ref in self._macro_names:
                 args = [self.visit(a) for a in node.arguments]
                 return f"{clean_ref}({', '.join(args)})"
-            warn(f"Unknown Vensim function '{node.function.reference}'; using lowercase name.")
-            julia_func = re.sub(r"[^a-z0-9_]", "_", node.function.reference.lower())
+            return _not_implemented(node.function.reference.upper().replace("_", " "),
+                                    [self.visit(a) for a in node.arguments])
 
         # ELMCOUNT(SubscriptRange) → emit the integer literal size
         if julia_func == "pysd_elmcount":

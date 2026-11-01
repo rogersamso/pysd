@@ -54,6 +54,7 @@ from pysd.translators.structures.abstract_expressions import (
 )
 
 from .julia_expressions_builder import (
+    _not_implemented,
     HELPER_IMPLEMENTATIONS,
     InlineLookupRegistry,
     JuliaASTVisitor,
@@ -1226,12 +1227,8 @@ class JuliaSectionBuilder:
             if isinstance(comp, AbstractData):
                 return self._process_tab_data_structure(elem, identifier, comp)
             # Non-AbstractData with DataStructure AST: fall through to unsupported
-            warn(
-                f"'DataStructure' for '{elem.name}' is not supported in the "
-                "Julia builder — emitting placeholder equation."
-            )
             self.aux_decls.append(f"@variables {identifier}(t)")
-            return [f"# UNSUPPORTED(DataStructure): {identifier} ~ 0.0"]
+            return [f"{identifier} ~ {_not_implemented(f'DataStructure ({elem.name})', [])}"]
 
         # ---- Remaining unsupported structures ---------------------------
         if isinstance(ast, _UNSUPPORTED_STRUCTURES):  # pragma: no cover  # empty tuple, always False
