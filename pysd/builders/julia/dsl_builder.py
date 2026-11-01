@@ -383,7 +383,7 @@ class DSLBuilder:
 
     STATEFUL = (ae.IntegStructure, ae.DelayStructure, ae.DelayNStructure, ae.DelayFixedStructure,
                 ae.SmoothStructure, ae.SmoothNStructure, ae.TrendStructure, ae.SampleIfTrueStructure,
-                ae.InitialStructure)
+                ae.InitialStructure, ae.ForecastStructure)
 
     def _scan(self, node) -> Tuple[set, bool]:
         refs, timed = set(), False
@@ -397,7 +397,7 @@ class DSLBuilder:
         if isinstance(node, ae.CallStructure):
             name = clean(node.function.reference)
             if name in ("step", "pulse", "pulse_train", "ramp", "random_uniform", "random_0_1",
-                        "random_normal", "random_exponential"):
+                        "random_normal", "random_exponential", "get_time_value"):
                 timed = True
             refs.add(name)
         for child in self._children(node):
@@ -837,6 +837,16 @@ class Context:
         if isinstance(node, ae.TrendStructure):
             x, tau, init = self.visit(node.input), self.visit(node.average_time), self.visit(node.initial_trend)
             return Code(f"trend({x.text}, {tau.text}; init = {init.text})", x.dims)
+        if isinstance(node, ae.ForecastStructure):
+            # as Python PySD: input · (1 + zidz(input - A, T · A) · horizon), A a
+            # smooth of the input over T that starts at input / (1 + initial trend)
+            x, tau = self.visit(node.input), self.visit(node.average_time)
+            h, init = self.visit(node.horizon), self.visit(node.initial_trend)
+            dims = self._union(x.dims, tau.dims, h.dims, init.dims)
+            d = "." if dims else ""
+            a = f"smooth({x.text}, {tau.text}; init = {x.wrap(P_MUL)} {d}/ (1 {d}+ {init.wrap(P_ADD + 1)}))"
+            return Code(f"{x.wrap(P_MUL)} {d}* (1 {d}+ zidz{d}({x.text} {d}- {a}, {tau.wrap(P_MUL)} {d}* {a}) "
+                        f"{d}* {h.wrap(P_MUL)})", dims, P_MUL)
         if isinstance(node, ae.SampleIfTrueStructure):
             cnd, x, init = self.visit(node.condition), self.visit(node.input), self.visit(node.initial)
             return Code(f"sample_if_true({cnd.text}, {x.text}; init = {init.text})",
@@ -1209,7 +1219,27 @@ class Context:
             m = self.visit(args[0])
             return Code(invert_matrix(m.text, m.dims), m.dims)
         if fname == "active_initial":
-            raise DSLError(f"{self.e.name}: ACTIVE INITIAL inside an expression is not supported yet")
+            # inside an expression: a variable of its own, its active value
+            # during the run and its initial value at t₀ (as a whole equation)
+            a, b = self.visit(args[0]), self.visit(args[1])
+            dims = self._union(a.dims, b.dims)
+            name = identifier(self.e.name + " active initial", self.b.taken)
+            unit = self.b._meta(self.e).split(",")[0].lstrip("[")
+            d = "[" + ", ".join(dims) + "]" if dims else ""
+            self.b._hide(self.e.view, f"{name}(t){d}, [{unit}, description = "
+                                      f"\"The ACTIVE INITIAL in {self.e.ident}.\"]")
+            self.e.lines.append(f"{name} ~ {a.text}")
+            self.e.lines.append(f"{name}(t₀) ~ {b.text}")
+            return Code(name, dims)
+        if fname == "get_time_value":
+            # the current time plus an offset, GET TIME VALUE(0, offset, 0), as
+            # the ODE backend and the Python builder for it
+            rel, off, measure = args
+            if rel != 0 or measure != 0:
+                raise DSLError(f"{self.e.name}: GET TIME VALUE other than the time plus an offset "
+                               "(0, offset, 0) is not supported yet")
+            o = self.visit(off)
+            return Code(f"t {'.+' if o.dims else '+'} {o.wrap(P_ADD + 1)}", o.dims, P_ADD)
         raise DSLError(f"{self.e.name}: the function {node.function.reference.upper()} is not supported yet")
 
     def _bangs(self, node) -> List[str]:

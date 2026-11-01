@@ -378,15 +378,6 @@ late = DELAY FIXED(a + b, 2, 0)
 	~		|
 """, "late: DELAY FIXED of an expression"),
     ("""
-x = 1
-	~	Dmnl
-	~		|
-
-y = ACTIVE INITIAL(x, 1) + 1
-	~	Dmnl
-	~		|
-""", "y: ACTIVE INITIAL inside an expression"),
-    ("""
 a: a1, a2
 	~	~		|
 
@@ -451,3 +442,31 @@ fraction = RANDOM 0 1()
     assert "random_normal(-5, 5, 0, 1; seed = 3, dims = dim)" in code
     assert "waits ~ random_exponential(0, 9, 1, 2; seed = 4)" in code
     assert "fraction ~ random_0_1()" in code
+
+
+def test_forecast_active_initial_and_get_time_value(tmp_path):
+    _, code = translate(tmp_path, """
+input = 1 + Time
+	~	Dmnl
+	~		|
+
+forecast = FORECAST(input, 2, 3)
+	~	Dmnl
+	~		|
+
+buffered = ACTIVE INITIAL(input * 2, 5) + 1
+	~	Dmnl
+	~		|
+
+ahead = GET TIME VALUE(0, 0.5, 0)
+	~	Month
+	~		|
+""")
+    # FORECAST as Python PySD's: a smooth that starts at input / (1 + initial trend)
+    assert "smooth(input, 2; init = input / (1 + 0))" in code
+    assert re.search(r"forecast ~ input \* \(1 \+ zidz\(input - smooth", code)
+    # ACTIVE INITIAL inside an expression: a variable of its own
+    assert "buffered_active_initial ~ input * 2" in code
+    assert "buffered_active_initial(t₀) ~ 5" in code
+    assert "buffered ~ buffered_active_initial + 1" in code
+    assert "ahead ~ t + 0.5" in code
