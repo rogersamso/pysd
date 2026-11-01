@@ -15,12 +15,18 @@ New Features
   that Julia saves the model built and compiled (``@precompile_model``) and
   later sessions load it in seconds.  See :doc:`julia_builder`, "The DSL
   backend".
-- Julia builder, DSL backend: translated models need PySD.jl 0.4.0 (the
+- Julia builder, DSL backend: translated models need PySD.jl 0.5.0 (the
   ``[compat]`` of the model's package), which adds derivatives and
   uncertainties through a run (ForwardDiff.jl, Measurements.jl), SciML's ODE
   solvers (``run_model(m, solver)``, ``ODEProblem(m)``) and results as tables
   (``DataFrame(r)``, ``DimStack(r)``).  See :doc:`julia_builder`, "The DSL
   backend".
+- Julia builder, ODE and MTK backends: switches on the time (``STEP``,
+  ``PULSE``, comparisons with ``Time``) are exact at the model's ticks with
+  any solver; the ``RANDOM`` functions draw once per tick, seeded, the same in
+  every run and with any solver; ``run_model`` warns, once, about equations
+  written for Euler steps of ``TIME STEP`` when another solver runs the model.
+  PySD.jl 0.5.0.  See :doc:`julia_builder`, "Choosing a solver".
 - Julia builder, ODE and MTK backends: ``DELAY FIXED``, ``SAMPLE IF TRUE``
   and a ``DELAY N`` whose delay time changes run with any solver.  They are
   recorded at the model's ticks (PySD.jl's ``PySDTicks``, PySD.jl 0.4.0)

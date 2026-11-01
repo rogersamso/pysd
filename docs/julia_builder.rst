@@ -262,7 +262,7 @@ What a translated model gives you, besides running:
   form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
   layer per variable over the time and its dimensions.
 
-These need PySD.jl 0.4.0, which the model's package requires.
+These need PySD.jl 0.5.0, which the model's package requires.
 
 What it translates: stocks, auxiliaries and constants; subscripts (ranges,
 subranges, mappings, arrays of up to 3 dimensions, ``:EXCEPT:``, variables
@@ -429,6 +429,24 @@ A ``DELAY FIXED`` whose delay time can't be evaluated when the model is
 translated is approximated by a first-order delay, exact only with Euler
 steps of ``TIME STEP``; ``run_model`` then refuses other solvers, with an
 error that names it.
+
+Switches on the time (``STEP``, ``PULSE``, ``PULSE TRAIN``, comparisons with
+``Time``) also make the model stop at every tick, and its equations see the
+time through PySD.jl's ``pysd_tick_time``: a solver's step that ends at a
+tick sees the time just before it, so a switch at a tick changes the rates
+from that tick on, with any solver.
+
+The ``RANDOM`` functions draw once per tick, as Vensim: each call is a
+variable of its own, a standard draw (PySD.jl's ``pysd_tick_uniform``,
+``_normal``, ``_exponential``) seeded from the call, its seed, the element and
+the tick, which the equation scales and cuts.  A draw holds between ticks,
+and every run draws the same, with any solver.
+
+Some equations are written for Euler steps of ``TIME STEP`` and may mean
+something else with another solver: ``TIME STEP`` used as a value
+(``(target - x) / TIME STEP`` sets a stock in one step), ``Time`` tested for
+equality, non-negative stocks.  With any other solver than Euler with steps
+of ``TIME STEP``, ``run_model`` names them in a warning, once.
 
 .. list-table::
    :header-rows: 1

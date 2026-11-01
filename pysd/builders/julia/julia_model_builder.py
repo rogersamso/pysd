@@ -153,7 +153,7 @@ def _ast_children(node) -> list:
 
 
 #: PySD.jl version the generated models are written for (checked on load).
-PYSD_JL_VERSION = "0.4.0"
+PYSD_JL_VERSION = "0.5.0"
 
 # Control variable identifiers produced by Vensim
 _CONTROL_IDENTIFIERS = frozenset(
