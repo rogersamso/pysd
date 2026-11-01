@@ -72,7 +72,7 @@ delayed = DELAY N(input, delay time, 0, 3)
 """ + CONTROL
 
 PLAIN = """{UTF-8}
-input = STEP(1, 1)
+input = Time / 10
 	~	Dmnl
 	~		|
 
@@ -103,7 +103,7 @@ def _translate(tmp_path, text, backend, name="model"):
 def test_records_delays_and_samples_at_the_ticks(tmp_path, backend):
     _, code = _translate(tmp_path, STEPWISE, backend)
     assert "const _ticks = PySDTicks(initial_time, time_step)" in code
-    assert "pysd_fixed_delay(_ticks, 1, 4, 0.0, t)" in code
+    assert "pysd_fixed_delay(_ticks, 1, 4, 0.0, " in code
     assert "pysd_sampled(_ticks, 2, " in code
     # no stocks of their own, and any solver
     assert "_df_pipe_" not in code and "_sit_" not in code
@@ -209,3 +209,93 @@ report("tsit5", run_model(solver = Tsit5(), adaptive = true, abstol = 1e-12, rel
     err = lambda s: np.max(np.abs(s - exact))
     assert err(out["half:stock"]) < err(out["euler:stock"]) * 0.6
     assert err(out["rk4:stock"]) < err(out["half:stock"])
+
+
+# --- switches on the time, and equations written for steps of TIME STEP ---------
+
+SWITCHES = """{UTF-8}
+stepped = INTEG(STEP(1, 2), 0)
+	~	Dmnl
+	~		|
+
+pulsed = INTEG(2 * PULSE(1, 0.5), 0)
+	~	Dmnl
+	~		|
+
+year met = INTEG(IF THEN ELSE(Time = 2, Time / TIME STEP, 0), 0)
+	~	Dmnl
+	~		|
+
+ahead = lookahead(Time + TIME STEP)
+	~	Dmnl
+	~		|
+
+lookahead(
+	[(0,0)-(10,10)],(0,0),(10,10))
+	~	Dmnl
+	~		|
+""".replace("FINAL TIME = 10", "") + CONTROL.replace("FINAL TIME = 10", "FINAL TIME = 4")
+
+
+@pytest.mark.parametrize("backend", ["ode", "mtk"])
+def test_switches_on_the_time_stop_at_the_ticks(tmp_path, backend):
+    _, code = _translate(tmp_path, SWITCHES, backend)
+    assert "const _ticks = PySDTicks(initial_time, time_step)" in code
+    assert "pysd_step(pysd_tick_time(_ticks, t), 1.0, 2.0)" in code
+    assert "_ticks_callback(" in code
+    # no fixed delays or samples: nothing to record
+    assert "_record_ticks!(u, t, p = " in code and "pysd_record!" not in code
+
+
+@pytest.mark.parametrize("backend", ["ode", "mtk"])
+def test_equations_written_for_steps_of_time_step_are_named(tmp_path, backend):
+    _, code = _translate(tmp_path, SWITCHES, backend)
+    assert "function _warn_stepwise(solver, dt)" in code
+    assert "    _warn_stepwise(solver, dt)\n" in code
+    assert "1 use TIME STEP as a value (a move or a rate per step): year_met" in code
+    assert "1 test the time for equality (true for one Euler step, at one instant here): year_met" in code
+    # a time given to a lookup (Time + TIME STEP) is a time, not one of these
+    assert "ahead" not in code.split("function _warn_stepwise")[1].split("end")[0]
+
+
+@pytest.mark.parametrize("backend", ["ode", "mtk"])
+def test_models_without_them_have_neither(tmp_path, backend):
+    _, code = _translate(tmp_path, PLAIN.replace("STEP(1, 1)", "Time / 10"), backend)
+    assert "_ticks" not in code and "_warn_stepwise" not in code
+
+
+@pytest.mark.julia
+@pytest.mark.parametrize("backend", ["ode", "mtk"])
+def test_switches_are_exact_with_any_solver(tmp_path, backend):
+    _require_julia(backend)
+    jl, _ = _translate(tmp_path, SWITCHES, backend)
+    final = {"ode": "observe(sol.u[end], sol.t[end])[n]",
+             "mtk": "sol[getproperty(@__MODULE__, Symbol(n))][end]"}[backend]
+    script = f"""
+include({json.dumps(str(jl))})
+using OrdinaryDiffEq, Logging
+final(sol, n) = {final}
+for (label, kw) in (("euler", (;)), ("rk4", (; solver = RK4())), ("half", (; dt = time_step / 2)),
+                    ("bs3", (; solver = BS3(), adaptive = true)))
+    buf = IOBuffer()
+    sol = with_logger(ConsoleLogger(buf, Logging.Warn)) do
+        run_model(; kw...)
+    end
+    println("@", label, ":stepped=", final(sol, "stepped"))
+    println("@", label, ":pulsed=", final(sol, "pulsed"))
+    println("@", label, ":warned=", occursin("year_met", String(take!(buf))) ? 1 : 0)
+end
+"""
+    path = tmp_path / "run_switches.jl"
+    path.write_text(script, encoding="utf-8")
+    run = subprocess.run(["julia", "--startup-file=no", str(path)],
+                         capture_output=True, text=True, timeout=1800)
+    assert run.returncode == 0, run.stdout[-3000:] + run.stderr[-3000:]
+    out = dict(line[1:].split("=", 1) for line in run.stdout.splitlines() if line.startswith("@"))
+    for label in ("euler", "rk4", "half", "bs3"):
+        # a step at 2 and a pulse from 1 to 1.5 of 2: at the ticks, exactly
+        assert abs(float(out[f"{label}:stepped"]) - 2.0) < 1e-12, (label, out)
+        assert abs(float(out[f"{label}:pulsed"]) - 1.0) < 1e-12, (label, out)
+    # Euler with steps of TIME STEP is Vensim's: no warning; the others warn
+    assert out["euler:warned"] == "0"
+    assert out["rk4:warned"] == "1" and out["half:warned"] == "1"

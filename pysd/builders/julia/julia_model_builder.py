@@ -44,6 +44,7 @@ from pysd.translators.structures.abstract_expressions import (
     GetLookupsStructure,
     InitialStructure,
     IntegStructure,
+    LogicStructure,
     LookupsStructure,
     ReferenceStructure,
     SampleIfTrueStructure,
@@ -140,6 +141,15 @@ def _outer_for_clause(eq: str) -> str:
         elif depth == 0 and inner[i:i + 4] == "for " and inner[i - 1] == " ":
             return inner[i + 4:]
     return ""
+
+
+def _ast_children(node) -> list:
+    """The parts of an abstract expression (a dataclass, or a list of them)."""
+    if isinstance(node, (list, tuple)):
+        return list(node)
+    if hasattr(node, "__dataclass_fields__"):
+        return [getattr(node, f) for f in node.__dataclass_fields__]
+    return []
 
 
 #: PySD.jl version the generated models are written for (checked on load).
@@ -403,6 +413,12 @@ class JuliaSectionBuilder:
         # What is recorded at the model's ticks (fixed delays' inputs, samples'
         # values), by key: its position here, from 1 (PySD.jl's PySDTicks)
         self._tick_records: List[str] = []
+        # whether an equation switches on the time (STEP, PULSE, Time >= 2015):
+        # the model then stops at the ticks too (see _finish_ticks)
+        self._time_switches: bool = False
+        # the equations written for Euler steps of TIME STEP, by kind
+        # (_scan_stepwise): named in a warning when another solver runs
+        self._stepwise: Dict[str, List[str]] = {}
 
         # Accumulated declarations
         self.stock_decls: List[str] = []
@@ -523,6 +539,7 @@ class JuliaSectionBuilder:
             eqs = self._process_element(elem, identifier, is_control)
             self.built_elements[identifier] = (eqs, is_control)
 
+        self._finish_ticks()
         self._sort_u0_entries()
 
         # Register any inline lookups collected while visiting ASTs
@@ -2413,6 +2430,123 @@ class JuliaSectionBuilder:
             f"D({lv_name}) ~ ({input_expr} - {lv_name}) / max({delay_time_expr}, eps(Float64))",
             f"{identifier} ~ {lv_name}",
         ]
+
+    # A switch on the time in an equation as written: STEP, PULSE, PULSE TRAIN
+    # or a comparison of the time.  The time itself, ``t``.
+    _SWITCH_RE = re.compile(
+        r"pysd_(?:step|pulse|pulse_train)\(|(?<![\w.:])t\s*(?:<=|>=|<|>|==|!=|≤|≥)"
+        r"|(?:<=|>=|<|>|==|!=|≤|≥)\s*t(?![\w(])")
+    _TIME_RE = re.compile(r"(?<![\w.:])t(?![\w(])")
+
+    def _uses_ticks(self) -> bool:
+        """Whether the model stops at its ticks: it records fixed delays or
+        samples, or it switches on the time."""
+        return bool(self._tick_records) or self._time_switches
+
+    def _finish_ticks(self) -> None:
+        """After every equation is built: a model that switches on the time
+        stops at the ticks, and its equations see the time through
+        ``pysd_tick_time`` (a solver's step that ends at a tick sees the time
+        just before it, so a switch at a tick is exact).  Also the equations
+        written for Euler steps of TIME STEP."""
+        equations = [e for eqs, control in self.built_elements.values() if not control for e in eqs]
+        self._time_switches = any(self._SWITCH_RE.search(e) for e in equations)
+        if self._time_switches:          # (fixed delays and samples read the tick count)
+            for name, (eqs, control) in list(self.built_elements.items()):
+                if not control:
+                    self.built_elements[name] = (
+                        [self._TIME_RE.sub("pysd_tick_time(_ticks, t)", e) for e in eqs], control)
+        self._stepwise = self._scan_stepwise()
+
+    def _scan_stepwise(self) -> Dict[str, List[str]]:
+        """The equations written for Euler steps of TIME STEP, which may mean
+        something else with another solver: TIME STEP used as a value
+        (``(target - x) / TIME STEP`` sets a stock in one step), the time tested
+        for equality (true for one Euler step, at one instant for another
+        solver), non-negative stocks (their outflow is cut to what empties
+        them in one step).  A time given to a function (``data(Time + TIME
+        STEP)``), a delay's or a smooth's time, and a SAMPLE IF TRUE's
+        condition (read at the ticks) are not."""
+        def norm(r):
+            return re.sub(r"[^a-z0-9]+", "_", str(r).lower()).strip("_")
+
+        def is_time(n):
+            return isinstance(n, ReferenceStructure) and norm(n.reference) == "time"
+
+        def has_time(n):
+            return is_time(n) or any(has_time(c) for c in _ast_children(n))
+
+        def time_arg(n):
+            return isinstance(n, ArithmeticStructure) and len(n.arguments) > 0 and \
+                is_time(n.arguments[0]) and set(n.operators) <= {"+", "-"}
+
+        def scan(n, found):
+            if isinstance(n, ReferenceStructure):
+                if norm(n.reference) == "time_step":
+                    found.add("dt")
+                return
+            if isinstance(n, LogicStructure) and has_time(n) and \
+                    any(op in ("=", "==", "<>", "!=") for op in n.operators):
+                found.add("equals")
+            if isinstance(n, SampleIfTrueStructure):        # its condition is read at the ticks
+                scan(n.input, found)
+                scan(n.initial, found)
+                return
+            if isinstance(n, CallStructure):
+                for a in n.arguments:
+                    if not time_arg(a):
+                        scan(a, found)
+                return
+            if isinstance(n, (list, tuple)):
+                for c in n:
+                    scan(c, found)
+                return
+            for field in getattr(n, "__dataclass_fields__", {}):
+                if "time" not in field:                     # a delay's or a smooth's time
+                    scan(getattr(n, field), found)
+
+        names: Dict[str, List[str]] = {"dt": [], "equals": [], "nonnegative": []}
+        for elem in self.abstract_elements:
+            if isinstance(elem, AbstractControlElement):
+                continue
+            ident = self.namespace.namespace.get(elem.name, elem.name)
+            found: Set[str] = set()
+            for comp in elem.components:
+                scan(comp.ast, found)
+                if isinstance(comp.ast, IntegStructure) and getattr(comp.ast, "non_negative", False):
+                    found.add("nonnegative")
+            for kind in ("dt", "equals", "nonnegative"):
+                if kind in found and ident not in names[kind]:
+                    names[kind].append(ident)
+        return {k: v for k, v in names.items() if v}
+
+    def _stepwise_guard(self) -> Tuple[str, str]:
+        """The warning run_model gives, once, when another solver than Euler
+        with steps of TIME STEP runs a model with equations written for Euler
+        steps (``_stepwise``): its definition, and the call."""
+        if not self._stepwise:
+            return "", ""
+        what = {"dt": "use TIME STEP as a value (a move or a rate per step)",
+                "equals": "test the time for equality (true for one Euler step, at one instant here)",
+                "nonnegative": "are non-negative stocks (their outflow is cut to what empties them in one step)"}
+        lines = []
+        for kind, names in self._stepwise.items():
+            shown = ", ".join(names[:8]) + (", …" if len(names) > 8 else "")
+            lines.append(f"  {len(names)} {what[kind]}: {shown}")
+        text = "\\n".join(l.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") for l in lines)
+        definition = textwrap.dedent("""\
+            # Equations written for Euler steps of TIME STEP: with another solver they
+            # may mean something else, so it names them, once.
+            function _warn_stepwise(solver, dt)
+                nameof(typeof(solver)) === :Euler && isapprox(dt, time_step; rtol = 1e-9) && return
+                @warn "Equations written for Euler steps of TIME STEP, which may mean something " *
+                      "else with this solver (only Euler() with dt = time_step gives Vensim's " *
+                      "values); compare with smaller steps to see whether the results change:\\n" *
+                      "{TEXT}" maxlog = 1
+            end
+
+            """).replace("{TEXT}", text)
+        return definition, "    _warn_stepwise(solver, dt)\n"
 
     def _tick_record(self, name: str) -> int:
         """A record kept at the model's ticks: its key."""
@@ -5648,7 +5782,7 @@ class JuliaSectionBuilder:
             "tspan = (initial_time, final_time)\n"
         ) + (
             "\n# the records of the fixed delays and samples, at the model's ticks\n"
-            "const _ticks = PySDTicks(initial_time, time_step)\n" if self._tick_records else "")
+            "const _ticks = PySDTicks(initial_time, time_step)\n" if self._uses_ticks() else "")
 
     def _euler_guard(self) -> Tuple[str, str]:
         """The check that run_model starts with, and its definition: a model
@@ -5677,26 +5811,31 @@ class JuliaSectionBuilder:
         """The records kept at the model's ticks (fixed delays' inputs, samples'
         values), and the callback that makes a solver stop at every tick to
         record them (PySD.jl's PySDTicks): ODE backend (MTK: _run_function_mtk)."""
-        if not self._tick_records:
+        if not self._uses_ticks():
             return ""
         # (one that depends on constants only is a parameter: in p, not in v)
         records = "\n".join(f"    pysd_record!(_ticks, {k}, hasproperty(v, :{name}) ? v.{name} : p.{name})"
                              for k, name in enumerate(self._tick_records, 1))
-        return textwrap.dedent("""\
-            # Fixed delays and samples move at the model's ticks, every TIME STEP,
-            # as Vensim: a solver stops at each, where they are recorded from the
-            # state, and they are held in between.  With Euler steps of TIME STEP
-            # the values are Vensim's; other solvers run the same model.
+        record = textwrap.dedent("""\
             function _record_ticks!(u, t, p = _params)
                 p isa NamedTuple || (p = _params)
                 v = model!(nothing, _named(u), p, t)
             {RECORDS}
                 return nothing
             end
-            _ticks_callback(p = _params, t_final = final_time) =
+            """).replace("{RECORDS}", records) if self._tick_records else \
+            "_record_ticks!(u, t, p = _params) = nothing          # (switches on the time only)\n"
+        return textwrap.dedent("""\
+            # Fixed delays and samples move at the model's ticks, every TIME STEP,
+            # as Vensim: a solver stops at each, where they are recorded from the
+            # state, and they are held in between.  With Euler steps of TIME STEP
+            # the values are Vensim's; other solvers run the same model.  A step
+            # that ends at a tick sees the time just before it (pysd_tick_time),
+            # so a switch on the time at a tick is exact.
+            {RECORD}_ticks_callback(p = _params, t_final = final_time) =
                 pysd_ticks_callback(_ticks, (u, t) -> _record_ticks!(u, t, p); t_final)
 
-            """).replace("{RECORDS}", records)
+            """).replace("{RECORD}", record)
 
     def _run_function(self) -> str:
         if self.backend == "mtk":
@@ -5757,12 +5896,14 @@ class JuliaSectionBuilder:
                 {{TICKS_END}}    return OrdinaryDiffEq.SciMLBase.DiffEqArray(us, ts)
                 end
                 """).replace("{TAB_LOAD}", tab_lines).replace(
-                    "{TICKS_START}", "    pysd_reset_ticks!(_ticks)\n" if self._tick_records else "").replace(
+                    "{TICKS_START}", "    pysd_reset_ticks!(_ticks)\n" if self._uses_ticks() else "").replace(
                     "{TICK}", "        pysd_begin_tick!(_ticks, t); _record_ticks!(u, t, params); "
-                              "pysd_end_tick!(_ticks)\n" if self._tick_records else "").replace(
-                    "{TICKS_END}", "    pysd_free_ticks!(_ticks)\n" if self._tick_records else "")
+                              "pysd_end_tick!(_ticks)\n" if self._uses_ticks() else "").replace(
+                    "{TICKS_END}", "    pysd_free_ticks!(_ticks)\n" if self._uses_ticks() else "")
         guard, check = self._euler_guard()
-        if not self._tick_records:
+        warn_def, warn_call = self._stepwise_guard()
+        guard, check = guard + warn_def, check + warn_call
+        if not self._uses_ticks():
             return "prob = ODEProblem(rhs!, u0, tspan, _problem_p(_params))\n\n" + guard + doc + textwrap.dedent(f"""\
                 function run_model(; params=_params, u0=nothing, tspan=tspan, dt={ts}, solver=Euler(){tab_param}, kwargs...){tab_load}
                 {{CHECK}}    u0 === nothing && (u0 = initial_state(params))
@@ -5792,26 +5933,33 @@ class JuliaSectionBuilder:
         # at 0.0).  saveat is needed so that a system without unknowns is
         # still saved at every step.
         guard, check = self._euler_guard()
-        if self._tick_records:
+        warn_def, warn_call = self._stepwise_guard()
+        guard, check = guard + warn_def, check + warn_call
+        if self._uses_ticks():
             values = ", ".join(self._tick_records)
             records = "\n".join(f"    pysd_record!(_ticks, {k}, v[{k}])"
                                  for k in range(1, len(self._tick_records) + 1))
-            ticks = textwrap.dedent("""\
-                # Fixed delays and samples move at the model's ticks, every TIME STEP,
-                # as Vensim: a solver stops at each, where they are recorded from the
-                # state, and they are held in between.  With Euler steps of TIME STEP
-                # the values are Vensim's; other solvers run the same model.
+            record = textwrap.dedent("""\
                 const _ticked = ModelingToolkit.SymbolicIndexingInterface.observed(sys, [{VALUES}])
                 function _record_ticks!(u, t, p = prob.p)
                     v = _ticked(u, p, t)
                 {RECORDS}
                     return nothing
                 end
-                _ticks_callback(t_final = final_time) =
+                """).replace("{VALUES}", values).replace("{RECORDS}", records) if self._tick_records else \
+                "_record_ticks!(u, t, p = prob.p) = nothing          # (switches on the time only)\n"
+            ticks = textwrap.dedent("""\
+                # Fixed delays and samples move at the model's ticks, every TIME STEP,
+                # as Vensim: a solver stops at each, where they are recorded from the
+                # state, and they are held in between.  With Euler steps of TIME STEP
+                # the values are Vensim's; other solvers run the same model.  A step
+                # that ends at a tick sees the time just before it (pysd_tick_time),
+                # so a switch on the time at a tick is exact.
+                {RECORD}_ticks_callback(t_final = final_time) =
                     pysd_ticks_callback(_ticks, (u, t) -> _record_ticks!(u, t); t_final)
                 prob = remake(prob; callback = _ticks_callback())
 
-                """).replace("{VALUES}", values).replace("{RECORDS}", records)
+                """).replace("{RECORD}", record)
             return textwrap.dedent(f"""\
                 u0_map = Dict(Symbolics.unwrap(k) => v for (k, v) in u0)
                 u0_full = isempty(unknowns(sys)) ? u0 :
