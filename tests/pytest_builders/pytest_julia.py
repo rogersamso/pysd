@@ -1691,21 +1691,20 @@ class TestJuliaSectionBuilderInitial:
 
 class TestJuliaSectionBuilderExpansions:
 
-    def test_delay_fixed_expands(self):
-        """DELAY FIXED with literal delay=2, time_step=1 → N=2 pipeline stages."""
+    @pytest.mark.parametrize("backend", ["ode", "mtk"])
+    def test_delay_fixed_expands_to_tick_records(self, backend):
+        """DELAY FIXED with delay=2, time_step=1 → the input recorded at the
+        ticks, read 2 ticks later."""
         ast = DelayFixedStructure(input=5.0, delay_time=2.0, initial=5.0)
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Delayed Fixed", components=[comp])
-        sb = _section_builder_from_elements([elem])
+        sb = _section_builder_from_elements([elem], backend=backend)
         sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        # New pipeline uses _df_pipe_k_delayed_fixed naming
-        assert any("_df_pipe_" in e for e in all_eqs), \
-            "DELAY FIXED must emit pipeline stages"
-        assert any("delayed_fixed ~" in e for e in all_eqs), \
-            "DELAY FIXED must assign the output identifier"
-        assert any("_df_pipe_" in d for d in sb.stock_decls), \
-            "Pipeline stages must appear in stock_decls"
+        assert "_df_in_delayed_fixed ~ 5.0" in all_eqs
+        assert "delayed_fixed ~ pysd_fixed_delay(_ticks, 1, 2, 5.0, t)" in all_eqs
+        assert sb._tick_records == ["_df_in_delayed_fixed"]
+        assert not any("_df_pipe_" in d for d in sb.stock_decls)
 
     def test_delay_fixed_dynamic_fallback_guards_division_by_zero(self):
         """DELAY FIXED with dynamic (non-constant) delay time falls back to a
@@ -1817,16 +1816,17 @@ class TestJuliaSectionBuilderExpansions:
         assert any("_sm_forecast_out" in e for e in all_eqs)
         assert any("forecast_out ~" in e for e in all_eqs)
 
-    def test_sample_if_true_expands(self):
-        ts_elem = _make_control_element("TIME STEP", 0.25)
+    @pytest.mark.parametrize("backend", ["ode", "mtk"])
+    def test_sample_if_true_expands_to_a_tick_record(self, backend):
+        """The sample's value recorded at the ticks, held in between."""
         ast = SampleIfTrueStructure(condition=1.0, input=5.0, initial=5.0)
         comp = AbstractComponent(subscripts=[[], []], ast=ast)
         elem = AbstractElement(name="Sample Out", components=[comp])
-        sb = _section_builder_from_elements([ts_elem, elem])
+        sb = _section_builder_from_elements([elem], backend=backend)
         sb.build_section()
         all_eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("_sit_sample_out" in e for e in all_eqs)
-        assert any("sample_out ~" in e for e in all_eqs)
+        assert "sample_out ~ pysd_sampled(_ticks, 1, 1.0, 5.0, 5.0, t)" in all_eqs
+        assert sb._tick_records == ["sample_out"]
 
     def test_allocate_available_emits_helper_call(self):
         ast = AllocateAvailableStructure(
@@ -4946,7 +4946,9 @@ class TestMdlFileTranslation:
             pytest.skip("julia_sample_if_true test model not found")
         jl_path = self._translate(mdl, tmp_path)
         content = jl_path.read_text()
-        assert "_sit_" in content
+        # ODE: recorded at the ticks (no stock of its own)
+        assert "pysd_sampled(_ticks, " in content
+        assert "_sit_" not in content
 
     def test_except_2d_integ_no_unsupported_warning(self, tmp_path):
         """2-D EXCEPT + INTEG (stock variable with 2D subscript and EXCEPT clause)
@@ -5139,10 +5141,11 @@ class TestXmileDelayFixed:
             warnings.simplefilter("always")
             jl_path = translate_to_julia(xmile)
         content = jl_path.read_text()
-        # The embedded delay must be lifted: _edf0 becomes an auxiliary backed
-        # by a pipeline stock (_df_pipe__edf0) in the ODE state vector.
+        # The embedded delay must be lifted: _edf0 becomes an auxiliary whose
+        # input (_df_in__edf0) is recorded at the model's ticks.
         assert "_edf0" in content
-        assert "_df_pipe__edf0" in content
+        assert "_df_in__edf0" in content
+        assert "pysd_fixed_delay(_ticks, " in content
 
 
 class TestEmbeddedDelayDrain2D:
@@ -5169,14 +5172,14 @@ class TestEmbeddedDelayDrain2D:
             _make_control_element("FINAL TIME", 10.0),
             _make_control_element("SAVEPER", 1.0),
         ]
-        sb = _section_builder_from_elements(
-            [inp_elem, aux_elem] + control_elems,
-            subscripts=[sr_a, sr_b],
-        )
-        sb.build_section()
-        assert any("_edf" in d for d in sb.stock_decls), (
-            f"2D aux with embedded delay must generate pipeline stocks, got: {sb.stock_decls}"
-        )
+        for backend in ("ode", "mtk"):
+            sb = _section_builder_from_elements(
+                [inp_elem, aux_elem] + control_elems,
+                subscripts=[sr_a, sr_b], backend=backend,
+            )
+            sb.build_section()
+            # its input is recorded at the ticks
+            assert any(r.startswith("_df_in__edf") for r in sb._tick_records), sb._tick_records
 
 
 class TestXmileMinMax:
@@ -6353,9 +6356,10 @@ class TestSubscriptedExpansions:
     # Subscripted DELAY FIXED via MTK backend (lines 2134-2159)
     # ------------------------------------------------------------------
 
-    def test_subscripted_delay_fixed_mtk_emits_pipeline(self):
-        """DELAY FIXED on a subscripted element with the MTK backend uses the
-        exact pipeline too (delay 2, time step 1 -> 2 stages)."""
+    def test_subscripted_delay_fixed_mtk_records_the_array(self):
+        """DELAY FIXED on a subscripted element with the MTK backend: the
+        input array recorded at the ticks, each element read 2 ticks later
+        (delay 2, time step 1), with no stocks of its own."""
         sr = self._sr("sector", ["S1", "S2"])
         ast = DelayFixedStructure(input=5.0, delay_time=2.0, initial=5.0)
         comp = self._sub_comp(["sector"], ast)
@@ -6363,12 +6367,10 @@ class TestSubscriptedExpansions:
         sb = _section_builder_from_elements([elem], subscripts=[sr], backend="mtk")
         sb.build_section()
         eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        assert any("_df_pipe_df_sub[_k - 1, _i0]" in e for e in eqs), eqs
-        assert "@variables _df_pipe_df_sub(t)[1:2, 1:N_SECTOR]" in sb.stock_decls
-        # one entry per element, for its 2 stages
-        u0_entries = [e for e in sb.u0_entries if "_df_pipe_" in e]
-        assert u0_entries == ["_df_pipe_df_sub[1:2, 1] => 5.0",
-                              "_df_pipe_df_sub[1:2, 2] => 5.0"], sb.u0_entries
+        assert any("[_df_in_df_sub[_i0] ~ 5.0 for _i0 in 1:N_SECTOR]..." == e for e in eqs), eqs
+        assert any("pysd_fixed_delay(_ticks, 1, 2, 5.0, t, _i0) for _i0 in 1:N_SECTOR" in e for e in eqs), eqs
+        assert not any("_df_pipe_" in d for d in sb.stock_decls)
+        assert sb._tick_records == ["_df_in_df_sub"]
 
     def test_delay_fixed_delay_time_evaluated_at_initial_time(self):
         """As Python PySD, a changing delay time is read at the initial time:
@@ -6380,18 +6382,20 @@ class TestSubscriptedExpansions:
         ast = DelayFixedStructure(input=5.0, delay_time=delay, initial=5.0)
         elem = AbstractElement(name="DST", components=[
             AbstractComponent(subscripts=[[], []], ast=ast)])
-        sb = _section_builder_from_elements(
-            [elem, _make_control_element("INITIAL TIME", 0.0),
-             _make_control_element("TIME STEP", 1.0)])
-        sb.build_section()
-        assert "@variables _df_pipe_dst(t)[1:2]" in sb.stock_decls, sb.stock_decls
+        for backend in ("ode", "mtk"):
+            sb = _section_builder_from_elements(
+                [elem, _make_control_element("INITIAL TIME", 0.0),
+                 _make_control_element("TIME STEP", 1.0)], backend=backend)
+            sb.build_section()
+            eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
+            assert "dst ~ pysd_fixed_delay(_ticks, 1, 2, 5.0, t)" in eqs, eqs
 
     # ------------------------------------------------------------------
     # Subscripted SAMPLE IF TRUE (lines 2388-2415)
     # ------------------------------------------------------------------
 
-    def test_subscripted_sample_if_true_emits_array_stock(self):
-        """SAMPLE IF TRUE on subscripted element emits array-comprehension stock."""
+    def test_subscripted_sample_if_true_emits_an_array_record(self):
+        """SAMPLE IF TRUE on a subscripted element: one record of the array."""
         sr = self._sr("product", ["P1", "P2", "P3"])
         ast = SampleIfTrueStructure(condition=1.0, input=7.0, initial=0.0)
         comp = self._sub_comp(["product"], ast)
@@ -6399,11 +6403,9 @@ class TestSubscriptedExpansions:
         sb = _section_builder_from_elements([elem], subscripts=[sr])
         sb.build_section()
         eqs = [e for eqs, _ in sb.built_elements.values() for e in eqs]
-        sit_eqs = [e for e in eqs if "_sit_sit_var" in e]
-        assert sit_eqs, f"Expected SIT stock equations, got {eqs}"
-        assert any("for _i0 in 1:" in e for e in sit_eqs)
-        u0_entries = [e for e in sb.u0_entries if "_sit_" in e]
-        assert len(u0_entries) == 3, f"Expected 3 u0 entries, got {sb.u0_entries}"
+        # one record of the whole array, read element by element
+        assert any("pysd_sampled(_ticks, 1, 1.0, 7.0, 0.0, t, _i0) for _i0 in 1:" in e for e in eqs), eqs
+        assert not any("_sit_" in d for d in sb.stock_decls)
 
     # ------------------------------------------------------------------
     # 2D INITIAL frozen stock (lines 3244-3259)
@@ -7645,11 +7647,10 @@ class TestSubscriptedDelayFixedArguments:
                                 subscripts=[dim1], path=tmp_path / "m.mdl")
         model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
         content = JuliaModelBuilder(model).build_model().read_text()
-        assert ("(_k == 1 ? r_subs[_i0] : _df_pipe_r_delayed_subs[_k - 1, _i0])"
-                in content)
-        # every stage of each element starts at that element: one line, the
-        # stage first (the order of the state vector)
-        assert "s._df_pipe_r_delayed_subs .= [r_subs[i] for _ in 1:2, i in 1:2]" in content
+        # the input recorded at the ticks is each element's, and so is the
+        # initial value read before the first two ticks
+        assert "_df_in_r_delayed_subs[_i0] = r_subs[_i0]" in content
+        assert "pysd_fixed_delay(_ticks, 1, 2, r_subs[_i0], t, _i0)" in content
 
 
 class TestSumOverSubrange:
@@ -8728,20 +8729,20 @@ inflow=
 	~
 	~		|
 
-delayed=
-	DELAY FIXED(inflow, 1, 0)
+smoothed=
+	SMOOTH(inflow, 1)
 	~
 	~		|
 
 level= INTEG (
-	delayed,
+	smoothed,
 		5)
 	~
 	~		|
 """)
         init = _block(content, "function initial_state(p = _params)")
         assert init.index("s.level = 5.0") < init.index("# the translation's own stocks")
-        assert init.index("# the translation's own stocks") < init.index("s._df_pipe_delayed")
+        assert init.index("# the translation's own stocks") < init.index("s._lv1_smoothed")
 
 
 class TestStateMapHasTheModelsStocks:
@@ -8761,16 +8762,16 @@ level[dim]= INTEG (
 	~
 	~		|
 
-delayed[dim]=
-	DELAY FIXED(level[dim], 2, 0)
+smoothed[dim]=
+	SMOOTH3(level[dim], 2)
 	~
 	~		|
 """)
         state_map = _block(content, "const _state_map = [", "\n]\n")
         assert '("level", 1, String["dim"]),' in state_map
-        assert "_df_pipe" not in state_map
-        # the internal stock is still in the state, after level
-        assert "_df_pipe_delayed = zeros(4, N_DIM)" in content
+        assert "_lv" not in state_map
+        # the internal stocks are still in the state
+        assert "_lv1_smoothed" in content
 
 
 class TestReadableLayout:

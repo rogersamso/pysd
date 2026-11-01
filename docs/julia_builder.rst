@@ -253,9 +253,10 @@ What a translated model gives you, besides running:
   ``run_model(m, Euler())`` gives the same values with SciML's Euler, and
   ``run_model(m, BS3(); reltol = 1e-8)`` solves the ODE with adaptive steps,
   to check that ``TIME STEP`` is small enough; ``ODEProblem(m)`` is the model
-  as a SciML problem, for callbacks and ensembles of runs.  Only Euler with
-  steps of ``TIME STEP`` gives Vensim's values for ``DELAY FIXED``,
-  ``SAMPLE IF TRUE`` and comparisons with ``Time``.
+  as a SciML problem, for callbacks and ensembles of runs.  ``DELAY FIXED``
+  and ``SAMPLE IF TRUE`` move at the model's ticks with any solver (see
+  "Choosing a solver"); only Euler with steps of ``TIME STEP`` gives
+  Vensim's values.
 - **Results as tables**: ``DataFrame(r)`` and ``CSV.write(path, r)`` give a
   column per variable and element, with the Julia names in Python PySD's
   form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
@@ -404,9 +405,30 @@ middle of a run is not supported).
 Choosing a solver
 ^^^^^^^^^^^^^^^^^
 
-The default is ``Euler()``, which matches Vensim's integration method.
-All solvers from `OrdinaryDiffEq.jl
-<https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/>`_ work.
+The default is ``Euler()`` with steps of ``TIME STEP``, which matches
+Vensim's integration method.  All solvers from `OrdinaryDiffEq.jl
+<https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/>`_ work, with
+both backends: ``run_model(solver = RK4())``, ``run_model(dt = time_step / 4)``,
+``run_model(solver = Tsit5(), adaptive = true)``.  Other solvers give more
+accurate stocks (and so other numbers than Vensim's), which shows whether
+``TIME STEP`` is small enough.
+
+``DELAY FIXED`` and ``SAMPLE IF TRUE`` are defined by steps of ``TIME STEP``,
+the model's ticks: a fixed delay gives its input N ticks before, a sample
+takes its input at the ticks where its condition holds.  The translated
+model records them at the ticks (PySD.jl's ``PySDTicks``): the solver stops
+at every tick, where each delay's input and each sample's value are recorded
+from the state there, and they are held in between, so the solver's own
+steps only integrate the stocks.  With Euler steps of ``TIME STEP`` the
+values are Vensim's; with any other solver the model is the same.  (A
+``DELAY N`` whose delay time changes keeps its past delay times the same
+way.)  Stopping at every tick also means that an adaptive solver never takes
+steps longer than ``TIME STEP``.
+
+A ``DELAY FIXED`` whose delay time can't be evaluated when the model is
+translated is approximated by a first-order delay, exact only with Euler
+steps of ``TIME STEP``; ``run_model`` then refuses other solvers, with an
+error that names it.
 
 .. list-table::
    :header-rows: 1
@@ -471,7 +493,7 @@ also call it manually:
    save_results(sol, sys, _dim_labels, "output.nc")
 
 With the ODE backend the file holds the model's stocks (not the internal
-ones the translation adds, such as the stages of a ``DELAY FIXED``). A subscripted stock
+ones the translation adds, such as the stages of a ``SMOOTH3``). A subscripted stock
 gets one NetCDF dimension per subscript range, named after the range and
 holding its element labels, in the order ``(time, dim_1, ..., dim_n)`` (the
 same layout as PySD's Python NetCDF output, so the file can be passed to
@@ -637,15 +659,17 @@ Supported Vensim features
        time it started with)
      - Supported
    * - ``DELAY FIXED``
-     - Supported (exact N-stage Euler pipeline; N comes from the delay time at
-       the initial time, as in the Python builder)
-     - Supported (same pipeline)
+     - Supported (the input recorded at every tick, read N ticks later, with
+       any solver; N comes from the delay time at the initial time, as in the
+       Python builder)
+     - Supported (the same)
    * - ``TREND``, ``FORECAST``
      - Supported (as the Python builder, also subscripted)
      - Supported
    * - ``SAMPLE IF TRUE``
-     - Supported (instantaneous ifelse output)
-     - Supported
+     - Supported (its value recorded at every tick and held in between, with
+       any solver)
+     - Supported (the same)
    * - ``INITIAL``
      - Supported
      - Supported
@@ -701,7 +725,7 @@ Supported Vensim features
      - Supported
      - Supported
    * - XMILE ``DELAY`` embedded in expression
-     - Supported (lifted to pipeline auxiliary stocks)
+     - Supported (lifted to an auxiliary, a fixed delay recorded at the ticks)
      - Supported
    * - ``ALLOCATE AVAILABLE`` / ``ALLOCATE BY PRIORITY``
      - Supported (exact Vensim algorithm via PySD.jl helpers; subscripted
@@ -778,11 +802,11 @@ parse.  The Julia builder does not yet cover:
      - Passes through; interactive value ignored in batch simulation
    * - ``DELAY FIXED`` exact semantics
      - Full (discrete transport delay)
-     - Supported (exact N-stage Euler pipeline matching Vensim ring-buffer
-       semantics; N comes from the delay time at the initial time)
+     - Supported (the input recorded at every tick, as Vensim's ring buffer,
+       with any solver; N comes from the delay time at the initial time)
    * - ``SAMPLE IF TRUE`` exact semantics
      - Full (holds last-true value)
-     - Supported (instantaneous ifelse output; hold stock updated each step)
+     - Supported (recorded at every tick and held in between, with any solver)
 
 With the same integration method (Euler with the model's time step), the
 results match Python PySD's to the last digits in most variables: ``SUM``

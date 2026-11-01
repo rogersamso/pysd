@@ -396,6 +396,14 @@ class JuliaSectionBuilder:
         # Map Julia identifier → comment string (units / documentation)
         self._var_comments: Dict[str, str] = {}
 
+        # What the translation writes as stocks that are exact only with Euler
+        # steps of TIME STEP (a DELAY FIXED whose delay time is unknown at
+        # translation time): the generated run_model refuses other solvers
+        self._euler_only: List[str] = []
+        # What is recorded at the model's ticks (fixed delays' inputs, samples'
+        # values), by key: its position here, from 1 (PySD.jl's PySDTicks)
+        self._tick_records: List[str] = []
+
         # Accumulated declarations
         self.stock_decls: List[str] = []
         self.aux_decls: List[str] = []
@@ -2148,36 +2156,25 @@ class JuliaSectionBuilder:
         As Python PySD (DelayN), when the delay time changes stage k uses the
         delay time of k - 1 time steps ago, and the output the one of the
         previous time step; for a constant delay time, or DELAY1/DELAY3, all
-        use the current one.  The past values are kept in a pipeline of states
-        (exact with Euler, as DELAY FIXED), whose equations are appended to
-        *eqs*.
+        use the current one.  The past values are recorded at the model's ticks
+        (a fixed delay of the delay time); their equations are appended to *eqs*.
         """
         constant = self._try_eval_as_float(delay_time_expr) is not None
         if not isinstance(ast, DelayNStructure) or constant:
             return [delay_time_expr] * order, delay_time_expr
-        ts_expr = self.control_vals.get("time_step") or "time_step"
-        times = [delay_time_expr]
-        prev = delay_time_expr
-        for k in range(1, max(order, 2)):
-            name = f"_dlt{k}_{identifier}"
-            self.namespace.namespace[f"__internal_dlt{k}_{identifier}"] = name
-            if dims:
-                self.stock_decls.append(f"@variables {name}(t)[{self._range_str(dims)}]")
-                for combo in itertools.product(*ranges):
-                    expr_i = u0_delay_expr
-                    for iv, val in zip(idx_vars, combo):
-                        expr_i = expr_i.replace(iv, str(val))
-                    idx_s = ", ".join(str(v) for v in combo)
-                    self.u0_entries.append(f"{name}[{idx_s}] => {expr_i}")
-                ref = f"{name}[{idx}]"
-                eqs.append(f"[D({ref}) ~ ({prev} - {ref}) / ({ts_expr}) for {for_clause}]...")
-            else:
-                self.stock_decls.append(f"@variables {name}(t)")
-                self.u0_entries.append(f"{name} => {u0_delay_expr}")
-                ref = name
-                eqs.append(f"D({ref}) ~ ({prev} - {ref}) / ({ts_expr})")
-            times.append(ref)
-            prev = ref
+        # the delay time recorded at every tick: k ticks ago is a fixed delay of it
+        in_name = f"_dlt_in_{identifier}"
+        self.namespace.namespace[f"__internal_dlt_in_{identifier}"] = in_name
+        key = self._tick_record(in_name)
+        at = f", {idx}" if dims else ""
+        if dims:
+            self.aux_decls.append(f"@variables {in_name}(t)[{self._range_str(dims)}]")
+            eqs.append(f"[{in_name}[{idx}] ~ {delay_time_expr} for {for_clause}]...")
+        else:
+            self.aux_decls.append(f"@variables {in_name}(t)")
+            eqs.append(f"{in_name} ~ {delay_time_expr}")
+        times = [delay_time_expr] + [
+            f"pysd_fixed_delay(_ticks, {key}, {k}, {u0_delay_expr}, t{at})" for k in range(1, max(order, 2))]
         return times[:order], times[1]
 
     # ------------------------------------------------------------------
@@ -2332,16 +2329,13 @@ class JuliaSectionBuilder:
         visitor: "JuliaASTVisitor",
         dims: Optional[List[Tuple[str, int]]] = None,
     ) -> List[str]:
-        """Expand DELAY FIXED into an exact N-stage Euler pipeline (ODE backend)
-        or a first-order ODE approximation (MTK backend / dynamic delay time).
+        """Expand DELAY FIXED: its input recorded at every tick of the model,
+        read N = round(delay_time / time_step) ticks later, exact with any
+        solver (``_expand_delay_fixed_ticks``).
 
-        For the ODE backend the pipeline is exact when using Euler integration:
-        each of the N = round(delay_time / time_step) stages performs one step of
-        delay via a first-order ODE with averaging_time = time_step.  With the
-        Euler solver, u[pipe_k](t+dt) = u[pipe_{k-1}](t), giving exact transport.
-
-        For the MTK backend (or when delay_time cannot be evaluated at translation
-        time) a single first-order ODE approximation is emitted instead.
+        When the delay time cannot be evaluated at translation time, a single
+        first-order ODE approximation is emitted instead, and run_model then
+        refuses other solvers than Euler steps of TIME STEP.
         """
         dims = dims or []
         if dims:
@@ -2369,8 +2363,8 @@ class JuliaSectionBuilder:
             dt_val = self._eval_fixing(ast.delay_time, reason)
         if dt_val is not None and ts_val is not None and ts_val > 0:
             N = max(round(dt_val / ts_val + 1e-6), 1)
-            return self._expand_delay_fixed_pipeline(
-                identifier, input_expr, initial_expr, N, dims
+            return self._expand_delay_fixed_ticks(
+                identifier, input_expr, initial_expr, N, dims or []
             )
         else:
             warn(
@@ -2380,6 +2374,7 @@ class JuliaSectionBuilder:
             )
 
         # ---- Fallback: single first-order ODE approximation ----
+        self._euler_only.append(f"DELAY FIXED ({identifier})")
         lv_name = f"_df_{identifier}"
         self.namespace.namespace[f"__internal_df_{identifier}"] = lv_name
 
@@ -2419,61 +2414,37 @@ class JuliaSectionBuilder:
             f"{identifier} ~ {lv_name}",
         ]
 
-    def _expand_delay_fixed_pipeline(
-        self,
-        identifier: str,
-        input_expr: str,
-        initial_expr: str,
-        N: int,
-        dims: Optional[List[Tuple[str, int]]] = None,
-    ) -> List[str]:
-        """Emit an N-stage pipeline for an exact DELAY FIXED with Euler integration.
+    def _tick_record(self, name: str) -> int:
+        """A record kept at the model's ticks: its key."""
+        self._tick_records.append(name)
+        return len(self._tick_records)
 
-        The stages are one array stock ``_df_pipe_<identifier>`` with the stage
-        as its first index (then the variable's dimensions), so that a long
-        delay (a delay time of hundreds of time steps) is one comprehension
-        and not hundreds of variables.  With Euler and dt = time_step, each
-        stage shifts a value by exactly one time step, giving a total
-        transport delay of N * time_step.  All stages start at
-        ``initial_expr``.
-        """
-        dims = dims or []
-        ts_expr = self.control_vals.get("time_step") or "time_step"
-        pipe_name = f"_df_pipe_{identifier}"
-        self.namespace.namespace[f"__internal_df_pipe_{identifier}"] = pipe_name
-        idx_vars = self._idx_vars(len(dims))
-        cells = ", ".join(["_k"] + idx_vars)
-        prev = ", ".join(["_k - 1"] + idx_vars)
-        last = ", ".join([str(N)] + idx_vars)
-        for_clause = ", ".join(
-            ["_k in 1:" + str(N)] + ([self._for_clause(dims, idx_vars)] if dims else [])
-        )
-        ranges = ", ".join([f"1:{N}"] + ([self._range_str(dims)] if dims else []))
-        self.stock_decls.append(f"@variables {pipe_name}(t)[{ranges}]")
-        # One u0 entry per cell of the variable, for all its stages
-        for idx_combo in itertools.product(*[range(1, size + 1) for _, size in dims]):
-            expr_i = initial_expr
-            for iv, idx in zip(idx_vars, idx_combo):
-                expr_i = expr_i.replace(iv, str(idx))
-            idx_s = ", ".join([f"1:{N}"] + [str(i) for i in idx_combo])
-            self.u0_entries.append(f"{pipe_name}[{idx_s}] => {expr_i}")
-
-        equations = [
-            f"[D({pipe_name}[{cells}]) ~ "
-            f"((_k == 1 ? {input_expr} : {pipe_name}[{prev}]) - {pipe_name}[{cells}]) "
-            f"/ ({ts_expr}) for {for_clause}]..."
-        ]
+    def _expand_delay_fixed_ticks(self, identifier, input_expr, initial_expr, N, dims):
+        """DELAY FIXED: its input is recorded at every tick of the model
+        (t0 + k * TIME STEP), and its value is the input N ticks before, as
+        Vensim, with any solver (PySD.jl's ``pysd_fixed_delay``).  The input is
+        a variable of its own, ``_df_in_<identifier>``, which ``_record_ticks!``
+        records."""
+        in_name = f"_df_in_{identifier}"
+        self.namespace.namespace[f"__internal_df_in_{identifier}"] = in_name
+        key = self._tick_record(in_name)
         if dims:
-            idx_str_t = ", ".join(idx_vars)
+            idx_vars = self._idx_vars(len(dims))
+            idx = ", ".join(idx_vars)
+            for_clause = self._for_clause(dims, idx_vars)
+            self.aux_decls.append(f"@variables {in_name}(t)[{self._range_str(dims)}]")
             self.aux_decls.append(f"@variables {identifier}(t)[{self._range_str(dims)}]")
-            equations.append(
-                f"[{identifier}[{idx_str_t}] ~ {pipe_name}[{last}] "
-                f"for {self._for_clause(dims, idx_vars)}]..."
-            )
-        else:
-            self.aux_decls.append(f"@variables {identifier}(t)")
-            equations.append(f"{identifier} ~ {pipe_name}[{N}]")
-        return equations
+            return [
+                f"[{in_name}[{idx}] ~ {input_expr} for {for_clause}]...",
+                f"[{identifier}[{idx}] ~ pysd_fixed_delay(_ticks, {key}, {N}, {initial_expr}, t, {idx}) "
+                f"for {for_clause}]...",
+            ]
+        self.aux_decls.append(f"@variables {in_name}(t)")
+        self.aux_decls.append(f"@variables {identifier}(t)")
+        return [
+            f"{in_name} ~ {input_expr}",
+            f"{identifier} ~ pysd_fixed_delay(_ticks, {key}, {N}, {initial_expr}, t)",
+        ]
 
     # ------------------------------------------------------------------
     # Trend expansion
@@ -2587,52 +2558,23 @@ class JuliaSectionBuilder:
         which is exact (one-step snap to input).
         """
         dims = dims or []
-        st_name = f"_sit_{identifier}"
-        self.namespace.namespace[f"__internal_sit_{identifier}"] = st_name
-
-        ts_val = self.control_vals.get("time_step")
-        ts_expr = ts_val if ts_val is not None else "time_step"
-
+        # its value is recorded at every tick of the model, and held in
+        # between, as Vensim, with any solver (PySD.jl's pysd_sampled)
+        key = self._tick_record(identifier)
         if dims:
             idx_vars = self._idx_vars(len(dims))
             vnd = self._nd_visitor(dims, idx_vars)
-            condition_nd = vnd.visit(ast.condition)
-            input_nd = vnd.visit(ast.input)
-            initial_nd = vnd.visit(ast.initial)
-            idx_str_t = ", ".join(idx_vars)
-            for_clause = self._for_clause(dims, idx_vars)
-            ranges_list = [range(1, size + 1) for _, size in dims]
-
-            self.stock_decls.append(
-                f"@variables {st_name}(t)[{self._range_str(dims)}]"
-            )
-            for idx_combo in itertools.product(*ranges_list):
-                expr_i = initial_nd
-                for iv, idx in zip(idx_vars, idx_combo):
-                    expr_i = expr_i.replace(iv, str(idx))
-                idx_s = ", ".join(str(v) for v in idx_combo)
-                self.u0_entries.append(f"{st_name}[{idx_s}] => {expr_i}")
-            self.aux_decls.append(
-                f"@variables {identifier}(t)[{self._range_str(dims)}]"
-            )
+            idx = ", ".join(idx_vars)
+            self.aux_decls.append(f"@variables {identifier}(t)[{self._range_str(dims)}]")
             return [
-                f"[D({st_name}[{idx_str_t}]) ~ pysd_ifelse({condition_nd} > 0.5, "
-                f"({input_nd} - {st_name}[{idx_str_t}]) / ({ts_expr}), 0.0) "
-                f"for {for_clause}]...",
-                f"[{identifier}[{idx_str_t}] ~ pysd_ifelse({condition_nd} > 0.5, "
-                f"{input_nd}, {st_name}[{idx_str_t}]) for {for_clause}]...",
+                f"[{identifier}[{idx}] ~ pysd_sampled(_ticks, {key}, {vnd.visit(ast.condition)}, "
+                f"{vnd.visit(ast.input)}, {vnd.visit(ast.initial)}, t, {idx}) "
+                f"for {self._for_clause(dims, idx_vars)}]...",
             ]
-
-        condition_expr = visitor.visit(ast.condition)
-        input_expr = visitor.visit(ast.input)
-        initial_expr = visitor.visit(ast.initial)
-        self.stock_decls.append(f"@variables {st_name}(t)")
-        self.u0_entries.append(f"{st_name} => {initial_expr}")
         self.aux_decls.append(f"@variables {identifier}(t)")
         return [
-            f"D({st_name}) ~ pysd_ifelse({condition_expr} > 0.5, "
-            f"({input_expr} - {st_name}) / ({ts_expr}), 0.0)",
-            f"{identifier} ~ pysd_ifelse({condition_expr} > 0.5, {input_expr}, {st_name})",
+            f"{identifier} ~ pysd_sampled(_ticks, {key}, {visitor.visit(ast.condition)}, "
+            f"{visitor.visit(ast.input)}, {visitor.visit(ast.initial)}, t)",
         ]
 
     # ------------------------------------------------------------------
@@ -5459,7 +5401,7 @@ class JuliaSectionBuilder:
         for base, cells in own:
             lines += self._u0_stock_lines(target, base, cells)
         if internal:
-            lines.append("# the translation's own stocks (DELAY FIXED stages, SAMPLE IF TRUE, ...)")
+            lines.append("# the translation's own stocks (smooths, delays, trends, ...)")
             for base, cells in internal:
                 lines += self._u0_stock_lines(target, base, cells)
         return lines
@@ -5704,7 +5646,57 @@ class JuliaSectionBuilder:
             f"time_step    = {ts}\n"
             f"saveper      = {sp}\n"
             "tspan = (initial_time, final_time)\n"
-        )
+        ) + (
+            "\n# the records of the fixed delays and samples, at the model's ticks\n"
+            "const _ticks = PySDTicks(initial_time, time_step)\n" if self._tick_records else "")
+
+    def _euler_guard(self) -> Tuple[str, str]:
+        """The check that run_model starts with, and its definition: a model
+        with stocks exact only with Euler steps of TIME STEP (``_euler_only``)
+        refuses other solvers and steps, which would silently run another
+        model (a fixed delay as a chain of smooths, samples never taken)."""
+        if not self._euler_only:
+            return "", ""
+        parts = sorted(set(self._euler_only))
+        shown = ", ".join(parts[:5]) + (f" and {len(parts) - 5} more" if len(parts) > 5 else "")
+        shown = shown.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+        definition = textwrap.dedent(f"""\
+            # {shown}: written as stocks that are exact only with Euler steps
+            # of TIME STEP.  Another solver or step would run another model.
+            function _check_euler(solver, dt)
+                nameof(typeof(solver)) === :Euler && isapprox(dt, time_step; rtol = 1e-9) && return
+                error("this model has {shown}, written as stocks that are exact only with " *
+                      "Euler steps of TIME STEP: run it with solver = Euler() and dt = time_step " *
+                      "(the default).  For other solvers, translate it with backend=\\"dsl\\".")
+            end
+
+            """)
+        return definition, "    _check_euler(solver, dt)\n"
+
+    def _ticks_block(self) -> str:
+        """The records kept at the model's ticks (fixed delays' inputs, samples'
+        values), and the callback that makes a solver stop at every tick to
+        record them (PySD.jl's PySDTicks): ODE backend (MTK: _run_function_mtk)."""
+        if not self._tick_records:
+            return ""
+        # (one that depends on constants only is a parameter: in p, not in v)
+        records = "\n".join(f"    pysd_record!(_ticks, {k}, hasproperty(v, :{name}) ? v.{name} : p.{name})"
+                             for k, name in enumerate(self._tick_records, 1))
+        return textwrap.dedent("""\
+            # Fixed delays and samples move at the model's ticks, every TIME STEP,
+            # as Vensim: a solver stops at each, where they are recorded from the
+            # state, and they are held in between.  With Euler steps of TIME STEP
+            # the values are Vensim's; other solvers run the same model.
+            function _record_ticks!(u, t, p = _params)
+                p isa NamedTuple || (p = _params)
+                v = model!(nothing, _named(u), p, t)
+            {RECORDS}
+                return nothing
+            end
+            _ticks_callback(p = _params, t_final = final_time) =
+                pysd_ticks_callback(_ticks, (u, t) -> _record_ticks!(u, t, p); t_final)
+
+            """).replace("{RECORDS}", records)
 
     def _run_function(self) -> str:
         if self.backend == "mtk":
@@ -5735,6 +5727,7 @@ class JuliaSectionBuilder:
                     global final_time = _c["final_time"]
                 end
                 tspan = (initial_time, final_time)
+                """) + self._ticks_block() + textwrap.dedent(f"""\
                 prob = ODEProblem(rhs!, u0, tspan, _problem_p(_params))
 
                 # The control variables change during the run, so (as Python
@@ -5748,8 +5741,8 @@ class JuliaSectionBuilder:
                     t = initial_time
                     ts = Float64[]
                     us = Vector{{typeof(u)}}()
-                    while true
-                        c = observe(u, t; p = params)
+                {{TICKS_START}}    while true
+                {{TICK}}        c = observe(u, t; p = params)
                         prec = c["time_step"] * 1e-5
                         elapsed = t - initial_time
                         if mod(elapsed, c["saveper"]) < prec || mod(-elapsed, c["saveper"]) < prec
@@ -5761,15 +5754,36 @@ class JuliaSectionBuilder:
                         u .+= c["time_step"] .* du
                         t += c["time_step"]
                     end
-                    return OrdinaryDiffEq.SciMLBase.DiffEqArray(us, ts)
+                {{TICKS_END}}    return OrdinaryDiffEq.SciMLBase.DiffEqArray(us, ts)
                 end
-                """).replace("{TAB_LOAD}", tab_lines)
-        return "prob = ODEProblem(rhs!, u0, tspan, _problem_p(_params))\n\n" + doc + textwrap.dedent(f"""\
+                """).replace("{TAB_LOAD}", tab_lines).replace(
+                    "{TICKS_START}", "    pysd_reset_ticks!(_ticks)\n" if self._tick_records else "").replace(
+                    "{TICK}", "        pysd_begin_tick!(_ticks, t); _record_ticks!(u, t, params); "
+                              "pysd_end_tick!(_ticks)\n" if self._tick_records else "").replace(
+                    "{TICKS_END}", "    pysd_free_ticks!(_ticks)\n" if self._tick_records else "")
+        guard, check = self._euler_guard()
+        if not self._tick_records:
+            return "prob = ODEProblem(rhs!, u0, tspan, _problem_p(_params))\n\n" + guard + doc + textwrap.dedent(f"""\
+                function run_model(; params=_params, u0=nothing, tspan=tspan, dt={ts}, solver=Euler(){tab_param}, kwargs...){tab_load}
+                {{CHECK}}    u0 === nothing && (u0 = initial_state(params))
+                    solve(ODEProblem(rhs!, u0, tspan, _problem_p(params)), solver; dt=dt, adaptive=false, kwargs...)
+                end
+                """).replace("{TAB_LOAD}", tab_lines).replace("{CHECK}", check)
+        # with the callback that records the fixed delays and samples at the
+        # ticks (and another one given, if any), and the records then read by time
+        return self._ticks_block() + \
+            "prob = ODEProblem(rhs!, u0, tspan, _problem_p(_params); callback = _ticks_callback())\n\n" + \
+            guard + doc + textwrap.dedent(f"""\
             function run_model(; params=_params, u0=nothing, tspan=tspan, dt={ts}, solver=Euler(){tab_param}, kwargs...){tab_load}
-                u0 === nothing && (u0 = initial_state(params))
-                solve(ODEProblem(rhs!, u0, tspan, _problem_p(params)), solver; dt=dt, adaptive=false, kwargs...)
+            {{CHECK}}    u0 === nothing && (u0 = initial_state(params))
+                cb = _ticks_callback(params, tspan[2])
+                haskey(kwargs, :callback) && (cb = OrdinaryDiffEq.CallbackSet(cb, kwargs[:callback]))
+                sol = solve(ODEProblem(rhs!, u0, tspan, _problem_p(params)), solver; dt=dt, adaptive=false,
+                            Base.structdiff(values(kwargs), NamedTuple{{(:callback,)}})..., callback=cb)
+                pysd_free_ticks!(_ticks)
+                return sol
             end
-            """).replace("{TAB_LOAD}", tab_lines)
+            """).replace("{TAB_LOAD}", tab_lines).replace("{CHECK}", check)
 
     def _run_function_mtk(self) -> str:
         ts = self.control_vals.get("time_step") or "time_step"
@@ -5777,17 +5791,52 @@ class JuliaSectionBuilder:
         # reorder them, and may add unknowns from algebraic loops, which start
         # at 0.0).  saveat is needed so that a system without unknowns is
         # still saved at every step.
+        guard, check = self._euler_guard()
+        if self._tick_records:
+            values = ", ".join(self._tick_records)
+            records = "\n".join(f"    pysd_record!(_ticks, {k}, v[{k}])"
+                                 for k in range(1, len(self._tick_records) + 1))
+            ticks = textwrap.dedent("""\
+                # Fixed delays and samples move at the model's ticks, every TIME STEP,
+                # as Vensim: a solver stops at each, where they are recorded from the
+                # state, and they are held in between.  With Euler steps of TIME STEP
+                # the values are Vensim's; other solvers run the same model.
+                const _ticked = ModelingToolkit.SymbolicIndexingInterface.observed(sys, [{VALUES}])
+                function _record_ticks!(u, t, p = prob.p)
+                    v = _ticked(u, p, t)
+                {RECORDS}
+                    return nothing
+                end
+                _ticks_callback(t_final = final_time) =
+                    pysd_ticks_callback(_ticks, (u, t) -> _record_ticks!(u, t); t_final)
+                prob = remake(prob; callback = _ticks_callback())
+
+                """).replace("{VALUES}", values).replace("{RECORDS}", records)
+            return textwrap.dedent(f"""\
+                u0_map = Dict(Symbolics.unwrap(k) => v for (k, v) in u0)
+                u0_full = isempty(unknowns(sys)) ? u0 :
+                    [x => get(u0_map, x, 0.0) for x in unknowns(sys)]
+                prob = ODEProblem(sys, u0_full, tspan; build_initializeprob = false)
+
+                """) + ticks + guard + textwrap.dedent(f"""\
+                function run_model(; u0=u0_full, tspan=tspan, dt={ts}, solver=Euler(), kwargs...)
+                {{CHECK}}    prob_local = remake(prob; u0=u0, tspan=tspan, callback=_ticks_callback(tspan[2]))
+                    sol = solve(prob_local, solver; dt=dt, saveat=tspan[1]:dt:tspan[2], adaptive=false, kwargs...)
+                    pysd_free_ticks!(_ticks)
+                    return sol
+                end
+                """).replace("{CHECK}", check)
         return textwrap.dedent(f"""\
             u0_map = Dict(Symbolics.unwrap(k) => v for (k, v) in u0)
             u0_full = isempty(unknowns(sys)) ? u0 :
                 [x => get(u0_map, x, 0.0) for x in unknowns(sys)]
             prob = ODEProblem(sys, u0_full, tspan; build_initializeprob = false)
 
-            function run_model(; u0=u0_full, tspan=tspan, dt={ts}, solver=Euler())
-                prob_local = remake(prob; u0=u0, tspan=tspan)
+            {{GUARD}}function run_model(; u0=u0_full, tspan=tspan, dt={ts}, solver=Euler())
+            {{CHECK}}    prob_local = remake(prob; u0=u0, tspan=tspan)
                 solve(prob_local, solver; dt=dt, saveat=tspan[1]:dt:tspan[2], adaptive=false)
             end
-            """)
+            """).replace("{GUARD}", guard).replace("{CHECK}", check)
 
     def _entrypoint_block(self) -> str:
         """Generate the calls that run the model and save results.
@@ -5846,9 +5895,9 @@ class JuliaSectionBuilder:
             size = stock_sizes[name]
             dim_names = self._var_dims.get(name, [])
             # The model's own stocks, by their subscript ranges.  Internal
-            # stocks (_df_pipe_*, _sit_*, ...: the stages of a DELAY FIXED,
-            # the value a SAMPLE IF TRUE holds) are not results, as in
-            # Python PySD, and their cells are not laid out over ranges.
+            # stocks (_lv*, _dl*, ...: the stages of a SMOOTH or a DELAY N)
+            # are not results, as in Python PySD, and their cells are not
+            # laid out over ranges.
             if not name.startswith("_") and size == math.prod(
                     self._subs_sizes.get(d, 0) for d in dim_names):
                 dims_jl = ", ".join(f'"{d}"' for d in dim_names)

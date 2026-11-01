@@ -515,22 +515,19 @@ class TestNewConstructsTranslation:
         content = self._translate(mdl, tmp_path)
         assert "function model!" in content
 
-    def test_delay_fixed_emits_pipeline_stages(self, tmp_path, julia_model):
-        """DELAY FIXED must expand into N Euler pipeline stages (exact transport delay)."""
+    def test_delay_fixed_emits_tick_records(self, tmp_path, julia_model):
+        """DELAY FIXED: its input recorded at every tick, read N ticks later
+        (exact transport, with any solver)."""
         mdl = julia_model("delay_fixed_constant")
         if not mdl.exists():
             pytest.skip("julia_delay_fixed test model not found")
         content = self._translate(mdl, tmp_path)
-        # Must declare internal pipeline stocks (prefix _df_pipe_)
-        assert "_df_pipe_" in content, "DELAY FIXED must declare _df_pipe_ pipeline stocks"
-        # Must produce ODE derivatives
-        assert re.search(r"\bd\.\w+", content), "DELAY FIXED must produce d.<stock> = ... rates of change"
-        # Must NOT emit a 'not supported' warning marker in generated code
+        assert "_df_in_output" in content
         assert "DELAY FIXED is not supported" not in content
-        # The model has delay_time=2 and time_step=0.0625 → N=32 stages
-        # The 32 stages are one array stock
-        assert "_df_pipe_output = zeros(32)" in content, "Pipeline must have 32 stages"
-        assert "_k in 1:32" in content
+        # delay_time=2 and time_step=0.0625 → 32 ticks
+        assert re.search(r"pysd_fixed_delay\(_ticks, 1, 32, ", content)
+        assert "pysd_record!(_ticks, 1, hasproperty(v, :_df_in_output) ? v._df_in_output : p._df_in_output)" in content
+        assert "_df_pipe_" not in content
 
     # --- TREND ---
 
@@ -586,23 +583,16 @@ class TestNewConstructsTranslation:
         content = self._translate(mdl, tmp_path)
         assert "function model!" in content
 
-    def test_sample_if_true_emits_conditional_stock(self, tmp_path, julia_model):
-        """SAMPLE IF TRUE must expand into a hold stock with correct instantaneous output."""
+    def test_sample_if_true_emits_a_tick_record(self, tmp_path, julia_model):
+        """SAMPLE IF TRUE: its value recorded at every tick, and held in
+        between; at a tick, the input where the condition holds."""
         mdl = julia_model("sample_if_true")
         if not mdl.exists():
             pytest.skip("julia_sample_if_true test model not found")
         content = self._translate(mdl, tmp_path)
-        # Must declare a hold stock
-        assert "_sit_" in content, "SAMPLE IF TRUE must declare a _sit_ hold stock"
-        # Must produce a conditional ODE for the hold stock
-        assert re.search(r"\bd\.\w+", content), "SAMPLE IF TRUE must produce a d.<stock> = ... rate of change"
-        # Condition must appear in the ODE
-        assert "ifelse" in content, "SAMPLE IF TRUE ODE must use ifelse for condition"
-        # The output variable must use the instantaneous conditional expression,
-        # NOT just read the stock directly (fixes off-by-one for the "true" branch)
-        # i.e. sample_simple = ifelse(condition, input, _sit_sample_simple)
-        assert "_sit_sample_simple" in content, \
-            "Output must use conditional ifelse(condition, input, hold_state)"
+        assert re.search(r"sample_simple = pysd_sampled\(_ticks, \d+, ", content)
+        assert re.search(r"pysd_record!\(_ticks, \d+, hasproperty\(v, :sample_simple\)", content)
+        assert "_sit_" not in content
 
     # --- Built-in function expansions ---
 

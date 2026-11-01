@@ -21,6 +21,13 @@ New Features
   solvers (``run_model(m, solver)``, ``ODEProblem(m)``) and results as tables
   (``DataFrame(r)``, ``DimStack(r)``).  See :doc:`julia_builder`, "The DSL
   backend".
+- Julia builder, ODE and MTK backends: ``DELAY FIXED``, ``SAMPLE IF TRUE``
+  and a ``DELAY N`` whose delay time changes run with any solver.  They are
+  recorded at the model's ticks (PySD.jl's ``PySDTicks``, PySD.jl 0.4.0)
+  instead of being written as stocks that are exact only with Euler steps of
+  ``TIME STEP``: the solver stops at every tick, where they are recorded, and
+  they are held in between.  Euler steps of ``TIME STEP`` give the same
+  values as before.  See :doc:`julia_builder`, "Choosing a solver".
 - **Experimental Julia/ModelingToolkit backend.** New ``pysd.translate_to_julia()``
   function translates Vensim ``.mdl`` files to standalone Julia scripts that use
   `ModelingToolkit.jl <https://github.com/SciML/ModelingToolkit.jl>`_ and
