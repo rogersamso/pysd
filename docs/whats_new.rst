@@ -48,6 +48,12 @@ New Features
   ``error`` for a function not translated; with the ODE and MTK backends,
   ``π`` for ``PI`` and ``pysd_ln(x) / pysd_ln(base)`` for ``LOG``).  PySD.jl
   0.8.0.
+- Julia builder, DSL backend: time settings that change during the run
+  (``FINAL TIME``, ``TIME STEP`` and ``SAVEPER`` that depend on ``Time`` or
+  on other variables, ``INITIAL TIME`` that depends on ``Time``) are variables
+  of the model that ``Model`` reads at every step, as the Python builder.
+  All the test models that the Python pathway runs match Vensim's output with
+  the DSL backend (186).  PySD.jl 0.9.0.
 - Julia builder, MTK backend: ``VECTOR SORT ORDER``, ``VECTOR RANK``,
   ``VECTOR REORDER`` and ``VECTOR SELECT`` build their equations with
   comparisons, as ModelingToolkit needs (before, sorting the symbolic values

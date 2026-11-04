@@ -115,9 +115,6 @@ KNOWN_FAILURES = {
     # MTK: numeric conversion of a symbolic value (#502)
     ("vensim:allocate_by_priority", "mtk"): "MTK: numeric conversion of a symbolic value (#502)",
     ("vensim:subscripted_round", "mtk"): "values differ from the reference (#499)",
-    # the DSL backend (PYSD_JULIA_BACKENDS=dsl)
-    ("vensim:control_vars", "dsl"): "DSL: time settings that are expressions",
-    ("vensim:dynamic_final_time", "dsl"): "DSL: time settings that are expressions",
 }
 
 
@@ -315,7 +312,7 @@ def _dsl_id_map(names_file, columns):
     ids = {}
     for col in columns:
         control = col.upper().replace("_", " ")
-        if control in CONTROL_COLUMNS:
+        if control in CONTROL_COLUMNS and _clean(col) not in to_julia:
             ids[col] = "@" + CONTROL_COLUMNS[control]                # the model's time settings
             continue
         base, _, rest = col.partition("[")

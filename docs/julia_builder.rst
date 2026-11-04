@@ -262,7 +262,7 @@ What a translated model gives you, besides running:
   form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
   layer per variable over the time and its dimensions.
 
-These need PySD.jl 0.8.0, which the model's package requires.
+These need PySD.jl 0.9.0, which the model's package requires.
 
 What it translates: stocks, auxiliaries and constants; subscripts (ranges,
 subranges, ranges defined with other ranges, mappings, arrays of up to 3
@@ -284,23 +284,24 @@ AVAILABLE``; ``INVERT MATRIX``; ``GAME`` (its value);
 ``PULSE``, ``PULSE TRAIN``, ``QUANTUM``, ``ZIDZ``, ``XIDZ``, ``MIN``, ``MAX``
 (also XMILE's of one argument), ``MODULO``, ``ELMCOUNT``, ``LN``, ``LOG``,
 ``EXP``, ``SQRT``, the trigonometric functions, ``PI``; ``TIME``, ``TIME
-STEP``, ``INITIAL TIME``, ``FINAL TIME`` and ``SAVEPER`` in equations.
+STEP``, ``INITIAL TIME``, ``FINAL TIME`` and ``SAVEPER`` in equations, and
+as equations: time settings that change during the run (a ``FINAL TIME``
+that depends on a variable, a ``TIME STEP`` that depends on ``Time``) are
+variables of the model that ``Model`` reads at every step, as the Python
+builder (``time = (0, :final_time), dt = :time_step``).
 
 What it doesn't translate yet.  A function it does not know (as ``LOOKUP
 FORWARD``): as the Python builder, a warning, and a call that stops the
 model with an error naming the function when it is evaluated.  The
 translation stops, listing the elements, for: ``GET TIME VALUE`` other than
-``GET TIME VALUE(0, offset, 0)``; time settings that change during the run
-(a ``FINAL TIME`` that depends on a variable or on ``Time``); ``DELAY FIXED``
+``GET TIME VALUE(0, offset, 0)``; ``DELAY FIXED``
 of an expression (of a variable it works); macros with several outputs;
 constants written as a table of numbers of more than 2 dimensions; ``INVERT
 MATRIX`` over more than 3 dimensions.
 
 The reference tests run every test model with the DSL backend
-(``PYSD_JULIA_BACKENDS=dsl``): 184 match Vensim's output (137 Vensim models,
-47 XMILE); the two whose time settings change during the run are listed in
-``KNOWN_FAILURES``, and the others are those the Python pathway marks as
-failing.
+(``PYSD_JULIA_BACKENDS=dsl``): 186 match Vensim's output (139 Vensim models,
+47 XMILE); the others are those the Python pathway marks as failing.
 Three large models (a global model and two regional models that take data
 from it, 1,900 to 2,000 names each) match Python PySD to 1e-12 in every saved
 value.

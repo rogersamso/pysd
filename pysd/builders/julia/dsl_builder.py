@@ -350,15 +350,22 @@ class DSLBuilder:
     # --- elements ----------------------------------------------------------------------
 
     def _elements(self):
+        # the time settings: numbers (controls), or variables of the model that
+        # change during the run (changing: name → its element)
+        self.all_controls = {clean(el.name): el for el in self.section.elements
+                             if isinstance(el, AbstractControlElement)}
         self.controls: Dict[str, object] = {}
+        self.changing: Dict[str, object] = {}
         self.kind_errors: List[str] = []
         self.hidden: Dict[str, List[str]] = {}       # view → declarations the translator adds
         self.positions: Dict[str, str] = {}          # range → its positions parameter
         self.elements: Dict[str, Element] = {}      # clean name → element
         for el in self.section.elements:
             if isinstance(el, AbstractControlElement):
-                self.controls[clean(el.name)] = el
-                continue
+                if self._control(clean(el.name)) is not None:
+                    self.controls[clean(el.name)] = el
+                    continue
+                self.changing[clean(el.name)] = el
             try:
                 self._split_exceptions(el)
             except DSLError as err:
@@ -621,7 +628,7 @@ class DSLBuilder:
         (out / "dims.jl").write_text(self._dims_text(), encoding="utf-8")
         (out / "inputs.jl").write_text(self._inputs_text(), encoding="utf-8")
         # the time unit too (XMILE's "Time", for instance)
-        _, unknown = translate_units(self.controls["time_step"].units if "time_step" in self.controls else "")
+        _, unknown = translate_units(self.all_controls["time_step"].units if "time_step" in self.all_controls else "")
         self.unknown_units.update(unknown)
         if self.unknown_units:
             (out / "units.jl").write_text(self._units_text(), encoding="utf-8")
@@ -724,26 +731,37 @@ class DSLBuilder:
         return "\n".join(out) + "\n"
 
     def _control(self, name, default=None):
-        el = self.controls.get(name)
+        """A time setting's value, if it is a number (or one of numbers, or
+        another setting that is); None if it changes during the run."""
+        el = self.all_controls.get(name)
         if el is None:
             return default
         ast = el.components[0].ast
         if isinstance(ast, (int, float)):
             return float(ast)
-        if isinstance(ast, ae.ReferenceStructure):
+        if isinstance(ast, ae.ReferenceStructure) and clean(ast.reference) in self.all_controls:
             return self._control(clean(ast.reference), default)
         if isinstance(ast, ae.ArithmeticStructure) and all(isinstance(a, (int, float)) for a in ast.arguments):
             v = float(ast.arguments[0])
             for op, a in zip(ast.operators, ast.arguments[1:]):
                 v = {"+": v + a, "-": v - a, "*": v * a, "/": v / a}[op]
             return v
-        raise DSLError(f"{name}: only numbers are supported for the control variables")
+        return None
+
+    def _setting(self, name, default):
+        """A time setting in Model: its number, or the name of its variable."""
+        if name in self.changing:
+            return ":" + self.elements[name].ident
+        value = self._control(name, default)
+        if value is None:
+            raise DSLError(f"the model has no {name.upper().replace('_', ' ')}")
+        return number(value)
 
     def _main_text(self, files):
-        t0, tf = self._control("initial_time", 0), self._control("final_time")
-        dt = self._control("time_step", 1)
-        save = self._control("saveper", dt)
-        tunit, _ = translate_units(self.controls["time_step"].units if "time_step" in self.controls else "")
+        t0, tf = self._setting("initial_time", 0), self._setting("final_time", None)
+        dt = self._setting("time_step", 1)
+        save = self._setting("saveper", None) if "saveper" in self.all_controls else dt
+        tunit, _ = translate_units(self.all_controls["time_step"].units if "time_step" in self.all_controls else "")
         tunit = tunit or "s"
         out = [f"# {self.path.name}, translated to PySD.jl's DSL by PySD.", "using PySD, DimensionalData"]
         if self.unknown_units:
@@ -752,7 +770,8 @@ class DSLBuilder:
         out += [f'include("{f}")' for _, f in files]
         sets = ", ".join(v for v, _ in files)
         out += ["", f"{identifier(self.path.stem, set())} = Model({sets};",
-                f"    inputs, time = {number(t0)}:{number(dt)}:{number(tf)}, saveat = {number(save)},",
+                (f"    inputs, time = {t0}:{dt}:{tf}, saveat = {save}," if not self.changing else
+                 f"    inputs, time = ({t0}, {tf}), dt = {dt}, saveat = {save},"),
                 f'    time_unit = u"{tunit}", numerics = :python)']
         return "\n".join(out) + "\n"
 
@@ -1291,9 +1310,9 @@ class Context:
         name = clean(node.reference)
         if name == "time":
             return Code("t")
-        if name == "time_step":
+        if name == "time_step" and name not in self.b.changing:
             return Code("Δt")
-        if name == "initial_time":
+        if name == "initial_time" and name not in self.b.changing:
             return Code("t₀")
         el = self.b.elements.get(name)
         rng = next((r for r in self.b.ranges if clean(r) == name), None)

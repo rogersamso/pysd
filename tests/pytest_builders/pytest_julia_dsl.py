@@ -287,6 +287,26 @@ def test_time_step_as_a_fraction_and_saveper_by_default(tmp_path):
     assert "time = 0:0.25:10, saveat = 0.25," in text
 
 
+def test_time_settings_that_change_during_the_run(tmp_path):
+    path = tmp_path / "changing.mdl"
+    path.write_text("{UTF-8}\nstock = INTEG(1, 0)\n\t~\tDmnl\n\t~\t\t|\n\n"
+                    "rate = TIME STEP * 2\n\t~\tDmnl\n\t~\t\t|\n\n" + CONTROL
+                    .replace("FINAL TIME  = 10", "FINAL TIME  = IF THEN ELSE(stock > 5, Time, 10)")
+                    .replace("TIME STEP  = 0.5", "TIME STEP  = IF THEN ELSE(Time < 4, 1, 0.5)")
+                    .replace("SAVEPER  = 1", "SAVEPER  = TIME STEP"), encoding="utf-8")
+    main = pysd.translate_to_julia(str(path), backend="dsl")
+    text = main.read_text(encoding="utf-8")
+    assert "time = (0, :final_time), dt = :time_step, saveat = :saveper," in text
+    code = "\n".join(f.read_text(encoding="utf-8") for f in main.parent.glob("*.jl"))
+    # the settings are variables; TIME STEP in an equation is its variable, not Δt
+    assert "final_time ~ ifelse(stock > 5, t, 10)" in code
+    assert "time_step ~ ifelse(t < 4, 1, 0.5)" in code
+    assert "saveper ~ time_step" in code
+    assert "rate ~ time_step * 2" in code
+    names = (main.parent / "names.tsv").read_text(encoding="utf-8")
+    assert "FINAL TIME\tfinal_time" in names
+
+
 # --- parameters and expressions ----------------------------------------------
 
 def test_parameter_in_parts_with_except(tmp_path):
