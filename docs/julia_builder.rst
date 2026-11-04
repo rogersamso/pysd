@@ -262,28 +262,35 @@ What a translated model gives you, besides running:
   form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
   layer per variable over the time and its dimensions.
 
-These need PySD.jl 0.6.0, which the model's package requires.
+These need PySD.jl 0.7.0, which the model's package requires.
 
 What it translates: stocks, auxiliaries and constants; subscripts (ranges,
 subranges, mappings, arrays of up to 3 dimensions, ``:EXCEPT:``, variables
 defined in parts or element by element); lookups (also inline, ``WITH
-LOOKUP``); ``GET DIRECT CONSTANTS``, ``LOOKUPS`` and ``DATA``; data variables
-without an equation (from other models' runs or files, above); ``SMOOTH``,
-``SMOOTHI``, ``SMOOTH3``, ``SMOOTH N``, ``DELAY1``, ``DELAY3``, ``DELAY N``,
-``DELAY FIXED`` (also of a constant), ``TREND``, ``SAMPLE IF TRUE``,
-``INITIAL``; ``SUM``, ``PROD``, ``VMIN``, ``VMAX`` (over one or several
-dimensions); ``INVERT MATRIX``; ``IF THEN ELSE``, ``STEP``, ``RAMP``,
+LOOKUP``); ``GET DIRECT CONSTANTS``, ``LOOKUPS`` and ``DATA`` (also in parts,
+one per element of one subscript or of several); data variables without an
+equation (from other models' runs or files, above); ``SMOOTH``, ``SMOOTHI``,
+``SMOOTH3``, ``SMOOTH N``, ``DELAY1``, ``DELAY3``, ``DELAY N``, ``DELAY
+FIXED`` (also of a constant), ``TREND``, ``FORECAST``, ``SAMPLE IF TRUE``,
+``INITIAL``, ``ACTIVE INITIAL``; the random functions (a draw per tick, the
+same with any solver); ``SUM``, ``PROD``, ``VMIN``, ``VMAX`` (over one or
+several dimensions); ``VECTOR SELECT``, ``VECTOR SORT ORDER``, ``VECTOR
+RANK``, ``VECTOR REORDER``; ``ALLOCATE BY PRIORITY``, ``ALLOCATE
+AVAILABLE``; ``INVERT MATRIX``; ``GAME`` (its value);
+``GET TIME VALUE(0, offset, 0)``; ``IF THEN ELSE``, ``STEP``, ``RAMP``,
 ``PULSE``, ``PULSE TRAIN``, ``QUANTUM``, ``ZIDZ``, ``XIDZ``, ``MIN``, ``MAX``
 (also XMILE's of one argument), ``MODULO``, ``ELMCOUNT``, ``LN``, ``LOG``,
 ``EXP``, ``SQRT``, the trigonometric functions, ``PI``; ``TIME``, ``TIME
 STEP``, ``INITIAL TIME``, ``FINAL TIME`` and ``SAVEPER`` in equations.
 
-What it doesn't translate yet (the translation stops and lists the elements):
-macros; ``ACTIVE INITIAL``; ``FORECAST``; ``ALLOCATE``; ``GET TIME VALUE``;
-``VECTOR SELECT`` and the other vector functions; ``GAME``; the random
-functions; time settings that are expressions; ``DELAY FIXED`` and
-``INITIAL`` of an expression (of a variable they work); ``:EXCEPT:`` narrower
-at several positions; constants written as a table of numbers of more than 2
+What it doesn't translate yet.  A function it does not know (as ``LOOKUP
+FORWARD``): as the Python builder, a warning, and a call that stops the
+model with an error naming the function when it is evaluated.  The
+translation stops, listing the elements, for: ``GET TIME VALUE`` other than
+``GET TIME VALUE(0, offset, 0)``;
+macros; time settings that are expressions; ``DELAY FIXED`` and ``INITIAL``
+of an expression (of a variable they work); ``:EXCEPT:`` narrower at several
+positions; constants written as a table of numbers of more than 2
 dimensions; ``INVERT MATRIX`` over more than 3 dimensions.
 
 The reference tests run every test model with the DSL backend
@@ -752,7 +759,13 @@ Supported Vensim features
    * - ``VECTOR SORT ORDER``, ``VECTOR RANK``, ``VECTOR REORDER``
      - Supported (along the last subscript of the argument, as the Python
        builder)
-     - Supported
+     - Supported (with comparisons, which ModelingToolkit can build
+       equations from)
+   * - ``VECTOR SELECT``
+     - Supported (over the ``!`` subscripts of either array, as the Python
+       builder)
+     - Partial (the error actions are not checked; with selections that are
+       variables, building the system can take very long)
    * - ``GET TIME VALUE``
      - Supported for the current time plus an offset (``GET TIME VALUE(0,
        offset, 0)``), as the Python builder

@@ -18,6 +18,8 @@ Environment variables:
     PYSD_JULIA_BACKENDS  comma-separated backends to test (default "ode,mtk";
                          "dsl" for the DSL backend)
     PYSD_JULIA_MTK       "all" (default) or "subset" (MTK_SUBSET only)
+    PYSD_JULIA_CASES     comma-separated model names (e.g. "vector_order,game"):
+                         translate and run only these
     PYSD_JULIA_TIMEOUT   per-model timeout in seconds (default 600)
     PYSD_JULIA_STARTUP   extra seconds for the first model of each Julia
                          process, which loads the packages (default 600)
@@ -106,18 +108,14 @@ KNOWN_FAILURES = {
     # MTK: symbolic value in an if/else condition (#502)
     ("vensim:control_vars", "mtk"): "MTK: symbolic value in an if/else condition (#502)",
     ("vensim:dynamic_final_time", "mtk"): "MTK: symbolic value in an if/else condition (#502)",
-    # VECTOR SELECT called with wrong arguments (#500)
-    ("vensim:vector_select", "mtk"): "VECTOR SELECT called with wrong arguments (#500)",
-    # lookup called with extra arguments (#500)
-    ("vensim:vector_order", "mtk"): "lookup called with extra arguments (#500)",
+    # MTK: building the system takes longer than the timeout
+    ("vensim:vector_select", "mtk"): "MTK: VECTOR SELECT with symbolic selections: building the system takes longer than the timeout",
     # MTK: initial value depends on other variables (#502)
     ("vensim:active_initial_circular", "mtk"): "MTK: initial value depends on other variables (#502)",
     # MTK: numeric conversion of a symbolic value (#502)
     ("vensim:allocate_by_priority", "mtk"): "MTK: numeric conversion of a symbolic value (#502)",
     ("vensim:subscripted_round", "mtk"): "values differ from the reference (#499)",
     # the DSL backend (PYSD_JULIA_BACKENDS=dsl)
-    ("vensim:allocate_available", "dsl"): "DSL: not translated yet: ALLOCATE AVAILABLE (the model stops with pysd_not_implemented)",
-    ("vensim:allocate_by_priority", "dsl"): "DSL: not translated yet: ALLOCATE BY PRIORITY (the model stops with pysd_not_implemented)",
     ("vensim:arithmetics_exp", "dsl"): "DSL: values missing from the results",
     ("vensim:arguments", "dsl"): "DSL: not translated yet: INITIAL of an expression",
     ("vensim:conditional_subscripts", "dsl"): "DSL: not translated yet: a subscript used as a value in a conditional subscript",
@@ -129,7 +127,6 @@ KNOWN_FAILURES = {
     ("vensim:except", "dsl"): "DSL: not translated yet: :EXCEPT: narrower at several positions",
     ("vensim:except_multiple", "dsl"): "DSL: not translated yet: :EXCEPT: narrower at several positions",
     ("vensim:exponentiation", "dsl"): "DSL: values differ from the reference",
-    ("vensim:game", "dsl"): "DSL: not translated yet: GAME (the model stops with pysd_not_implemented)",
     ("vensim:get_constants_subranges", "dsl"): "DSL: values differ from the reference",
     ("vensim:get_mixed_definitions", "dsl"): "DSL translation: list indices must be integers or slices, not NoneType",
     ("vensim:get_subscript_3d_arrays_xls", "dsl"): "DSL: a subscript range read from Excel",
@@ -151,8 +148,6 @@ KNOWN_FAILURES = {
     ("vensim:subscripted_lookups", "dsl"): "DSL translation: list indices must be integers or slices, not NoneType",
     ("vensim:subscripted_round", "dsl"): "DSL: values differ from the reference (as with MTK, #499)",
     ("vensim:tabbed_arrays", "dsl"): "DSL: the model does not build: DimensionMismatch: stack expects uniform slices, got axes(x) == (1:3, 1:4) while",
-    ("vensim:vector_order", "dsl"): "DSL translation: list indices must be integers or slices, not NoneType",
-    ("vensim:vector_select", "dsl"): "DSL: not translated yet: VECTOR SELECT (the model stops with pysd_not_implemented)",
     ("vensim:with_lookup", "dsl"): "DSL: the model does not build: ArgumentError: (↓ dim3 [:g, …, :i]) dims were not found in object.",
     ("xmile:arithmetics_exp", "dsl"): "DSL: values missing from the results",
     ("xmile:exponentiation", "dsl"): "DSL: values differ from the reference",
@@ -220,10 +215,16 @@ def _julia_unavailable(backend):
     return None
 
 
+ONLY = [c for c in os.environ.get("PYSD_JULIA_CASES", "").split(",") if c]
+
+
 def _cases_for(backend):
+    cases = list(CASES)
     if backend == "mtk" and MTK_SCOPE == "subset":
-        return [case for case in CASES if case in MTK_SUBSET]
-    return list(CASES)
+        cases = [case for case in cases if case in MTK_SUBSET]
+    if ONLY:
+        cases = [case for case in cases if case.split(":", 1)[-1] in ONLY]
+    return cases
 
 
 def _params():

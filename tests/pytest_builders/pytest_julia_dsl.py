@@ -474,17 +474,160 @@ ahead = GET TIME VALUE(0, 0.5, 0)
 
 def test_a_function_not_translated_stops_the_model(tmp_path):
     # as Python PySD: a warning, and a call that stops the model, naming it
-    with pytest.warns(UserWarning, match="VECTOR SELECT.*will crash"):
+    with pytest.warns(UserWarning, match="LOOKUP FORWARD.*will crash"):
         _, code = translate(tmp_path, """
-dim: a, b
-	~	~		|
-
-x[dim] = 1, 2
+table(
+	[(0,0)-(2,2)],(0,0),(1,1),(2,2))
 	~	Dmnl
 	~		|
 
-pick = VECTOR SELECT(x[dim!], x[dim!], 0, 0, 0)
+ahead = LOOKUP FORWARD(table, Time)
 	~	Dmnl
 	~		|
 """)
-    assert 'pysd_not_implemented("VECTOR SELECT"' in code
+    assert 'pysd_not_implemented("LOOKUP FORWARD"' in code
+
+
+def test_vector_functions_and_game(tmp_path):
+    _, code = translate(tmp_path, """
+region: north, south
+	~	~		|
+
+tech: coal, gas, solar
+	~	~		|
+
+rank: first, second, third
+	~	~		|
+
+cost[region, tech] = 3, 1, 2; 2, 3, 1;
+	~	Dmnl
+	~		|
+
+available[tech] = 1, 0, 1
+	~	Dmnl
+	~		|
+
+order[region, rank] = VECTOR SORT ORDER(cost[region, tech], 1)
+	~	Dmnl
+	~		|
+
+ranks[region, tech] = VECTOR RANK(cost[region, tech], 0)
+	~	Dmnl
+	~		|
+
+sorted[region, rank] = VECTOR REORDER(cost[region, tech], order[region, rank])
+	~	Dmnl
+	~		|
+
+cheapest[region] = VECTOR SELECT(available[tech!], cost[region, tech!], -1, 8, 0)
+	~	Dmnl
+	~		|
+
+cheapest anywhere = VECTOR SELECT(available[tech!], cost[region!, tech!], -1, 8, 0)
+	~	Dmnl
+	~		|
+
+played = GAME(cheapest anywhere * 2)
+	~	Dmnl
+	~		|
+""")
+    # along the last subscript, the results along the variable's last, by position
+    assert "order ~ vector_sort_order(set(cost, :tech => Dim{:rank}(rank_elements)), 1, rank)" in code
+    assert "ranks ~ vector_rank(cost, 0, tech)" in code
+    assert "sorted ~ vector_reorder(set(cost, :tech => Dim{:rank}(rank_elements)), order, rank)" in code
+    # over the ! subscripts, which the result no longer has
+    assert "cheapest ~ vector_select(available, cost, tech, -1, 8, 0)" in code
+    assert "cheapest_anywhere ~ vector_select(available, cost, (tech, region), -1, 8, 0)" in code
+    assert "played ~ cheapest_anywhere * 2" in code
+
+
+def test_vector_select_over_a_subscript_kept_elsewhere(tmp_path):
+    # dim2 is kept in the selection and summed over (!) in the input: two dimensions
+    _, code = translate(tmp_path, """
+dim1: a1, a2
+	~	~		|
+
+dim2: b1, b2
+	~	~		|
+
+sel[dim1, dim2] = 1, 0; 0, 1;
+	~	Dmnl
+	~		|
+
+input[dim2] = 3, 4
+	~	Dmnl
+	~		|
+
+out[dim2] = VECTOR SELECT(sel[dim1!, dim2], input[dim2!], -1, 0, 0)
+	~	Dmnl
+	~		|
+""")
+    assert "out ~ vector_select(sel, set(input, :dim2 => :dim2_selected), (dim1, :dim2_selected), -1, 0, 0)" in code
+
+
+def test_data_in_parts_over_two_subscripts(tmp_path):
+    _, code = translate(tmp_path, """
+region: north, south
+	~	~		|
+
+product: x, y
+	~	~		|
+
+company: c1, c2
+	~	~		|
+
+revenue[north, x, company]:RAW::=
+	GET DIRECT DATA('input.xlsx', 'Sheet1', 'time', 'B2') ~~|
+revenue[north, y, company]:RAW::=
+	GET DIRECT DATA('input.xlsx', 'Sheet1', 'time', 'C2') ~~|
+revenue[south, x, company]:RAW::=
+	GET DIRECT DATA('input.xlsx', 'Sheet1', 'time', 'D2') ~~|
+revenue[south, y, company]:RAW::=
+	GET DIRECT DATA('input.xlsx', 'Sheet1', 'time', 'E2')
+	~	Dmnl
+	~		|
+""")
+    # a vector per region, of a vector per product
+    assert re.search(r"revenue\[region, product, company\] = \[\[data\(\w+, \"time\", \"B2\"; method = :raw\), "
+                     r"data\(\w+, \"time\", \"C2\"; method = :raw\)\], \[data", code)
+
+
+def test_allocate_functions(tmp_path):
+    _, code = translate(tmp_path, """
+region: north, south
+	~	~		|
+
+branch: b1, b2, b3
+	~	~		|
+
+pprofile: ptype, ppriority, pwidth, pextra
+	~	~		|
+
+request[region, branch] = 5, 3, 2; 1, 4, 6;
+	~	Dmnl
+	~		|
+
+priority[branch] = 3, 1, 2
+	~	Dmnl
+	~		|
+
+supply[region] = 6, 20
+	~	Dmnl
+	~		|
+
+profiles[branch, pprofile] = 1, 3, 1, 0; 1, 1, 1, 0; 1, 2, 1, 0;
+	~	Dmnl
+	~		|
+
+shipped[region, branch] = ALLOCATE BY PRIORITY(request[region, branch], priority[branch], ELMCOUNT(branch), 1, supply[region])
+	~	Dmnl
+	~		|
+
+available[region, branch] = ALLOCATE AVAILABLE(request[region, branch], profiles[branch, ptype], 6)
+	~	Dmnl
+	~		|
+""")
+    # along the last subscript; the width and the supply over the others
+    assert "shipped ~ allocate_by_priority(request, priority, 1, supply, branch)" in code
+    # the profiles written from their first element (ptype): the whole range
+    assert "available ~ allocate_available(request, profiles, 6, branch, pprofile)" in code

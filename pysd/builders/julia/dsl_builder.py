@@ -13,6 +13,8 @@ Python PySD's last digits.
 """
 from __future__ import annotations
 
+import dataclasses
+import itertools
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -265,8 +267,8 @@ class DSLBuilder:
             e.vensim_dims = dims
             split = self._split_position(el) if kind == "parameter" and len(el.components) > 1 else None
             e.split = split
-            if split:                                    # the dimension it is split along, first
-                order = [split] + [i for i in range(len(dims)) if i != split]
+            if split:                                    # the dimensions it is split along, first
+                order = list(split) + [i for i in range(len(dims)) if i not in split]
                 e.dims = tuple(e.dims[i] for i in order)
             self.elements[clean(el.name)] = e
         views = self.section.views_dict or {}
@@ -330,21 +332,29 @@ class DSLBuilder:
             return "parameter"
         return "variable"
 
-    def _split_position(self, el) -> Optional[int]:
-        """The position where each part is one element (all of them, once) and the
-        others are whole ranges: a parameter in parts is then a vector of values."""
+    def _split_position(self, el) -> Optional[Tuple[int, ...]]:
+        """The positions where each part is one element and the others are whole
+        ranges, the parts covering every combination of the elements once: a
+        parameter in parts is then a vector of values (a vector of vectors
+        when split at two positions, and so on).  One position if there is one."""
         comps = el.components
         n = len(comps[0].subscripts[0])
         if any(c.subscripts[1] for c in comps):
             return None
-        for p in range(n):
-            elems = [self._elem(c.subscripts[0][p]) if self._range_of(c.subscripts[0][p]) is None else None
-                     for c in comps]
-            if None in elems or len(set(elems)) != len(elems):
-                continue
-            others = {tuple(c.subscripts[0][q] for q in range(n) if q != p) for c in comps}
-            if len(others) == 1 and all(self._range_of(x) is not None for x in next(iter(others))):
-                return p
+        dims = self._declared_dims(el)
+        single = [p for p in range(n) if all(self._range_of(c.subscripts[0][p]) is None for c in comps)]
+        for k in range(1, len(single) + 1):
+            for ps in itertools.combinations(single, k):
+                keys = [tuple(self._elem(c.subscripts[0][p]) for p in ps) for c in comps]
+                every = set(itertools.product(*(self.ranges[dims[p]] for p in ps)))
+                if len(set(keys)) != len(keys) or set(keys) != every:
+                    continue
+                others = {tuple(c.subscripts[0][q] for q in range(n) if q not in ps) for c in comps}
+                if len(others) == 1 and all(self._range_of(x) is not None for x in next(iter(others))):
+                    if k > 1 and not all(isinstance(c.ast, (ae.GetLookupsStructure, ae.GetDataStructure))
+                                         for c in comps):
+                        continue                  # numbers in parts at several positions: one equation each
+                    return ps
         return None
 
     def _time_dependence(self):
@@ -721,14 +731,19 @@ class DSLBuilder:
         vals = [self._one_value(e, c) for c in comps]
         if len(vals) == 1:
             return vals[0]
-        # one part per element of a dimension (declared first): one value per element
-        p = e.split
-        firsts = [self._elem(c.subscripts[0][p]) for c in comps]
-        order = self.ranges[e.vensim_dims[p]]
-        if set(firsts) != set(order):
-            raise DSLError(f"{e.name}: its parts don't define every element of {self.dimname[e.vensim_dims[p]]}")
-        by = dict(zip(firsts, vals))
-        return "[" + ", ".join(by[x] for x in order) + "]"
+        # one part per element of the dimensions it is split along (declared
+        # first): one value per element, in vectors nested in that order
+        ps = e.split
+        if ps is None:
+            raise DSLError(f"{e.name}: its parts don't define one element each")
+        by = {tuple(self._elem(c.subscripts[0][p]) for p in ps): v for c, v in zip(comps, vals)}
+
+        def nested(prefix):
+            if len(prefix) == len(ps):
+                return by[prefix]
+            elems = self.ranges[e.vensim_dims[ps[len(prefix)]]]
+            return "[" + ", ".join(nested(prefix + (x,)) for x in elems) + "]"
+        return nested(())
 
     def _one_value(self, e: Element, c) -> str:
         ast = c.ast
@@ -830,6 +845,9 @@ class Context:
             return self._reference(node)
         if isinstance(node, ae.CallStructure):
             return self._call(node)
+        if isinstance(node, ae.GameStructure):
+            # GAME passes its value through when the model is not run interactively
+            return self.visit(node.expression)
         for cls, kind in ((ae.SmoothStructure, "smooth"), (ae.SmoothNStructure, "smooth"),
                           (ae.DelayStructure, "delay"), (ae.DelayNStructure, "delay")):
             if isinstance(node, cls):
@@ -866,6 +884,8 @@ class Context:
             return self._of_whole(node.input, f"(t - {tau.wrap(P_ADD + 1)}; init = {init_text})")
         if isinstance(node, ae.InitialStructure):
             return self._initial(node.initial)
+        if isinstance(node, (ae.AllocateByPriorityStructure, ae.AllocateAvailableStructure)):
+            return self._allocate(node)
         raise DSLError(f"{self.e.name}: {type(node).__name__} is not supported yet")
 
     @staticmethod
@@ -1211,6 +1231,10 @@ class Context:
                     dims = self._union(dims, extra)
             kw = ("; " + ", ".join(kws)) if kws else ""
             return Code(f"{fname}({', '.join(c.text for c in vals)}{kw})", dims)
+        if fname in ("vector_sort_order", "vector_rank", "vector_reorder"):
+            return self._vector_along(fname, args)
+        if fname == "vector_select":
+            return self._vector_select(args)
         if fname == "elmcount":
             r = self.b._range_of(args[0].reference if isinstance(args[0], ae.ReferenceStructure) else str(args[0]))
             if r is None:
@@ -1241,15 +1265,118 @@ class Context:
                                "(0, offset, 0) is not supported yet")
             o = self.visit(off)
             return Code(f"t {'.+' if o.dims else '+'} {o.wrap(P_ADD + 1)}", o.dims, P_ADD)
-        # as Python PySD: a warning, and a call that stops the model with an
-        # error naming the function when it is evaluated
+        return self._not_implemented(node.function.reference.upper().replace("_", " "), args)
+
+    def _not_implemented(self, name: str, args) -> Code:
+        """As Python PySD: a warning, and a call that stops the model with an
+        error naming the function when it is evaluated."""
         cs = [self.visit(x) for x in args]
-        name = node.function.reference.upper().replace("_", " ")
         warnings.warn(f"Trying to translate '{name}' which it is not implemented in the DSL "
                       "backend. The translated model will crash...")
         quoted = name.replace('"', '\\"').replace("$", "\\$")
         return Code(f'pysd_not_implemented("{quoted}"' + "".join(", " + c.text for c in cs) + ")",
                     self._union(*(c.dims for c in cs)))
+
+    def _vector_along(self, fname: str, args) -> Code:
+        """VECTOR SORT ORDER, RANK and REORDER, as Vensim and Python PySD: along
+        the last subscript of the (first) argument, with the results along the
+        last subscript of the variable, position by position."""
+        name = fname.upper().replace("_", " ")
+        lhs = self.c.subscripts[0] if self.c.subscripts else []
+        decl = self.e.vensim_dims[-1] if self.e.vensim_dims else None
+        r_lhs = self.b._range_of(lhs[-1]) if lhs else None
+        if r_lhs is None or list(self.b.ranges[r_lhs]) != list(self.b.ranges[decl]):
+            raise DSLError(f"{self.e.name}: {name} for a part of the last subscript is not supported yet")
+        target = self.b.dimname[decl]
+        arrays = []
+        for a in args[:2 if fname == "vector_reorder" else 1]:
+            last = a.subscripts.subscripts[-1] if isinstance(a, ae.ReferenceStructure) and a.subscripts else None
+            r = self.b._range_of(last) if last else None
+            c = self.visit(a)
+            if r is None or not c.dims:
+                raise DSLError(f"{self.e.name}: {name} of an expression, not of a variable over a range")
+            if len(self.b.ranges[r]) != len(self.b.ranges[decl]):
+                raise DSLError(f"{self.e.name}: {name} along {last}, of another size than {decl}")
+            own = c.dims[-1]
+            if own != target:
+                if target in c.dims:
+                    raise DSLError(f"{self.e.name}: {name} along {last}, with {decl} elsewhere")
+                c = Code(f"set({c.text}, :{own} => Dim{{:{target}}}({self.b.elements_name[decl]}))",
+                         c.dims[:-1] + (target,))
+            arrays.append(c)
+        rest = [self.visit(x) for x in args[len(arrays):]]
+        dims = self._union(*(c.dims for c in arrays))
+        return Code(f"{fname}({', '.join(c.text for c in arrays + rest)}, {target})", dims)
+
+    def _allocate(self, node) -> Code:
+        """ALLOCATE BY PRIORITY and ALLOCATE AVAILABLE, as the Python builder:
+        along the last subscript of the variable; the width and the supply
+        (they can't vary along it) and the rest broadcast to the others.
+        ALLOCATE AVAILABLE's profiles are written as pp[…, ptype], the first
+        element of the profile range: the whole range is passed."""
+        by_priority = isinstance(node, ae.AllocateByPriorityStructure)
+        name = "ALLOCATE BY PRIORITY" if by_priority else "ALLOCATE AVAILABLE"
+        lhs = self.c.subscripts[0] if self.c.subscripts else []
+        decl = self.e.vensim_dims[-1] if self.e.vensim_dims else None
+        r_lhs = self.b._range_of(lhs[-1]) if lhs else None
+        if r_lhs is None or list(self.b.ranges[r_lhs]) != list(self.b.ranges[decl]):
+            raise DSLError(f"{self.e.name}: {name} for a part of the last subscript is not supported yet")
+        along = self.b.dimname[decl]
+        request = self.visit(node.request)
+        if along not in request.dims:
+            raise DSLError(f"{self.e.name}: {name} of a request without {decl}")
+        if by_priority:
+            priority, width, supply = (self.visit(x) for x in (node.priority, node.width, node.supply))
+            if along in width.dims or along in supply.dims:
+                raise DSLError(f"{self.e.name}: {name} with a width or a supply over {decl}")
+            dims = self._union(request.dims, priority.dims, width.dims, supply.dims)
+            return Code(f"allocate_by_priority({request.text}, {priority.text}, {width.text}, "
+                        f"{supply.text}, {along})", dims)
+        pp = node.pp
+        el = self.b.elements.get(clean(pp.reference)) if isinstance(pp, ae.ReferenceStructure) else None
+        if el is None or not pp.subscripts:
+            raise DSLError(f"{self.e.name}: {name} with profiles that are not a variable")
+        profile = el.vensim_dims[-1]
+        subs = list(pp.subscripts.subscripts)
+        subs[-1] = profile
+        profiles = self.visit(dataclasses.replace(
+            pp, subscripts=dataclasses.replace(pp.subscripts, subscripts=type(pp.subscripts.subscripts)(subs))))
+        pdim = self.b.dimname[profile]
+        supply = self.visit(node.avail)
+        if along in supply.dims:
+            raise DSLError(f"{self.e.name}: {name} with a supply over {decl}")
+        dims = self._union(request.dims, tuple(d for d in profiles.dims if d != pdim), supply.dims)
+        return Code(f"allocate_available({request.text}, {profiles.text}, {supply.text}, {along}, {pdim})", dims)
+
+    def _vector_select(self, args) -> Code:
+        """VECTOR SELECT(selection[d!], x[d!], missing, action, error), as Python
+        PySD: over all the ! subscripts of either array.  A dimension that is
+        over (with !) in one and kept in the other (or in the variable) is two
+        dimensions: the one with ! is renamed for the call."""
+        sel, x = self.visit(args[0]), self.visit(args[1])
+        bangs = [[self._target(self.b._range_of(s)) for s in self._bangs(a)] for a in args[:2]]
+        kept = {d for c, b in zip((sel, x), bangs) for d in c.dims if d not in b}
+        over: List[str] = []
+        out = []
+        for c, b in zip((sel, x), bangs):
+            renames, dims = [], list(c.dims)
+            for d in b:
+                o = d
+                if d in kept:
+                    o = d + "_selected"
+                    renames.append(f":{d} => :{o}")
+                    dims[dims.index(d)] = o
+                if o not in over:
+                    over.append(o)
+            text = f"set({c.text}, {', '.join(renames)})" if renames else c.text
+            out.append(Code(text, tuple(dims)))
+        if not over:
+            raise DSLError(f"{self.e.name}: VECTOR SELECT without a subscript with !")
+        names = [o if o in self.b.dimname.values() else ":" + o for o in over]
+        overs = names[0] if len(names) == 1 else "(" + ", ".join(names) + ")"
+        rest = [self.visit(a).text for a in args[2:]]
+        dims = tuple(d for d in self._union(*(c.dims for c in out)) if d not in over)
+        return Code(f"vector_select({out[0].text}, {out[1].text}, {overs}, {', '.join(rest)})", dims)
 
     def _bangs(self, node) -> List[str]:
         """The subscripts marked with ! in an expression, once each (SUM's)."""

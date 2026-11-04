@@ -15,7 +15,7 @@ New Features
   that Julia saves the model built and compiled (``@precompile_model``) and
   later sessions load it in seconds.  See :doc:`julia_builder`, "The DSL
   backend".
-- Julia builder, DSL backend: translated models need PySD.jl 0.6.0 (the
+- Julia builder, DSL backend: translated models need PySD.jl 0.7.0 (the
   ``[compat]`` of the model's package), which adds derivatives and
   uncertainties through a run (ForwardDiff.jl, Measurements.jl), SciML's ODE
   solvers (``run_model(m, solver)``, ``ODEProblem(m)``) and results as tables
@@ -26,6 +26,18 @@ New Features
   run and with any solver; an equation for all of an array draws per
   element), ``FORECAST``, ``ACTIVE INITIAL`` inside an expression, and ``GET
   TIME VALUE(0, offset, 0)``.  PySD.jl 0.6.0.
+- Julia builder, DSL backend: ``VECTOR SELECT``, ``VECTOR SORT ORDER``,
+  ``VECTOR RANK`` and ``VECTOR REORDER`` (PySD.jl's ``vector_select`` and the
+  others, along the last subscript as the Python builder), ``GAME`` (its
+  value), and data or lookups given in parts over several subscripts
+  (``x[A, X, company]``, ``x[A, Y, company]``, ...).  ``ALLOCATE BY
+  PRIORITY`` and ``ALLOCATE AVAILABLE`` (PySD.jl's ``allocate_by_priority``
+  and ``allocate_available``, with Vensim's algorithms, as the ODE backend).
+  PySD.jl 0.7.0.
+- Julia builder, MTK backend: ``VECTOR SORT ORDER``, ``VECTOR RANK``,
+  ``VECTOR REORDER`` and ``VECTOR SELECT`` build their equations with
+  comparisons, as ModelingToolkit needs (before, sorting the symbolic values
+  failed).
 - Julia builder: a function it does not translate stops the model, as the
   Python builder: the translation warns that the model will crash and writes
   ``pysd_not_implemented("NAME", ...)``, which raises an error naming it
