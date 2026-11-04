@@ -1350,6 +1350,8 @@ class Context:
             r = self.b._range_of(s)
             if r is None:                                   # an element
                 e = self.b._elem(s)
+                if e is None:
+                    raise DSLError(f"{self.e.name}: {node.reference}[{s}]: unknown subscript {s!r}")
                 sels.append(f"{d} = At({label(e)})")
                 continue
             target = self._target(r)

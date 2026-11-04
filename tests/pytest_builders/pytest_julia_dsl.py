@@ -5,6 +5,8 @@ These tests only translate (no Julia needed): each writes a small Vensim
 model, translates it with ``backend="dsl"`` and checks the Julia code.
 """
 import re
+import warnings
+from pathlib import Path
 
 import pytest
 
@@ -271,6 +273,7 @@ thickness[depth] = 1, 2, 3
 def test_helpers():
     from pysd.builders.julia.dsl_builder import number, translate_units
     assert number(True) == "true" and number(False) == "false"
+    assert number(float("inf")) == "Inf" and number(float("-inf")) == "-Inf"
     # units it can't read are left without a unit
     assert translate_units("Month @ 2") == (None, [])
 
@@ -305,6 +308,72 @@ def test_time_settings_that_change_during_the_run(tmp_path):
     assert "rate ~ time_step * 2" in code
     names = (main.parent / "names.tsv").read_text(encoding="utf-8")
     assert "FINAL TIME\tfinal_time" in names
+
+
+def test_time_settings_missing(tmp_path):
+    # INITIAL TIME left out: 0, as Vensim; FINAL TIME left out: an error
+    no_initial = CONTROL.replace("INITIAL TIME  = 0\n\t~\tMonth\n\t~\tThe initial time for the simulation.\n\t|\n\n", "")
+    path = tmp_path / "no_initial.mdl"
+    path.write_text("{UTF-8}\nstock = INTEG(1, 0)\n\t~\tDmnl\n\t~\t\t|\n\n" + no_initial, encoding="utf-8")
+    assert "time = 0:0.5:10," in pysd.translate_to_julia(str(path), backend="dsl").read_text(encoding="utf-8")
+    no_final = CONTROL.replace("FINAL TIME  = 10\n\t~\tMonth\n\t~\tThe final time for the simulation.\n\t|\n\n", "")
+    path = tmp_path / "no_final.mdl"
+    path.write_text("{UTF-8}\nstock = INTEG(1, 0)\n\t~\tDmnl\n\t~\t\t|\n\n" + no_final, encoding="utf-8")
+    with pytest.raises(Exception, match="the model has no FINAL TIME"):
+        pysd.translate_to_julia(str(path), backend="dsl")
+
+
+def test_split_views(tmp_path):
+    import shutil
+    src = Path(__file__).parents[1] / "more-tests" / "split_model" / "test_split_model.mdl"
+    shutil.copy(src, tmp_path / src.name)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        main = pysd.translate_to_julia(str(tmp_path / src.name), backend="dsl", split_views=True)
+    views = sorted(f.name for f in main.parent.glob("*.jl") if f != main)
+    assert len(views) > 3                               # a file per view, dims and inputs
+    text = main.read_text(encoding="utf-8")
+    assert all(f'include("{v}")' in text for v in views)
+
+
+def test_initial_of_a_constant_expression_is_its_value(tmp_path):
+    _, code = translate(tmp_path, """
+c = 2
+	~	Dmnl
+	~		|
+
+y = INITIAL(c + 1)
+	~	Dmnl
+	~		|
+""")
+    assert "y ~ c + 1" in code and "y_initial_expression" not in code
+
+
+XMILE = """<xmile xmlns="http://docs.oasis-open.org/xmile/ns/XMILE/v1.0" version="1.0">
+    <header><vendor>test</vendor><product lang="en">test</product></header>
+    <sim_specs method="Euler" time_units="Months"><start>0</start><stop>10</stop><dt>1</dt></sim_specs>
+    <dimensions><dim name="a"><elem name="a1"/><elem name="a2"/></dim></dimensions>
+    <model>
+        <variables>
+            <aux name="x"><eqn>Time</eqn></aux>
+            <aux name="v"><dimensions><dim name="a"/></dimensions><eqn>Time</eqn></aux>
+            <aux name="lowest"><eqn>MIN(x)</eqn></aux>
+            <aux name="both"><dimensions><dim name="a"/></dimensions><eqn>MAX(v, x)</eqn></aux>
+            <aux name="rest"><eqn>x mod 3</eqn></aux>
+        </variables>
+    </model>
+</xmile>
+"""
+
+
+def test_xmile_min_max_and_mod(tmp_path):
+    path = tmp_path / "small.xmile"
+    path.write_text(XMILE, encoding="utf-8")
+    main = pysd.translate_to_julia(str(path), backend="dsl")
+    code = (main.parent / "equations.jl").read_text(encoding="utf-8")
+    assert "lowest ~ x" in code                  # MIN of one number: the number
+    assert "both ~ max.(v, x)" in code           # of several: element by element
+    assert "rest ~ rem(x, 3)" in code            # mod, as Vensim's MODULO
 
 
 # --- parameters and expressions ----------------------------------------------
@@ -418,6 +487,48 @@ inverse[a, b, c] = INVERT MATRIX(m[b, c], 2)
 	~	Dmnl
 	~		|
 """, "inverse: INVERT MATRIX over 3 dimensions"),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nx[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns = x[zz]\n\t~\tDmnl\n\t~\t\t|\n\n',
+     "x\\[zz\\]: unknown subscript 'zz'"),
+    ('y = nope + 1\n\t~\tDmnl\n\t~\t\t|\n\n',
+     "y: unknown name 'nope'"),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nx[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns = SUM(x[a1])\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: SUM without a subscript with !'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nx[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns = SUM(x[b!])\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: x\\[b!\\]: subscript mappings are not supported yet'),
+    ('x = 1\n\t~\tDmnl\n\t~\t\t|\n\nn = ELMCOUNT(x)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     'n: ELMCOUNT of'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nx[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns = VECTOR SELECT(x[a], x[a], 1, 0, 0)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: VECTOR SELECT without a subscript with !'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nx[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[a] = VECTOR SORT ORDER(x[a] + 1, 1)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: VECTOR SORT ORDER of an expression'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nx[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[a1] = VECTOR SORT ORDER(x[a], 1)\n\t~\tDmnl\n\t~\t\t|\n\ns[a2] = 0\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: VECTOR SORT ORDER for a part of the last subscript'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nx[b] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[a] = VECTOR SORT ORDER(x[b], 1)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: VECTOR SORT ORDER along b, of another size than a'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nc: c1, c2\n\t~\t~\t\t|\n\nx[a, c] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[c, a] = VECTOR SORT ORDER(x[a, c], 1)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: VECTOR SORT ORDER along c, with a elsewhere'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nr[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\npr[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[a1] = ALLOCATE BY PRIORITY(r[a], pr[a], 2, 1, 5)\n\t~\tDmnl\n\t~\t\t|\n\ns[a2] = 0\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: ALLOCATE BY PRIORITY for a part of the last subscript'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nr = 1\n\t~\tDmnl\n\t~\t\t|\n\npr[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[a] = ALLOCATE BY PRIORITY(r, pr[a], 2, 1, 5)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: ALLOCATE BY PRIORITY of a request without a'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nr[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\npr[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\nw[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[a] = ALLOCATE BY PRIORITY(r[a], pr[a], 2, w[a], 5)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: ALLOCATE BY PRIORITY with a width or a supply over a'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nr[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[a] = ALLOCATE AVAILABLE(r[a], 1, 5)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: ALLOCATE AVAILABLE with profiles that are not a variable'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\np: ptype, ppriority, pwidth, pextra\n\t~\t~\t\t|\n\nr[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\npp[a, p] = 1\n\t~\tDmnl\n\t~\t\t|\n\nav[a] = 5\n\t~\tDmnl\n\t~\t\t|\n\ns[a] = ALLOCATE AVAILABLE(r[a], pp[a, ptype], av[a])\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: ALLOCATE AVAILABLE with a supply over a'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nc: c1, c2, c3 -> a\n\t~\t~\t\t|\n\nx[c] = 1\n\t~\tDmnl\n\t~\t\t|\n\ns[a] = x[c]\n\t~\tDmnl\n\t~\t\t|\n\n',
+     's: x\\[c\\]: a mapping between ranges of different sizes'),
+    (':MACRO: ONE(x)\nONE = x + 1\n\t~\tDmnl\n\t~\t\t|\n\n:END OF MACRO:\ny = ONE(1, 2)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     'macro one: called with 2 arguments, defined with 1'),
+    (':MACRO: PING(x)\nPING = PONG(x) + 1\n\t~\tDmnl\n\t~\t\t|\n\n:END OF MACRO:\n:MACRO: PONG(x)\nPONG = PING(x) + 1\n\t~\tDmnl\n\t~\t\t|\n\n:END OF MACRO:\ny = PING(1)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     'calls itself'),
+    ('a: a1, c\n\t~\t~\t\t|\n\nc: c1, a\n\t~\t~\t\t|\n\nx[a] = 1\n\t~\tDmnl\n\t~\t\t|\n\n',
+     'subscript range a is defined with itself'),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nx[a] :EXCEPT: [zz] = 1\n\t~\tDmnl\n\t~\t\t|\n\n',
+     "x: unknown subscript 'zz'"),
+    ('a: a1, a2\n\t~\t~\t\t|\n\nb: b1, b2, b3\n\t~\t~\t\t|\n\nl[a1, b1]((0,0),(1,1))\n\t~\tDmnl\n\t~\t\t|\n\nl[a2, b]((0,0),(1,2))\n\t~\tDmnl\n\t~\t\t|\n\nl[a1, b2]((0,0),(1,3))\n\t~\tDmnl\n\t~\t\t|\n\nl[a1, b3]((0,0),(1,4))\n\t~\tDmnl\n\t~\t\t|\n\ny = l[a1, b1](0.5)\n\t~\tDmnl\n\t~\t\t|\n\n',
+     'l: lookups or data in parts other than one element each'),
 ])
 def test_not_translated_yet(tmp_path, equations, message):
     with pytest.raises(Exception, match=message):
