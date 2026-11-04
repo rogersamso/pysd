@@ -87,7 +87,7 @@ BUILTIN_FUNCTIONS: dict = {
     "MIN": "min",
     "MAX": "max",
     "QUANTUM": "pysd_quantum",
-    "PI": "pysd_pi",
+    "PI": "pysd_pi",               # written as π
     # Control flow — parser stores as "if_then_else" (underscores).
     # Use pysd_ifelse: Symbolics' `ifelse` has type issues with SymReal
     # conditions, so PySD.jl provides a dispatching wrapper.
@@ -110,7 +110,7 @@ BUILTIN_FUNCTIONS: dict = {
     "ACTIVE INITIAL": "pysd_active_initial",
     "ACTIVE_INITIAL": "pysd_active_initial",
     # SD helpers provided by PySD.jl
-    "LOG": "pysd_log_base",
+    "LOG": "pysd_log_base",        # written as pysd_ln(x) / pysd_ln(base)
     "XIDZ": "pysd_xidz",
     "ZIDZ": "pysd_zidz",
     "PULSE": "pysd_pulse",
@@ -149,12 +149,12 @@ BUILTIN_FUNCTIONS: dict = {
 # the AST visitor / model builder can track which helpers an equation requires
 # (e.g. to pull in ``pysd_trunc`` when ``pysd_quantum`` is used).
 HELPER_IMPLEMENTATIONS: frozenset = frozenset({
-    "pysd_trunc", "pysd_log_base", "pysd_xidz", "pysd_zidz",
+    "pysd_trunc", "pysd_xidz", "pysd_zidz",
     "pysd_exp", "pysd_sin", "pysd_cos", "pysd_tan", "pysd_atan", "pysd_sinh", "pysd_cosh",
     "pysd_pulse", "pysd_pulse_train", "pysd_ramp", "pysd_step",
     "pysd_active_initial", "pysd_ifelse", "pysd_sum",
     "pysd_inv_mat2d_elem", "pysd_inv_mat3d_elem",
-    "pysd_power", "pysd_quantum", "pysd_pi",
+    "pysd_power", "pysd_quantum",
     "pysd_xpulse", "pysd_xpulse_train", "pysd_xramp",
     "pysd_random_0_1", "pysd_random_uniform",
     "pysd_random_normal", "pysd_random_exponential",
@@ -1411,6 +1411,13 @@ class JuliaASTVisitor:
                 return f"{julia_func}({arg_expr} for {for_clause_agg})"
 
         args = [self.visit(a) for a in node.arguments]
+
+        # Julia's own where there is one: π, and LOG(x, base) as the quotient
+        # of PySD.jl's ln (NaN out of the domain, Python's digits)
+        if julia_func == "pysd_pi":
+            return "π"
+        if julia_func == "pysd_log_base" and len(args) == 2:
+            return f"(pysd_ln({args[0]}) / pysd_ln({args[1]}))"
 
         # pysd_ifelse dispatches on the condition type.  Vensim IF THEN ELSE
         # accepts any numeric condition (nonzero = true), so a bare variable or

@@ -15,7 +15,7 @@ New Features
   that Julia saves the model built and compiled (``@precompile_model``) and
   later sessions load it in seconds.  See :doc:`julia_builder`, "The DSL
   backend".
-- Julia builder, DSL backend: translated models need PySD.jl 0.7.0 (the
+- Julia builder, DSL backend: translated models need PySD.jl 0.8.0 (the
   ``[compat]`` of the model's package), which adds derivatives and
   uncertainties through a run (ForwardDiff.jl, Measurements.jl), SciML's ODE
   solvers (``run_model(m, solver)``, ``ODEProblem(m)``) and results as tables
@@ -34,14 +34,29 @@ New Features
   PRIORITY`` and ``ALLOCATE AVAILABLE`` (PySD.jl's ``allocate_by_priority``
   and ``allocate_available``, with Vensim's algorithms, as the ODE backend).
   PySD.jl 0.7.0.
+- Julia builder, DSL backend: macros (written in place, a copy of their
+  equations per call), ``:EXCEPT:`` narrower at several positions, ``INITIAL``
+  of an expression, subscripts and elements used as values (their position in
+  the main range, as the Python builder), ranges defined with other ranges,
+  ``GET DIRECT SUBSCRIPT``, ``ELMCOUNT`` of a copy of a range, data and Excel
+  constants in parts of any shape or mixed with numbers, the DATA keywords of
+  data from other models, and ``DELAY N`` with a delay time that changes (as
+  the Python builder).  184 test models match Vensim's output with the DSL
+  backend; the two whose time settings change during the run don't translate
+  yet.  Translated models use Julia's functions where there is one (``rem``
+  for ``MODULO``, ``trunc`` for ``QUANTUM``, ``mod`` for ``PULSE TRAIN``,
+  ``error`` for a function not translated; with the ODE and MTK backends,
+  ``π`` for ``PI`` and ``pysd_ln(x) / pysd_ln(base)`` for ``LOG``).  PySD.jl
+  0.8.0.
 - Julia builder, MTK backend: ``VECTOR SORT ORDER``, ``VECTOR RANK``,
   ``VECTOR REORDER`` and ``VECTOR SELECT`` build their equations with
   comparisons, as ModelingToolkit needs (before, sorting the symbolic values
   failed).
 - Julia builder: a function it does not translate stops the model, as the
   Python builder: the translation warns that the model will crash and writes
-  ``pysd_not_implemented("NAME", ...)``, which raises an error naming it
-  when the model evaluates it.  Before, the ODE and MTK backends wrote a call
+  ``pysd_not_implemented("NAME", ...)`` (the DSL backend, Julia's
+  ``error("Not implemented function 'NAME' ...")``), which raises an error
+  naming it when the model evaluates it.  Before, the ODE and MTK backends wrote a call
   to an undefined name, or 0.0 for a structure they did not handle, and the
   DSL backend stopped the translation.
 - Julia builder, ODE and MTK backends: switches on the time (``STEP``,
@@ -126,6 +141,13 @@ Deprecations
 
 Bug fixes
 ~~~~~~~~~
+- Julia builder, DSL backend: as Vensim, ``-2^2`` is -4, ``MODULO`` keeps the
+  sign of its first argument, ``:NA:`` is NaN, a value over fewer subscripts
+  than its variable repeats over the others, ``TABBED ARRAY`` keeps its rows,
+  ``GET DIRECT CONSTANTS`` from a cell reads the block of the variable's size,
+  and delays lower their order while order × ``TIME STEP`` exceeds the delay
+  time; models with stocks whose initial value is given in parts, lookups by
+  element or values by element of the first subscript build.
 - Julia builder, ODE and MTK backends: ``RANDOM NORMAL`` is a normal
   truncated to [min, max] and ``RANDOM EXPONENTIAL`` takes Vensim's (min,
   max, shift, stretch, seed), as the Python builder; the translation with

@@ -108,6 +108,10 @@ def number(value) -> str:
     if isinstance(value, (bool, np.bool_)):
         return "true" if value else "false"
     value = float(value)
+    if np.isnan(value):
+        return "NaN"
+    if np.isinf(value):
+        return "Inf" if value > 0 else "-Inf"
     if value == int(value) and abs(value) < 1e15:
         return str(int(value))
     return repr(value)
@@ -193,10 +197,88 @@ class Element:
     declaration: str = ""
 
 
+# --- macros ------------------------------------------------------------------------
+
+def _map_ast(node, f):
+    """The expression with f applied from the top: where f gives a node, that
+    node; elsewhere the same structure over the mapped children."""
+    out = f(node)
+    if out is not None:
+        return out
+    if isinstance(node, (list, tuple)):
+        return type(node)(_map_ast(x, f) for x in node)
+    if isinstance(node, ae.AbstractSyntax) and dataclasses.is_dataclass(node):
+        return dataclasses.replace(node, **{k.name: _map_ast(getattr(node, k.name), f)
+                                            for k in dataclasses.fields(node) if k.init})
+    return node
+
+
+def _expand_macros(model: AbstractModel) -> AbstractSection:
+    """The main section with each macro call written in place, as Vensim runs it:
+    a copy of the macro's equations per call (its own stocks), named after the
+    macro and the call, the parameters replaced by the call's arguments."""
+    main = model.sections[0]
+    macros = {clean(s.name): s for s in model.sections[1:] if s.type == "macro"}
+    if not macros:
+        return main
+    count: Dict[str, int] = {}
+    added: List = []
+
+    def expand(ast, depth=0):
+        def call(node):
+            if not (isinstance(node, ae.CallStructure) and isinstance(node.function, ae.ReferenceStructure)
+                    and clean(node.function.reference) in macros):
+                return None
+            m = macros[clean(node.function.reference)]
+            if m.returns:
+                raise DSLError(f"macro {m.name}: macros with several outputs are not supported yet")
+            if depth > 20:
+                raise DSLError(f"macro {m.name}: calls itself")
+            if len(node.arguments) != len(m.params):
+                raise DSLError(f"macro {m.name}: called with {len(node.arguments)} arguments, "
+                               f"defined with {len(m.params)}")
+            count[m.name] = count.get(m.name, 0) + 1
+            prefix = f"{m.name} {count[m.name]}" if count[m.name] > 1 else m.name
+            args = {clean(p): expand(a, depth + 1) for p, a in zip(m.params, node.arguments)}
+            names = {clean(el.name): (el.name if clean(el.name) == clean(m.name) else f"{prefix} {el.name}")
+                     for el in m.elements}
+            names[clean(m.name)] = f"{prefix} output" if count[m.name] > 1 else f"{m.name} output"
+
+            def local(x):
+                if isinstance(x, ae.ReferenceStructure):
+                    r = clean(x.reference)
+                    if r in args and not x.subscripts:
+                        return args[r]
+                    if r in names:
+                        return dataclasses.replace(x, reference=clean(names[r]))
+                return None
+            for el in m.elements:
+                comps = [dataclasses.replace(c, ast=expand(_map_ast(c.ast, local), depth + 1))
+                         for c in el.components]
+                doc = f"From the macro {m.name}. " + " ".join((el.documentation or "").split())
+                # a unit given by a parameter's name ("input") has no meaning outside
+                units = el.units or ""
+                if set(re.findall(r"[a-z_]\w*", clean(units))) & set(args):
+                    units = ""
+                added.append(dataclasses.replace(el, name=names[clean(el.name)], components=comps,
+                                                 units=units, documentation=doc.strip()))
+            return ae.ReferenceStructure(clean(names[clean(m.name)]))
+        return _map_ast(ast, call)
+
+    elements = []
+    for el in main.elements:
+        if isinstance(el, AbstractControlElement):
+            elements.append(el)
+            continue
+        elements.append(dataclasses.replace(
+            el, components=[dataclasses.replace(c, ast=expand(c.ast)) for c in el.components]))
+    return dataclasses.replace(main, elements=elements + added)
+
+
 class DSLBuilder:
     def __init__(self, abstract_model: AbstractModel):
         self.model = abstract_model
-        self.section: AbstractSection = abstract_model.sections[0]
+        self.section: AbstractSection = _expand_macros(abstract_model)
         self.path = Path(getattr(abstract_model, "original_path", None) or self.section.path)
         self.taken: set = set()
         self.unknown_units: set = set()
@@ -215,8 +297,27 @@ class DSLBuilder:
                 self.copies[r.name] = r.subscripts
             elif isinstance(r.subscripts, list):
                 self.ranges[r.name] = list(r.subscripts)
+            elif isinstance(r.subscripts, dict) and "firstcell" in r.subscripts:
+                # GET DIRECT SUBSCRIPT: the elements read now (written in dims.jl)
+                from pysd.py_backend.external import ExtSubscript
+                x = r.subscripts
+                self.ranges[r.name] = list(ExtSubscript(
+                    file_name=x["file"], tab=x["tab"], firstcell=x["firstcell"],
+                    lastcell=x["lastcell"], prefix=x["prefix"], root=self.path.parent).subscript)
             else:
                 raise DSLError(f"subscript range {r.name}: {r.subscripts!r} is not supported yet")
+        # a range written with other ranges in it (dim: A, subdim1, B): their elements
+        def expand(r, seen=()):
+            if r in seen:
+                raise DSLError(f"subscript range {r} is defined with itself")
+            out = []
+            for x in self.ranges[r]:
+                if x in self.ranges and x != r:
+                    out += [y for y in expand(x, seen + (r,)) if y not in out]
+                elif x not in out:
+                    out.append(x)
+            return out
+        self.ranges = {r: expand(r) for r in self.ranges}
         for c, of in self.copies.items():
             self.ranges[c] = self.ranges[of]
         # subscript mappings (lower -> upper): position by position, both ways
@@ -238,7 +339,9 @@ class DSLBuilder:
         self.lower_elem = {e.lower(): e for r in names for e in self.ranges[r]}
 
     def _range_of(self, sub: str) -> Optional[str]:
-        return self.lower_range.get(sub.lower().rstrip("!").strip())
+        key = sub.lower().rstrip("!").strip()
+        # (a reference to a range in an expression comes with underscores)
+        return self.lower_range.get(key) or self.lower_range.get(key.replace("_", " "))
 
     def _elem(self, sub: str) -> Optional[str]:
         return self.lower_elem.get(sub.lower().strip())
@@ -256,6 +359,10 @@ class DSLBuilder:
             if isinstance(el, AbstractControlElement):
                 self.controls[clean(el.name)] = el
                 continue
+            try:
+                self._split_exceptions(el)
+            except DSLError as err:
+                self.kind_errors.append(f"{el.name}: {err}")
             dims = self._declared_dims(el)
             try:
                 kind = self._kind(el)
@@ -279,6 +386,61 @@ class DSLBuilder:
         for k, e in self.elements.items():
             e.view = where.get(k, "")
         self._time_dependence()
+
+    def _main_position(self, elem, among=None) -> int:
+        """An element's value, as Python PySD: its position (1, 2, …) in the main
+        range (the largest with these elements, the first by name among equal ones)."""
+        own = set(among if among is not None else [elem])
+        main = min((q for q, els in self.ranges.items() if own <= set(els)),
+                   key=lambda q: (-len(self.ranges[q]), q))
+        return self.ranges[main].index(elem) + 1
+
+    def _split_exceptions(self, el):
+        """A part with an :EXCEPT: narrower at several positions ([store, product]
+        :EXCEPT: [s3, p5]) as several rectangular parts, each exception narrower
+        at one position only (what _lhs_parts writes as a selection)."""
+        out = []
+        for c in el.components:
+            subs, excs = c.subscripts
+            if not excs or all(len(self._narrower(subs, x)) <= 1 for x in excs):
+                out.append(c)
+                continue
+            sels = [self._selected(s) for s in subs]
+            excluded = set()
+            for x in excs:
+                excluded |= set(itertools.product(*(self._selected(s) for s in x)))
+            excluded &= set(itertools.product(*sels))
+            for piece in self._pieces(list(subs), sels, excluded):
+                names = [name for name, _ in piece]
+                exceptions = [names[:p] + [x] + names[p + 1:]
+                              for p, (_, ex) in enumerate(piece) for x in sorted(ex)]
+                out.append(dataclasses.replace(c, subscripts=(names, exceptions)))
+        el.components = out
+
+    def _narrower(self, subs, exc) -> List[int]:
+        return [q for q in range(len(exc)) if not set(self._selected(subs[q])) <= set(self._selected(exc[q]))]
+
+    def _pieces(self, subs, sels, excluded) -> List[List[Tuple[str, set]]]:
+        """Rectangular parts covering the elements of `subs` but the `excluded`
+        combinations: per position, a subscript and the elements it leaves out."""
+        if not excluded:
+            return [[(s, set()) for s in subs]]
+        if len(subs) == 1:
+            return [[(subs[0], {t[0] for t in excluded})]]
+        groups: Dict[frozenset, List[str]] = {}
+        for a in sels[0]:
+            groups.setdefault(frozenset(t[1:] for t in excluded if t[0] == a), []).append(a)
+        every = set(itertools.product(*sels[1:]))
+        out = []
+        for rest, elems in groups.items():
+            # the range kept (with the other elements left out), so that the
+            # references to it on the right follow the part
+            if not rest:                            # these elements whole at the other positions
+                out.append([(subs[0], set(sels[0]) - set(elems))] + [(s, set()) for s in subs[1:]])
+            elif set(rest) != every:                # (else left out entirely)
+                out += [[(subs[0], set(sels[0]) - set(elems))] + p
+                        for p in self._pieces(subs[1:], sels[1:], set(rest))]
+        return out
 
     def _declared_dims(self, el) -> List[str]:
         """At each position, the range the equations cover: the one written on the
@@ -325,7 +487,13 @@ class DSLBuilder:
             return "stock"
         inputs = (ae.LookupsStructure, ae.GetLookupsStructure, ae.GetDataStructure, ae.DataStructure)
         if all(isinstance(a, (int, float, np.ndarray, ae.GetConstantsStructure) + inputs) for a in asts):
+            if len(asts) > 1 and any(isinstance(a, ae.GetDataStructure) for a in asts) and \
+                    not all(isinstance(a, ae.GetDataStructure) for a in asts):
+                return "variable"                # data and numbers in parts: one equation each
             if len(asts) > 1 and self._split_position(el) is None:
+                if all(isinstance(a, (int, float, np.ndarray, ae.GetConstantsStructure, ae.GetDataStructure))
+                       for a in asts) and any(isinstance(a, ae.GetDataStructure) for a in asts):
+                    return "variable"            # data in parts: one equation each (Context.visit)
                 if any(isinstance(a, inputs) for a in asts):
                     raise DSLError(f"{el.name}: lookups or data in parts other than one element each are not supported yet")
                 return "constant_parts"          # a constant variable with one equation per part
@@ -351,7 +519,7 @@ class DSLBuilder:
                     continue
                 others = {tuple(c.subscripts[0][q] for q in range(n) if q not in ps) for c in comps}
                 if len(others) == 1 and all(self._range_of(x) is not None for x in next(iter(others))):
-                    if k > 1 and not all(isinstance(c.ast, (ae.GetLookupsStructure, ae.GetDataStructure))
+                    if k > 1 and not all(isinstance(c.ast, (ae.LookupsStructure, ae.GetLookupsStructure, ae.GetDataStructure))
                                          for c in comps):
                         continue                  # numbers in parts at several positions: one equation each
                     return ps
@@ -369,7 +537,8 @@ class DSLBuilder:
                 refs |= r
                 timed |= tm
             deps[k] = refs
-            direct[k] = timed or e.kind == "stock"
+            direct[k] = timed or e.kind == "stock" or e.kind == "variable" and any(
+                isinstance(c.ast, ae.GetDataStructure) for c in e.abstract.components)
         memo: Dict[str, bool] = {}
 
         def timed(k, seen=()):
@@ -599,13 +768,21 @@ class DSLBuilder:
         doc = " ".join((el.documentation or "").split())
         if el.limits and any(x is not None for x in el.limits):
             lo, hi = el.limits[:2]
-            rng = f"[{'?' if lo is None else number(lo)}, {'?' if hi is None else number(hi)}]"
+            bound = lambda x: "?" if x is None or np.isinf(x) else number(x)
+            rng = f"[{bound(lo)}, {bound(hi)}]"
             doc = (doc + " " + rng).strip()
         if doc:
             items.append(f"description = {jl_string(doc)}")
         if any(isinstance(c.ast, ae.IntegStructure) and c.ast.non_negative for c in el.components):
             items.append("nonnegative = true")
         return "[" + ", ".join(items) + "]"
+
+    @staticmethod
+    def _unit_item(e: Element) -> str:
+        """The `unit = ...` item of an element's metadata, for the variables
+        written for one of its parts (an initial value, a lookup...)."""
+        unit, _ = translate_units(e.abstract.units)
+        return f'unit = {"NoUnits" if unit is None else "u" + jl_string(unit)}'
 
     def _decl_target(self, e: Element) -> str:
         t = e.ident + ("(t)" if e.timevarying else "")
@@ -659,7 +836,7 @@ class DSLBuilder:
                 self.elements[r].timevarying for r in self._scan(c.ast.initial)[0] if r in self.elements)
                 for _, _, c in init_parts)
             dims = "[" + ", ".join(e.dims) + "]" if e.dims else ""
-            unit = meta.split(",")[0].lstrip("[")
+            unit = self._unit_item(e)
             self._hide(e.view, f"{init}{'(t)' if timed else ''}{dims}, [{unit}, description = "
                                f"\"The initial value of {e.ident}, by parts.\"]")
             e.lines += [f"{init}{sel} ~ {txt}" for sel, txt, _ in init_parts]
@@ -750,6 +927,9 @@ class DSLBuilder:
         if isinstance(ast, (int, float)):
             return number(ast)
         if isinstance(ast, np.ndarray):
+            shape = [len(self.ranges[s]) for s in c.subscripts[0] if s in self.ranges] if getattr(c, "subscripts", None) else []
+            if ast.ndim == 1 and len(shape) == 2 and shape[0] > 1 and ast.size == shape[0] * shape[1]:
+                ast = ast.reshape(shape)  # a TABBED ARRAY, written row by row
             if ast.ndim == 1:
                 return "[" + ", ".join(number(x) for x in ast) + "]"
             if ast.ndim == 2:
@@ -758,19 +938,31 @@ class DSLBuilder:
         if isinstance(ast, ae.GetConstantsStructure):
             cell, tr = ast.cell, ast.cell.endswith("*")
             cell = cell.rstrip("*")
+            subs = getattr(c, "subscripts", None)
+            if subs and re.fullmatch(r"[A-Za-z]{1,3}[0-9]+", cell):
+                # a cell: the block from it of the part's size (as Python PySD),
+                # columns along the last dimension (rows with `*`)
+                shape = [len(self._selected(x)) for x in subs[0] if self._range_of(x) is not None]
+                if 0 < len(shape) <= 2:
+                    rows, cols = ([1] + shape)[-2:]
+                    if tr:
+                        rows, cols = cols, rows
+                    if rows * cols > 1:
+                        cell = f"{cell}:{_cell_offset(cell, rows - 1, cols - 1)}"
             return f"constant({self._sheet(ast.file, ast.tab)}, {jl_string(cell)}" + \
                    ("; transpose = true)" if tr else ")")
         if isinstance(ast, ae.GetLookupsStructure):
             return f"lookup({self._sheet(ast.file, ast.tab)}, {jl_string(str(ast.x_row_or_col))}, {jl_string(ast.cell)})"
+        kw = getattr(c, "keyword", None)
+        method = {"interpolate": ":interpolate", "hold_backward": ":hold_backward",
+                  "look_forward": ":look_forward", "raw": ":raw"}.get(
+                      (kw or "interpolate").lower().strip(":").replace(" ", "_"))
+        m = "" if method in (None, ":interpolate") else f"; method = {method}"
         if isinstance(ast, ae.DataStructure):
             # no equation: a parent model's results give it (by its name there)
             self.uses_parents = True
-            return f"data(parents, :{e.ident})"
+            return f"data(parents, :{e.ident}{m})"
         if isinstance(ast, ae.GetDataStructure):
-            kw = getattr(c, "keyword", None)
-            method = {"interpolate": ":interpolate", "hold_backward": ":hold_backward",
-                      "look_forward": ":look_forward", "raw": ":raw"}.get((kw or "interpolate").lower().strip(":"))
-            m = "" if method in (None, ":interpolate") else f"; method = {method}"
             return f"data({self._sheet(ast.file, ast.tab)}, {jl_string(str(ast.time_row_or_col))}, {jl_string(ast.cell)}{m})"
         if isinstance(ast, ae.LookupsStructure):
             pts = ", ".join(f"{number(x)} => {number(y)}" for x, y in zip(ast.x, ast.y))
@@ -783,6 +975,21 @@ class _Literal:
     """An expression to write as a parameter's value (what _one_value takes)."""
     ast: object
     keyword: Optional[str] = None
+    subscripts: Optional[tuple] = None          # of the part it gives values to
+
+
+def _cell_offset(cell: str, drow: int, dcol: int) -> str:
+    """An Excel cell moved down and right ("A1", 2, 1 -> "B3")."""
+    m = re.fullmatch(r"([A-Za-z]+)([0-9]+)", cell)
+    col = 0
+    for ch in m.group(1).upper():
+        col = col * 26 + ord(ch) - 64
+    col += dcol
+    letters = ""
+    while col:
+        col, r = divmod(col - 1, 26)
+        letters = chr(65 + r) + letters
+    return f"{letters}{int(m.group(2)) + drow}"
 
 
 ARITH = {"+": "+", "-": "-", "*": "*", "/": "/", "^": "^", "**": "^"}
@@ -791,7 +998,7 @@ LOGIC = {"=": "==", "<>": "!=", "<": "<", ">": ">", "<=": "≤", ">=": "≥",
 FUNCTIONS = {"abs": "abs", "exp": "exp", "ln": "log", "sqrt": "sqrt", "sin": "sin", "cos": "cos",
              "tan": "tan", "arcsin": "asin", "arccos": "acos", "arctan": "atan", "sinh": "sinh",
              "cosh": "cosh", "tanh": "tanh", "integer": "trunc", "int": "trunc", "min": "min",
-             "max": "max", "modulo": "mod", "zidz": "zidz", "xidz": "xidz"}
+             "max": "max", "modulo": "rem", "zidz": "zidz", "xidz": "xidz"}
 REDUCTIONS = {"sum": "sum_over", "prod": "prod_over", "vmax": "maximum_over", "vmin": "minimum_over"}
 
 
@@ -817,26 +1024,23 @@ class Context:
         if isinstance(node, np.ndarray):                    # values for a part
             return Code(self.b._one_value(self.e, _Literal(node)))
         if isinstance(node, ae.GetConstantsStructure):
-            text = self.b._one_value(self.e, _Literal(node))
+            text = self.b._one_value(self.e, _Literal(node, subscripts=self.c.subscripts))
             if not self.e.timevarying:
                 return Code(text)
-            # read once: a parameter of its own (a part that is one element)
-            sel = self.b._lhs_selection(self.e, self.c)
-            if any(ch in sel for ch in "[,") and "At(:" not in sel or sel.count("=") > 1:
-                raise DSLError(f"{self.e.name}: Excel constants in a part of several elements of a "
-                               "variable that changes with time are not supported yet")
-            name = identifier(self.e.name + " " + (sel.split("At(:")[-1].rstrip(")]") if sel else "input"), self.b.taken)
-            unit = self.b._meta(self.e).split(",")[0].strip("[]")
-            self.b._hide(self.e.view, f"{name} = {text},\n    [{unit}, description = \"Read from Excel for {self.e.ident}.\"]")
-            return Code(name)
+            # read once: a parameter of its own over the part's ranges
+            return self._input_part(text, "Read from Excel for", "input", "")
+        if isinstance(node, ae.GetDataStructure):
+            # data in a part: a parameter of its own over the part's ranges
+            text = self.b._one_value(self.e, _Literal(node, getattr(self.c, "keyword", None)))
+            return self._input_part(text, "Data for", "data", "(t)")
         if isinstance(node, ae.InlineLookupsStructure):
             # WITH LOOKUP: the lookup a parameter of its own, called with the argument
             arg = self.visit(node.argument)
             name = identifier(self.e.name + " lookup", self.b.taken)
-            unit = self.b._meta(self.e).split(",")[0].strip("[]")
+            unit = self.b._unit_item(self.e)
             text = self.b._one_value(self.e, _Literal(node.lookups))
             self.b._hide(self.e.view, f"{name} = {text},\n    [{unit}, description = \"The lookup of {self.e.ident}.\"]")
-            return Code(f"{name}({arg.text})", arg.dims)
+            return Code(f"{name}{'.' if arg.dims else ''}({arg.text})", arg.dims)
         if isinstance(node, ae.ArithmeticStructure):
             return self._arithmetic(node)
         if isinstance(node, ae.LogicStructure):
@@ -851,8 +1055,10 @@ class Context:
         for cls, kind in ((ae.SmoothStructure, "smooth"), (ae.SmoothNStructure, "smooth"),
                           (ae.DelayStructure, "delay"), (ae.DelayNStructure, "delay")):
             if isinstance(node, cls):
-                return self._stateful(kind, node.input, getattr(node, "smooth_time", None) or
-                                      getattr(node, "delay_time", None), node.order, node.initial)
+                tau = getattr(node, "smooth_time", None) or getattr(node, "delay_time", None)
+                # DELAY N with a delay time that changes: as Python PySD (past delay times)
+                lagged = cls is ae.DelayNStructure and self._changes(tau)
+                return self._stateful(kind, node.input, tau, node.order, node.initial, lagged)
         if isinstance(node, ae.TrendStructure):
             x, tau, init = self.visit(node.input), self.visit(node.average_time), self.visit(node.initial_trend)
             return Code(f"trend({x.text}, {tau.text}; init = {init.text})", x.dims)
@@ -897,7 +1103,13 @@ class Context:
                     out.append(d)
         return tuple(out)
 
-    def _stateful(self, kind, x, tau, order, init) -> Code:
+    def _changes(self, node) -> bool:
+        """Whether an expression changes with time."""
+        refs, timed = self.b._scan(node)
+        return timed or any(self.b.elements[r].timevarying or self._is_data(self.b.elements[r])
+                            for r in refs if r in self.b.elements)
+
+    def _stateful(self, kind, x, tau, order, init, lagged=False) -> Code:
         xc, tc = self.visit(x), self.visit(tau)
         args = [xc.text, tc.text]
         kws = []
@@ -909,6 +1121,8 @@ class Context:
         if not (isinstance(init, ae.ReferenceStructure) and init is x) and init is not None and \
                 not self._same_as(init, x):
             kws.append(f"init = {self.visit(init).text}")
+        if lagged:
+            kws.append("lagged_times = true")
         text = f"{kind}({', '.join(args)}" + (f"; {', '.join(kws)})" if kws else ")")
         return Code(text, self._union(xc.dims, tc.dims))
 
@@ -923,7 +1137,16 @@ class Context:
             if el is None or not (el.timevarying or self._is_data(el)):
                 return self._reference(node)
             return self._of_whole(node, "(t₀)")
-        raise DSLError(f"{self.e.name}: INITIAL of an expression is not supported yet")
+        x = self.visit(node)
+        if not self._changes(node):
+            return x                              # constant: its value
+        # of an expression: a variable of its own, at t₀
+        name = identifier(self.e.name + " initial expression", self.b.taken)
+        d = "[" + ", ".join(x.dims) + "]" if x.dims else ""
+        self.b._hide(self.e.view, f"{name}(t){d}, [{self.b._unit_item(self.e)}, description = "
+                                  f"\"The expression in INITIAL in {self.e.ident}.\"]")
+        self.e.lines.append(f"{name} ~ {x.text}")
+        return Code(f"{name}(t₀)", x.dims)
 
     @staticmethod
     def _is_data(el) -> bool:
@@ -944,6 +1167,21 @@ class Context:
     def _op(op, *codes):
         return ("." + op) if any(c.dims for c in codes) else op
 
+    def _input_part(self, text, what, suffix, call) -> Code:
+        """An input in a part of a variable (Excel constants or data): a parameter
+        of its own over the part's ranges, named after its elements."""
+        parts = self.b._lhs_parts(self.e, self.c)
+        if any(r is not None and sel is not None for r, _, _, sel in parts):
+            raise DSLError(f"{self.e.name}: an input in a part of a subrange is not supported yet")
+        dims = tuple(dim for r, dim, _, _ in parts if r is not None)
+        labels = [elems[0] for r, _, elems, _ in parts if r is None]
+        name = identifier(" ".join([self.e.name, *labels]) if labels else f"{self.e.name} {suffix}",
+                          self.b.taken)
+        d = "[" + ", ".join(dims) + "]" if dims else ""
+        self.b._hide(self.e.view, f"{name}{d} = {text},\n    [{self.b._unit_item(self.e)}, "
+                                  f"description = \"{what} {self.e.ident}.\"]")
+        return Code(name + call, dims)
+
     def _arithmetic(self, node) -> Code:
         ops, args = node.operators, [self.visit(a) for a in node.arguments]
         if len(args) == 1:
@@ -953,14 +1191,18 @@ class Context:
             return args[0]
         if all(op in ("^", "**") for op in ops):        # right-associative
             out = args[-1]
-            for a in reversed(args[:-1]):
+            for node_a, a in reversed(list(zip(node.arguments[:-1], args[:-1]))):
                 op = self._op("^", a, out)
+                if isinstance(node_a, (int, float)) and node_a < 0:
+                    # -2^2 is -(2^2) in Vensim (and in Python and Julia): the minus unwrapped
+                    out = Code(f"{a.text} {op} {out.wrap(P_POW)}", self._union(a.dims, out.dims), P_UNARY)
+                    continue
                 out = Code(f"{a.wrap(P_POW + 1)} {op} {out.wrap(P_POW)}", self._union(a.dims, out.dims), P_POW)
             return out
         out = args[0]
         for op, a in zip(ops, args[1:]):
             if op == "mod":
-                out = Code(f"mod{'.' if out.dims or a.dims else ''}({out.text}, {a.text})",
+                out = Code(f"rem{'.' if out.dims or a.dims else ''}({out.text}, {a.text})",
                            self._union(out.dims, a.dims))
                 continue
             jop = ARITH[op]
@@ -1060,6 +1302,9 @@ class Context:
         if el is None:
             if name in self.b.controls:                 # FINAL TIME, SAVEPER: their value
                 return Code(number(self.b._control(name)))
+            elem = next((x for r in self.b.ranges.values() for x in r if clean(x) == name), None)
+            if elem is not None:                        # an element as a value: its position
+                return Code(str(self.b._main_position(elem)))
             raise DSLError(f"{self.e.name}: unknown name {node.reference!r}")
         subs = node.subscripts.subscripts if node.subscripts else []
         base = el.ident
@@ -1126,7 +1371,14 @@ class Context:
             name = identifier(r + " position", self.b.taken)
             self.b.positions[r] = name
             d = self.b.dimname[r]
-            self.b._hide(self.e.view, f"{name}[{d}] = 1:length({d}),\n    [unit = NoUnits, "
+            # as Python PySD: the position in the main range (the largest with these
+            # elements, the first by name among equal ones), so that equal elements of
+            # two ranges compare equal
+            own = self.b.ranges[r]
+            pos = [self.b._main_position(x, own) for x in own]
+            value = f"1:length({d})" if pos == list(range(1, len(own) + 1)) else \
+                "[" + ", ".join(map(str, pos)) + "]"
+            self.b._hide(self.e.view, f"{name}[{d}] = {value},\n    [unit = NoUnits, "
                                       f"description = \"The position of each element of {d}.\"]")
         name, d, target = self.b.positions[r], self.b.dimname[r], self._target(r)
         text = name if target == d else f"set({name}, :{d} => :{target})"
@@ -1151,14 +1403,24 @@ class Context:
             return Code(f"ifelse{dot}({c.text}, {a.text}, {b.text})", self._union(c.dims, a.dims, b.dims))
         if fname == "pi":
             return Code("π")
-        if fname in ("pulse_train", "quantum"):
-            # PySD.jl's, as Vensim (the parser gives PULSE TRAIN's arguments
-            # as start, interval, width, end)
-            cs = [self.visit(x) for x in args]
-            dims = self._union(*(c.dims for c in cs))
-            dot = "." if dims else ""
-            first = ["t"] if fname == "pulse_train" else []
-            return Code(f"pysd_{fname}{dot}({', '.join(first + [c.text for c in cs])})", dims)
+        if fname == "pulse_train":
+            # as Python PySD: from start to end, width every interval (the parser
+            # gives the arguments as start, interval, width, end)
+            start, interval, width, end = (self.visit(x) for x in args)
+            dims = self._union(start.dims, interval.dims, width.dims, end.dims)
+            d = "." if dims else ""
+            return Code(f"({start.text} {d}≤ t {d}< {end.wrap(P_CMP + 1)}) {d}& "
+                        f"(mod{d}(t {d}- {start.wrap(P_ADD + 1)} {d}+ 1e-6, {interval.text}) {d}< "
+                        f"{width.wrap(P_CMP + 1)})", dims, P_AND)
+        if fname == "quantum":
+            # as Python PySD: b * trunc(a / b), or a for a b below 1e-6
+            a, b = (self.visit(x) for x in args)
+            dims = self._union(a.dims, b.dims)
+            d = "." if dims else ""
+            steps = f"{b.wrap(P_MUL)} {d}* trunc{d}({a.wrap(P_MUL)} {d}/ {b.wrap(P_MUL + 1)})"
+            if isinstance(args[1], (int, float)) and not dims:
+                return Code(a.text, a.dims, a.prec) if args[1] < 1e-6 else Code(steps, (), P_MUL)
+            return Code(f"ifelse{d}({b.wrap(P_CMP + 1)} {d}< 1e-6, {a.text}, {steps})", dims)
         if fname in ("vmin_xmile", "vmax_xmile"):
             # XMILE's MIN and MAX: of all the elements of one array, or element by element
             cs = [self.visit(x) for x in args]
@@ -1249,7 +1511,7 @@ class Context:
             a, b = self.visit(args[0]), self.visit(args[1])
             dims = self._union(a.dims, b.dims)
             name = identifier(self.e.name + " active initial", self.b.taken)
-            unit = self.b._meta(self.e).split(",")[0].lstrip("[")
+            unit = self.b._unit_item(self.e)
             d = "[" + ", ".join(dims) + "]" if dims else ""
             self.b._hide(self.e.view, f"{name}(t){d}, [{unit}, description = "
                                       f"\"The ACTIVE INITIAL in {self.e.ident}.\"]")
@@ -1268,14 +1530,12 @@ class Context:
         return self._not_implemented(node.function.reference.upper().replace("_", " "), args)
 
     def _not_implemented(self, name: str, args) -> Code:
-        """As Python PySD: a warning, and a call that stops the model with an
-        error naming the function when it is evaluated."""
-        cs = [self.visit(x) for x in args]
+        """As Python PySD: a warning, and an error naming the function when the
+        model evaluates it."""
         warnings.warn(f"Trying to translate '{name}' which it is not implemented in the DSL "
                       "backend. The translated model will crash...")
-        quoted = name.replace('"', '\\"').replace("$", "\\$")
-        return Code(f'pysd_not_implemented("{quoted}"' + "".join(", " + c.text for c in cs) + ")",
-                    self._union(*(c.dims for c in cs)))
+        message = f"Not implemented function '{name}' (PySD's DSL backend does not translate it yet)"
+        return Code(f"error({jl_string(message)})")
 
     def _vector_along(self, fname: str, args) -> Code:
         """VECTOR SORT ORDER, RANK and REORDER, as Vensim and Python PySD: along

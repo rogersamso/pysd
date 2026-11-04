@@ -195,8 +195,9 @@ left = FINAL TIME - Time
 	~	Month
 	~		|
 """)
-    assert "pulses ~ pysd_pulse_train(t, 1, 5, 2, 10)" in code     # start, interval, width, end
-    assert "steps ~ pysd_quantum(t, 3)" in code
+    # start, interval, width, end
+    assert "pulses ~ (1 ≤ t < 10) & (mod(t - 1 + 1e-6, 5) < 2)" in code
+    assert "steps ~ 3 * trunc(t / 3)" in code
     assert "left ~ 10 - t" in code                                  # FINAL TIME: its value
 
 
@@ -485,7 +486,7 @@ ahead = LOOKUP FORWARD(table, Time)
 	~	Dmnl
 	~		|
 """)
-    assert 'pysd_not_implemented("LOOKUP FORWARD"' in code
+    assert 'error("Not implemented function \'LOOKUP FORWARD\'' in code
 
 
 def test_vector_functions_and_game(tmp_path):
@@ -631,3 +632,161 @@ available[region, branch] = ALLOCATE AVAILABLE(request[region, branch], profiles
     assert "shipped ~ allocate_by_priority(request, priority, 1, supply, branch)" in code
     # the profiles written from their first element (ptype): the whole range
     assert "available ~ allocate_available(request, profiles, 6, branch, pprofile)" in code
+
+
+def test_macros_are_written_in_place(tmp_path):
+    _, code = translate(tmp_path, """
+:MACRO: ACCUMULATE(input, start)
+ACCUMULATE = INTEG(input, start)
+	~	input
+	~		|
+
+:END OF MACRO:
+a = 1
+	~	Dmnl
+	~		|
+
+first = ACCUMULATE(a, 0)
+	~	Dmnl
+	~		|
+
+second = ACCUMULATE(2 * a, 5)
+	~	Dmnl
+	~		|
+""")
+    # one copy of the macro per call: its own stock, its parameters replaced
+    assert "∂t(accumulate_output) ~ a" in code
+    assert "accumulate_output(t₀) ~ 0" in code
+    assert "∂t(accumulate_2_output) ~ 2a" in code or "∂t(accumulate_2_output) ~ 2 * a" in code
+    assert "accumulate_2_output(t₀) ~ 5" in code
+    assert "first ~ accumulate_output" in code and "second ~ accumulate_2_output" in code
+    assert 'unit = u"input"' not in code
+
+
+def test_except_narrower_at_several_positions(tmp_path):
+    _, code = translate(tmp_path, """
+store: s1, s2, s3
+	~	~		|
+
+product: p1, p2
+	~	~		|
+
+x[store, product] :EXCEPT: [s3, p2] = 1
+	~	Dmnl
+	~		|
+
+x[s3, p2] = 2
+	~	Dmnl
+	~		|
+""")
+    # rectangular parts: every store but s3, then s3 for every product but p2
+    assert "x[store = Not(At(:s3))] ~ 1" in code
+    assert re.search(r"x\[store = At\(\[?:s3\]?\), product = (Not\(At\(:p2\)\)|At\(\[:p1\]\))\] ~ 1", code)
+    assert "x[store = At(:s3), product = At(:p2)] ~ 2" in code
+
+
+def test_initial_of_an_expression(tmp_path):
+    _, code = translate(tmp_path, """
+start = INITIAL(Time * 2)
+	~	Dmnl
+	~		|
+""")
+    assert "start_initial_expression ~ t * 2" in code
+    assert "start ~ start_initial_expression(t₀)" in code
+
+
+def test_subscripts_and_elements_as_values(tmp_path):
+    _, code = translate(tmp_path, """
+dim: a, b, c
+	~	~		|
+
+other: c, a, b
+	~	~		|
+
+same[dim, other] = IF THEN ELSE(dim = other, 1, 0)
+	~	Dmnl
+	~		|
+
+is b[dim] = IF THEN ELSE(dim = b, 1, 0)
+	~	Dmnl
+	~		|
+""")
+    # as Python PySD: the positions in the main range, so equal elements are equal
+    assert "other_position[other] = [3, 1, 2]" in code
+    assert "is_b ~ ifelse.(dim_position .== 2, 1, 0)" in code
+
+
+def test_numbers_and_operators_as_vensim(tmp_path):
+    _, code = translate(tmp_path, """
+x = -2^2
+	~	Dmnl
+	~		|
+
+y = MODULO(Time - 5, 3)
+	~	Dmnl
+	~		|
+
+z = IF THEN ELSE(Time > 5, :NA:, Time)
+	~	Dmnl
+	~		|
+""")
+    assert "x ~ -2 ^ 2" in code                  # -(2^2), as Vensim
+    assert "y ~ rem(t - 5, 3)" in code           # the sign of the first argument
+    assert "NaN" in code
+
+
+def test_tabbed_array_in_a_part(tmp_path):
+    _, code = translate(tmp_path, """
+row: r1, r2
+	~	~		|
+
+col: c1, c2, c3
+	~	~		|
+
+layer: l1, l2
+	~	~		|
+
+x[row, col, l1] = TABBED ARRAY(
+	1	2	3
+	4	5	6)
+	~	Dmnl
+	~		|
+
+x[row, col, l2] = 0
+	~	Dmnl
+	~		|
+""")
+    assert "[[1 2 3; 4 5 6], 0]" in code
+
+
+def test_data_in_parts_of_several_shapes(tmp_path):
+    _, code = translate(tmp_path, """
+dim: d1, d2
+	~	~		|
+
+adim: a1, a2
+	~	~		|
+
+v[d1, a1] := GET DIRECT DATA('input.xlsx', 'Sheet1', 'time', 'B2')
+	~	Dmnl
+	~		|
+
+v[d2, a1] = 2
+	~	Dmnl
+	~		|
+
+v[dim, a2] := GET DIRECT DATA('input.xlsx', 'Sheet1', 'time', 'C2')
+	~	Dmnl
+	~		|
+
+k[dim] = GET DIRECT CONSTANTS('input.xlsx', 'Sheet1', 'D5')
+	~	Dmnl
+	~		|
+""")
+    # one equation per part, each data a parameter of its own over the part's ranges
+    assert "v_d1_a1 = data(" in code and "v_a2[dim] = data(" in code
+    assert "v[dim = At(:d1), adim = At(:a1)] ~ v_d1_a1(t)" in code
+    assert "v[adim = At(:a2)] ~ v_a2(t)" in code
+    assert "v(t)[dim, adim]" in code
+    # constants from a cell: the block of the variable's size
+    assert '"D5:E5"' in code

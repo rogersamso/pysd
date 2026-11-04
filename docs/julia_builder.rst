@@ -262,17 +262,20 @@ What a translated model gives you, besides running:
   form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
   layer per variable over the time and its dimensions.
 
-These need PySD.jl 0.7.0, which the model's package requires.
+These need PySD.jl 0.8.0, which the model's package requires.
 
 What it translates: stocks, auxiliaries and constants; subscripts (ranges,
-subranges, mappings, arrays of up to 3 dimensions, ``:EXCEPT:``, variables
-defined in parts or element by element); lookups (also inline, ``WITH
+subranges, ranges defined with other ranges, mappings, arrays of up to 3
+dimensions, ``:EXCEPT:`` (also narrower at several positions), subscripts and
+elements as values, variables defined in parts or element by element); lookups (also inline, ``WITH
 LOOKUP``); ``GET DIRECT CONSTANTS``, ``LOOKUPS`` and ``DATA`` (also in parts,
-one per element of one subscript or of several); data variables without an
+one per element of one subscript or of several, or mixed with numbers);
+``GET DIRECT SUBSCRIPT`` (read as it translates); macros (written in place, a
+copy of their equations per call); data variables without an
 equation (from other models' runs or files, above); ``SMOOTH``, ``SMOOTHI``,
 ``SMOOTH3``, ``SMOOTH N``, ``DELAY1``, ``DELAY3``, ``DELAY N``, ``DELAY
 FIXED`` (also of a constant), ``TREND``, ``FORECAST``, ``SAMPLE IF TRUE``,
-``INITIAL``, ``ACTIVE INITIAL``; the random functions (a draw per tick, the
+``INITIAL`` (also of an expression), ``ACTIVE INITIAL``; the random functions (a draw per tick, the
 same with any solver); ``SUM``, ``PROD``, ``VMIN``, ``VMAX`` (over one or
 several dimensions); ``VECTOR SELECT``, ``VECTOR SORT ORDER``, ``VECTOR
 RANK``, ``VECTOR REORDER``; ``ALLOCATE BY PRIORITY``, ``ALLOCATE
@@ -287,15 +290,17 @@ What it doesn't translate yet.  A function it does not know (as ``LOOKUP
 FORWARD``): as the Python builder, a warning, and a call that stops the
 model with an error naming the function when it is evaluated.  The
 translation stops, listing the elements, for: ``GET TIME VALUE`` other than
-``GET TIME VALUE(0, offset, 0)``;
-macros; time settings that are expressions; ``DELAY FIXED`` and ``INITIAL``
-of an expression (of a variable they work); ``:EXCEPT:`` narrower at several
-positions; constants written as a table of numbers of more than 2
-dimensions; ``INVERT MATRIX`` over more than 3 dimensions.
+``GET TIME VALUE(0, offset, 0)``; time settings that change during the run
+(a ``FINAL TIME`` that depends on a variable or on ``Time``); ``DELAY FIXED``
+of an expression (of a variable it works); macros with several outputs;
+constants written as a table of numbers of more than 2 dimensions; ``INVERT
+MATRIX`` over more than 3 dimensions.
 
 The reference tests run every test model with the DSL backend
-(``PYSD_JULIA_BACKENDS=dsl``): 143 match Vensim's output (99 Vensim models,
-44 XMILE), and the others are listed in ``KNOWN_FAILURES`` with the reason.
+(``PYSD_JULIA_BACKENDS=dsl``): 184 match Vensim's output (137 Vensim models,
+47 XMILE); the two whose time settings change during the run are listed in
+``KNOWN_FAILURES``, and the others are those the Python pathway marks as
+failing.
 Three large models (a global model and two regional models that take data
 from it, 1,900 to 2,000 names each) match Python PySD to 1e-12 in every saved
 value.
