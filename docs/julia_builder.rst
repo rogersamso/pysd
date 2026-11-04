@@ -274,13 +274,15 @@ one per element of one subscript or of several, or mixed with numbers);
 copy of their equations per call); data variables without an
 equation (from other models' runs or files, above); ``SMOOTH``, ``SMOOTHI``,
 ``SMOOTH3``, ``SMOOTH N``, ``DELAY1``, ``DELAY3``, ``DELAY N``, ``DELAY
-FIXED`` (also of a constant), ``TREND``, ``FORECAST``, ``SAMPLE IF TRUE``,
+FIXED`` (also of a constant or of an expression), ``TREND``, ``FORECAST``, ``SAMPLE IF TRUE``,
 ``INITIAL`` (also of an expression), ``ACTIVE INITIAL``; the random functions (a draw per tick, the
 same with any solver); ``SUM``, ``PROD``, ``VMIN``, ``VMAX`` (over one or
 several dimensions); ``VECTOR SELECT``, ``VECTOR SORT ORDER``, ``VECTOR
 RANK``, ``VECTOR REORDER``; ``ALLOCATE BY PRIORITY``, ``ALLOCATE
 AVAILABLE``; ``INVERT MATRIX``; ``GAME`` (its value);
-``GET TIME VALUE(0, offset, 0)``; ``IF THEN ELSE``, ``STEP``, ``RAMP``,
+``GET TIME VALUE`` of the time or the initial time plus an offset
+(``(0, offset, 0)``, ``(1, offset, 0)``) and of the computer's clock
+(``(2, 0, measure)``, with Julia's Dates); ``IF THEN ELSE``, ``STEP``, ``RAMP``,
 ``PULSE``, ``PULSE TRAIN``, ``QUANTUM``, ``ZIDZ``, ``XIDZ``, ``MIN``, ``MAX``
 (also XMILE's of one argument), ``MODULO``, ``ELMCOUNT``, ``LN``, ``LOG``,
 ``EXP``, ``SQRT``, the trigonometric functions, ``PI``; ``TIME``, ``TIME
@@ -292,11 +294,10 @@ builder (``time = (0, :final_time), dt = :time_step``).
 
 What it doesn't translate yet.  A function it does not know (as ``LOOKUP
 FORWARD``): as the Python builder, a warning, and a call that stops the
-model with an error naming the function when it is evaluated.  The
-translation stops, listing the elements, for: ``GET TIME VALUE`` other than
-``GET TIME VALUE(0, offset, 0)``; ``DELAY FIXED``
-of an expression (of a variable it works); macros with several outputs;
-constants written as a table of numbers of more than 2 dimensions; ``INVERT
+model with an error naming the function when it is evaluated (also
+``GET TIME VALUE`` of a calendar measure of the model's time, as the Python
+builder).  The translation stops, listing the elements, for: macros with
+several outputs (PySD's Vensim parser doesn't read their calls yet); constants written as a table of numbers of more than 2 dimensions; ``INVERT
 MATRIX`` over more than 3 dimensions.
 
 The reference tests run every test model with the DSL backend

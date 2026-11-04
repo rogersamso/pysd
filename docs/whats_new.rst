@@ -54,6 +54,12 @@ New Features
   of the model that ``Model`` reads at every step, as the Python builder.
   All the test models that the Python pathway runs match Vensim's output with
   the DSL backend (186).  PySD.jl 0.9.0.
+- Julia builder, DSL backend: ``DELAY FIXED`` of an expression (a variable of
+  its own, delayed), ``GET TIME VALUE(1, offset, 0)`` (the initial time plus
+  the offset, as Vensim) and ``GET TIME VALUE(2, 0, measure)`` (the computer's
+  clock, with Julia's Dates; the day of the week from 0, Sunday, as Vensim).
+  Other cases of ``GET TIME VALUE`` stop the model when evaluated, as the
+  Python builder.
 - Julia builder, MTK backend: ``VECTOR SORT ORDER``, ``VECTOR RANK``,
   ``VECTOR REORDER`` and ``VECTOR SELECT`` build their equations with
   comparisons, as ModelingToolkit needs (before, sorting the symbolic values

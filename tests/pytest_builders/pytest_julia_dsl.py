@@ -386,19 +386,6 @@ p[dim] = PULSE(start[dim], 1)
 
 @pytest.mark.parametrize("equations, message", [
     ("""
-a = 1
-	~	Dmnl
-	~		|
-
-b = 2
-	~	Dmnl
-	~		|
-
-late = DELAY FIXED(a + b, 2, 0)
-	~	Dmnl
-	~		|
-""", "late: DELAY FIXED of an expression"),
-    ("""
 a: a1, a2
 	~	~		|
 
@@ -491,6 +478,50 @@ ahead = GET TIME VALUE(0, 0.5, 0)
     assert "buffered_active_initial(t₀) ~ 5" in code
     assert "buffered ~ buffered_active_initial + 1" in code
     assert "ahead ~ t + 0.5" in code
+
+
+def test_delay_fixed_of_an_expression(tmp_path):
+    _, code = translate(tmp_path, """
+a = Time
+	~	Dmnl
+	~		|
+
+late = DELAY FIXED(a + 1, 2, 0)
+	~	Dmnl
+	~		|
+""")
+    # a variable of its own, delayed
+    assert "late_delayed_expression ~ a + 1" in code
+    assert "late ~ late_delayed_expression(t - 2; init = 0)" in code
+
+
+def test_get_time_value_of_the_initial_time_and_the_clock(tmp_path):
+    with pytest.warns(UserWarning, match="GET TIME VALUE.*will crash"):
+        folder, code = translate(tmp_path, """
+from start = GET TIME VALUE(1, 2, 0)
+	~	Month
+	~		|
+
+year now = GET TIME VALUE(2, 0, 1)
+	~	Dmnl
+	~		|
+
+weekday now = GET TIME VALUE(2, 0, 5) + 1
+	~	Dmnl
+	~		|
+
+month of time = GET TIME VALUE(0, 0, 3)
+	~	Dmnl
+	~		|
+""")
+    assert "from_start ~ t₀ + 2" in code
+    # the computer's clock, with Julia's Dates (Vensim's measures; 0 is Sunday)
+    assert "year_now ~ year(now())" in code
+    assert "weekday_now ~ dayofweek(now()) % 7 + 1" in code
+    assert "using PySD, DimensionalData, Dates" in code
+    assert 'Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"' in (folder / "Project.toml").read_text()
+    # as Python PySD: a calendar measure of the model's time stops the model
+    assert re.search(r"month_of_time ~ error\(\"Not implemented function 'GET TIME VALUE\(0, …, 3\)'", code)
 
 
 def test_a_function_not_translated_stops_the_model(tmp_path):

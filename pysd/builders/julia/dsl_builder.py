@@ -284,6 +284,7 @@ class DSLBuilder:
         self.unknown_units: set = set()
         self.sheets: Dict[Tuple[str, str], str] = {}
         self.missing_units: List[str] = []
+        self.uses_dates = False                      # GET TIME VALUE of the computer's clock
         self._ranges()
         self._elements()
 
@@ -654,7 +655,9 @@ class DSLBuilder:
     def _write_package(self, out, main):
         import uuid
         name = self._package_name()
-        deps = "\n".join(f'{k} = "{v}"' for k, v in self._PACKAGES.items())
+        packages = dict(self._PACKAGES, **({"Dates": "ade2ca70-3891-5945-98fb-dc099432e06a"}
+                                            if self.uses_dates else {}))
+        deps = "\n".join(f'{k} = "{v}"' for k, v in packages.items())
         (out / "Project.toml").write_text(
             f'name = "{name}"\nuuid = "{uuid.uuid5(uuid.NAMESPACE_URL, "pysd-dsl-model:" + name)}"\n'
             f'version = "0.1.0"\n\n[deps]\n{deps}\n\n'
@@ -763,7 +766,8 @@ class DSLBuilder:
         save = self._setting("saveper", None) if "saveper" in self.all_controls else dt
         tunit, _ = translate_units(self.all_controls["time_step"].units if "time_step" in self.all_controls else "")
         tunit = tunit or "s"
-        out = [f"# {self.path.name}, translated to PySD.jl's DSL by PySD.", "using PySD, DimensionalData"]
+        out = [f"# {self.path.name}, translated to PySD.jl's DSL by PySD.",
+               "using PySD, DimensionalData" + (", Dates" if self.uses_dates else "")]
         if self.unknown_units:
             out.append('include("units.jl")')
         out += ['include("dims.jl")', 'include("inputs.jl")']
@@ -1096,9 +1100,17 @@ class Context:
             return Code(f"sample_if_true({cnd.text}, {x.text}; init = {init.text})",
                         self._union(cnd.dims, x.dims, init.dims))
         if isinstance(node, ae.DelayFixedStructure):
-            if not isinstance(node.input, ae.ReferenceStructure):
-                raise DSLError(f"{self.e.name}: DELAY FIXED of an expression is not supported yet")
             tau, init = self.visit(node.delay_time), self.visit(node.initial)
+            if not isinstance(node.input, ae.ReferenceStructure):
+                # of an expression: a variable of its own, delayed
+                x = self.visit(node.input)
+                name = identifier(self.e.name + " delayed expression", self.b.taken)
+                d = "[" + ", ".join(x.dims) + "]" if x.dims else ""
+                self.b._hide(self.e.view, f"{name}(t){d}, [{self.b._unit_item(self.e)}, description = "
+                                          f"\"The expression in DELAY FIXED in {self.e.ident}.\"]")
+                self.e.lines.append(f"{name} ~ {x.text}")
+                return Code(f"{name}(t - {tau.wrap(P_ADD + 1)}; init = {init.text})",
+                            self._union(x.dims, init.dims))
             # the initial value as the delayed value: of the whole array, as it, when
             # it's the same reference (Vensim's usual DELAY FIXED(x, τ, x))
             same = isinstance(node.initial, ae.ReferenceStructure) and \
@@ -1538,15 +1550,29 @@ class Context:
             self.e.lines.append(f"{name}(t₀) ~ {b.text}")
             return Code(name, dims)
         if fname == "get_time_value":
-            # the current time plus an offset, GET TIME VALUE(0, offset, 0), as
-            # the ODE backend and the Python builder for it
-            rel, off, measure = args
-            if rel != 0 or measure != 0:
-                raise DSLError(f"{self.e.name}: GET TIME VALUE other than the time plus an offset "
-                               "(0, offset, 0) is not supported yet")
-            o = self.visit(off)
-            return Code(f"t {'.+' if o.dims else '+'} {o.wrap(P_ADD + 1)}", o.dims, P_ADD)
+            return self._get_time_value(*args)
         return self._not_implemented(node.function.reference.upper().replace("_", " "), args)
+
+    # GET TIME VALUE(2, 0, measure): the computer's clock, with Julia's Dates
+    _CLOCK = {1: "year(now())", 2: "quarterofyear(now())", 3: "month(now())", 4: "day(now())",
+              5: "dayofweek(now()) % 7",                                  # 0 is Sunday
+              6: "Dates.value(today() - Date(0))",                        # days since 1 Jan 1 BC
+              7: "hour(now())", 8: "minute(now())",
+              9: "second(now()) + millisecond(now()) / 1000",
+              10: "mod(Dates.value(now() - DateTime(0)) ÷ 1000, 500_000)"}
+
+    def _get_time_value(self, rel, off, measure) -> Code:
+        """GET TIME VALUE: the time (0) or the initial time (1) plus an offset,
+        in the model's time unit (measure 0); the computer's clock (2), by
+        measure 1 to 10.  Other cases, as Python PySD: an error when evaluated."""
+        if rel in (0, 1) and measure == 0:
+            o = self.visit(off)
+            return Code(f"{'t' if rel == 0 else 't₀'} {'.+' if o.dims else '+'} {o.wrap(P_ADD + 1)}",
+                        o.dims, P_ADD)
+        if rel == 2 and measure in self._CLOCK:
+            self.b.uses_dates = True
+            return Code(self._CLOCK[measure], (), {5: P_MUL, 9: P_ADD}.get(measure, P_ATOM))
+        return self._not_implemented(f"GET TIME VALUE({rel}, …, {measure})", [rel, off, measure])
 
     def _not_implemented(self, name: str, args) -> Code:
         """As Python PySD: a warning, and an error naming the function when the
