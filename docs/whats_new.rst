@@ -164,6 +164,17 @@ Bug fixes
   truncated to [min, max] and ``RANDOM EXPONENTIAL`` takes Vensim's (min,
   max, shift, stretch, seed), as the Python builder; the translation with
   PySD.jl 0.5.0 cut the draws at the bounds and took the shift as the scale.
+- Julia builder, ODE and MTK backends: a variable defined in parts of which
+  some are ``GET DIRECT DATA`` and others not reads each data part as its
+  own series; ``GET DIRECT CONSTANTS`` of some elements of a range, in any
+  order, go to their elements, and the elements with no definition are NaN,
+  as those of an inline lookup defined for some elements.
+- Julia builder, MTK backend: time settings that change during the run (as
+  the ODE backend: ``run_model`` takes a step of the current ``TIME STEP``
+  and stops at the current ``FINAL TIME``), stocks whose initial value is an
+  ``ACTIVE INITIAL``, ``DATA`` variables from ``.tab`` files, ``ALLOCATE BY
+  PRIORITY`` and ``ALLOCATE AVAILABLE``; a ``DELAY FIXED`` whose initial
+  value is an expression keeps its value at the initial time.
 - Fix setting parmas with dimensions (:issue:`484`). (`@enekomartinmartinez <https://github.com/enekomartinmartinez>`_)
 - No deprecation warnings with pandas 3.1: results are indexed by time
   without ``inplace``, and spreadsheets are read with an explicit engine

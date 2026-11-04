@@ -1215,11 +1215,9 @@ class Context:
 
     def _arithmetic(self, node) -> Code:
         ops, args = node.operators, [self.visit(a) for a in node.arguments]
-        if len(args) == 1:
-            if ops and ops[0] in ("negative", "-"):
-                a = args[0]
-                return Code(("." if a.dims else "") + "-" + a.wrap(P_UNARY), a.dims, P_UNARY)
-            return args[0]
+        if len(args) == 1:                  # a negation: the parsers' only operation of one
+            a = args[0]
+            return Code(("." if a.dims else "") + "-" + a.wrap(P_UNARY), a.dims, P_UNARY)
         if all(op in ("^", "**") for op in ops):        # right-associative
             out = args[-1]
             for node_a, a in reversed(list(zip(node.arguments[:-1], args[:-1]))):
@@ -1455,16 +1453,13 @@ class Context:
                 return Code(a.text, a.dims, a.prec) if args[1] < 1e-6 else Code(steps, (), P_MUL)
             return Code(f"ifelse{d}({b.wrap(P_CMP + 1)} {d}< 1e-6, {a.text}, {steps})", dims)
         if fname in ("vmin_xmile", "vmax_xmile"):
-            # XMILE's MIN and MAX: of all the elements of one array, or element by element
-            cs = [self.visit(x) for x in args]
-            f = "min" if fname == "vmin_xmile" else "max"
-            if len(cs) == 1:
-                if not cs[0].dims:
-                    return cs[0]
-                over = cs[0].dims[0] if len(cs[0].dims) == 1 else "(" + ", ".join(cs[0].dims) + ")"
-                return Code(f"{'minimum' if f == 'min' else 'maximum'}_over({cs[0].text}, {over})", ())
-            dims = self._union(*(c.dims for c in cs))
-            return Code(f"{f}{'.' if dims else ''}({', '.join(c.text for c in cs)})", dims)
+            # XMILE's MIN and MAX of one argument: of all the elements of an array
+            # (of two, they are Vensim's MIN and MAX)
+            x = self.visit(args[0])
+            if not x.dims:
+                return x
+            over = x.dims[0] if len(x.dims) == 1 else "(" + ", ".join(x.dims) + ")"
+            return Code(f"{'minimum' if fname == 'vmin_xmile' else 'maximum'}_over({x.text}, {over})", ())
         if fname in FUNCTIONS:
             cs = [self.visit(x) for x in args]
             dims = self._union(*(c.dims for c in cs))

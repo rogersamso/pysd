@@ -707,7 +707,7 @@ Supported Vensim features
      - Supported
    * - ``ACTIVE INITIAL``
      - Supported (its initial value while the initial values are computed)
-     - Partial (the active value is used)
+     - Supported (the same)
    * - ``IF THEN ELSE``
      - Supported (``ifelse``)
      - Supported (``ifelse``)
@@ -728,7 +728,7 @@ Supported Vensim features
      - Supported
    * - ``DATA`` variables (tab-delimited ``.tab`` files)
      - Supported (runtime ``_tab_val`` interpolation via ``tab_data_files=`` parameter)
-     - Not supported
+     - Supported (the same)
    * - ``DATA`` variables fed from another model's NetCDF output
      - Supported (pass ``nc_data_files=["results.nc"]`` to ``run_model()``; scalars and
        subscripted variables supported)
@@ -781,7 +781,8 @@ Supported Vensim features
        ``TIME STEP``, ``SAVEPER`` depending on ``Time`` or on model variables)
      - Supported (as the Python builder: evaluated at every step; ``run_model``
        takes Euler steps)
-     - Not supported
+     - Supported (the same; not with fixed delays, samples, random draws or
+       switches on the time, which move by steps of ``TIME STEP``)
 
 .. note::
    When the builder encounters an unsupported or partially-supported construct

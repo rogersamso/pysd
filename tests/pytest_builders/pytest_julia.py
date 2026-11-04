@@ -7003,8 +7003,8 @@ class TestSectionBuilderHelpers:
         elem = AbstractElement(name="My Lookup", components=[comp1, comp2])
         sb = _section_builder_from_elements([elem], subscripts=[sr])
         sb.build_section()
-        # Placeholder interpolation should appear for the missing index C
-        assert any("LinearInterpolation([0.0], [0.0]" in d for d in sb.lookup_const_decls)
+        # NaN for the missing index C, as Python PySD
+        assert any(d.endswith("= _ -> NaN") for d in sb.lookup_const_decls)
 
     def test_subscripted_inline_lookup_2d_placeholder_for_missing_index(self):
         """When a 2D inline lookup has fewer components than dim elements, 2D placeholder is emitted (line 2632)."""
@@ -7018,8 +7018,8 @@ class TestSectionBuilderHelpers:
         elem = AbstractElement(name="2D Lookup", components=[comp1, comp2])
         sb = _section_builder_from_elements([elem], subscripts=[sr1, sr2])
         sb.build_section()
-        # Placeholder interpolation should appear for the missing indices
-        assert any("LinearInterpolation([0.0], [0.0]" in d for d in sb.lookup_const_decls)
+        # NaN for the missing indices, as Python PySD
+        assert any(d.endswith("= _ -> NaN") for d in sb.lookup_const_decls)
 
     def test_subscripted_inline_lookup_unknown_label_uses_fallback_index(self):
         """Subscripted inline lookup with unknown element label uses fallback index 1 (line 2568)."""
@@ -9179,3 +9179,137 @@ class TestCellLoops:
         lines = ["    x[2] = i * w[1]", "    x[3] = i * w[2]", "    x[4] = i * w[3]"]
         assert _fold_cell_loops(lines) == [
             "    for _i in 2:4", "        x[_i] = i * w[_i - 1]", "    end"]
+
+
+def _translate_controls(tmp_path, text, backend, time_step="1"):
+    """The translation of a model with the given TIME STEP (a number or a
+    variable's name)."""
+    import warnings
+    from pysd import translate_to_julia
+    path = tmp_path / f"m_{backend}.mdl"
+    path.write_text("{UTF-8}\n" + text + f"""
+FINAL TIME = 10 ~ Month ~ |
+INITIAL TIME = 0 ~ Month ~ |
+SAVEPER = 1 ~ Month ~ |
+TIME STEP = {time_step} ~ Month ~ |
+""")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return translate_to_julia(path, backend=backend).read_text()
+
+
+class TestMtkModels:
+    """What the MTK backend writes for time settings that change during the
+    run, ACTIVE INITIAL, fixed delays and ALLOCATE."""
+
+    STEP = "step= 1 / (1 + Time / 10) ~ ~ |\n"
+
+    def test_changing_time_step_is_a_variable_of_the_system(self, tmp_path):
+        content = _translate_controls(
+            tmp_path, "stock= INTEG(1, 0) ~ ~ |\n" + self.STEP, "mtk", time_step="step")
+        assert "@variables initial_time(t) final_time(t) time_step(t) saveper(t)" in content
+        assert "time_step ~ step," in content
+        assert "final_time ~ 10.0," in content
+        # stepped by an integrator, with the time step of each step
+        assert "h = integ[time_step]" in content
+        assert "set_proposed_dt!(integ, h)" in content
+        assert "tspan = (_initial_time, prob[final_time])" in content
+
+    def test_changing_time_step_without_stocks(self, tmp_path):
+        content = _translate_controls(
+            tmp_path, "x= Time * 2 ~ ~ |\n" + self.STEP, "mtk", time_step="step")
+        # its save times, from the settings, then solved at them
+        assert "sys, [time_step, saveper, final_time])" in content
+        assert "function _run_without_stocks(solver)" in content
+
+    def test_changing_time_step_with_switches_on_the_time(self, tmp_path):
+        with pytest.raises(ValueError, match="TIME STEP, which changes during the run"):
+            _translate_controls(
+                tmp_path, "x= IF THEN ELSE(Time < 5, 1, 0.5) ~ ~ |\n" + self.STEP,
+                "mtk", time_step="step")
+
+    def test_stock_starts_at_the_initial_value_of_an_active_initial(self, tmp_path):
+        content = _translate_controls(tmp_path, """
+y= Time + 3 ~ ~ |
+x= ACTIVE INITIAL(y * 2, 5) ~ ~ |
+stock= INTEG(1, x) ~ ~ |
+""", "mtk")
+        assert "x ~ pysd_active_initial((y * 2.0), 5.0)" in content
+        assert "stock => (5.0)" in content
+
+    def test_fixed_delay_computed_at_the_first_tick(self, tmp_path):
+        """Its initial value (here its input) is frozen at the first tick, so
+        the delay itself is computed there, besides its input."""
+        content = _translate_controls(tmp_path, """
+inflow= Time + 2 ~ ~ |
+delayed= DELAY FIXED(inflow, 3, inflow) ~ ~ |
+""", "mtk")
+        assert "observed(sys, [_df_in_delayed, delayed])" in content
+        assert "pysd_record!(_ticks, 1, v[1])" in content
+        assert "pysd_record!(_ticks, 2," not in content
+
+    def test_allocate_by_priority_is_registered_one_element_at_a_time(self, tmp_path):
+        content = _translate_controls(tmp_path, """
+r: r1, r2 ~ ~ |
+req[r]= 3, 4 ~ ~ |
+prio[r]= 1, 2 ~ ~ |
+supply= Time ~ ~ |
+alloc[r]= ALLOCATE BY PRIORITY(req[r], prio[r], ELMCOUNT(r), 1, supply) ~ ~ |
+""", "mtk")
+        assert ("@register_symbolic _allocate_by_priority(request::AbstractVector, "
+                "priority::AbstractVector, width::Real, supply::Real, i::Integer)") in content
+        assert "_allocate_by_priority([req[_v] for _v in 1:N_R], [prio[_v] for _v in 1:N_R], 1.0, supply, _i0)" in content
+
+
+class TestPartialDefinitions:
+    """Variables defined in parts, of which some are GET DATA or GET
+    CONSTANTS, or that leave elements undefined (ODE and MTK)."""
+
+    MIXED = """
+r: a, b, c ~ ~ |
+k: k1, k2 ~ ~ |
+md[a, k]:= GET DIRECT DATA('in.xlsx', 'S', 'time', 'B2') ~~|
+md[b, k1]= 5 ~~|
+md[b, k2]:= GET DIRECT DATA('in.xlsx', 'S', 'time', 'C2') ~~|
+md[c, k]= 7 ~ ~ |
+out[r, k]= md[r, k] ~ ~ |
+"""
+
+    def test_data_parts_read_into_functions_of_their_own(self, tmp_path):
+        content = _translate_controls(tmp_path, self.MIXED, "mtk")
+        assert ('const _md_data_0_fns = pysd_xlsx_build_lookup_dispatch('
+                'joinpath(@__DIR__, "in.xlsx"), "S", "time", "B2"; n=2)') in content
+        assert "_md_data_0(i, x) = _md_data_0_fns[i](x)" in content
+        assert "_md_data_2(x) = _md_data_2_fns[1](x)" in content
+        # the variable is an array built in parts, read as an array
+        assert "[md[_i0, _i1] ~ _md_data_0(_i1, t) for _i0 in [1], _i1 in 1:N_K]..." in content
+        assert "[md[_i0, _i1] ~ 5.0 for _i0 in [2], _i1 in [1]]..." in content
+        assert "[md[_i0, _i1] ~ _md_data_2(t) for _i0 in [2], _i1 in [2]]..." in content
+        assert "out[_i0, _i1] ~ md[_i0, _i1]" in content
+
+    def test_data_parts_ode(self, tmp_path):
+        content = _translate_controls(tmp_path, self.MIXED, "ode")
+        assert "_md_data_0 = pysd_input(_given, :_md_data_0, (i, x) -> _md_data_0_fns[i](x))" in content
+        assert "md[_i0, _i1] = _md_data_0(_i1, t)" in content
+        assert "out[_i0, _i1] = md[_i0, _i1]" in content
+
+    def test_data_part_over_a_subrange_is_left_to_get_data(self, tmp_path):
+        content = _translate_controls(tmp_path, """
+r: a, b, c ~ ~ |
+sub: a, b ~ ~ |
+md[sub]:= GET DIRECT DATA('in.xlsx', 'S', 'time', 'B2') ~~|
+md[c]= 7 ~ ~ |
+""", "mtk")
+        assert "_md_data_" not in content
+
+    def test_constants_of_some_elements_at_their_positions(self, tmp_path):
+        """Defined in any order, each part at its element's position; the
+        elements with no definition are NaN, as Python PySD."""
+        content = _translate_controls(tmp_path, """
+r: a, b, c ~ ~ |
+pc[c]= GET DIRECT CONSTANTS('in.xlsx', 'S', 'B2') ~~|
+pc[a]= GET DIRECT CONSTANTS('in.xlsx', 'S', 'D3') ~ ~ |
+""", "mtk")
+        assert "let _v = fill(NaN, 3)" in content
+        assert '_v[[3]] .= pysd_xlsx_read_constant(joinpath(@__DIR__, "in.xlsx"), "S", "B2")' in content
+        assert '_v[[1]] .= pysd_xlsx_read_constant(joinpath(@__DIR__, "in.xlsx"), "S", "D3")' in content

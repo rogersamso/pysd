@@ -362,6 +362,7 @@ class JuliaSectionBuilder:
         self.namespace = JuliaNamespaceManager()
         self.inline_registry = InlineLookupRegistry()
         self.needed_helpers: Set[str] = set()
+        self._mtk_allocate: Set[str] = set()      # MTK: ALLOCATE functions as registered elements
 
         # Map subscript range name → number of elements
         self._subs_sizes: Dict[str, int] = {}
@@ -414,6 +415,9 @@ class JuliaSectionBuilder:
         # What is recorded at the model's ticks (fixed delays' inputs, samples'
         # values), by key: its position here, from 1 (PySD.jl's PySDTicks)
         self._tick_records: List[str] = []
+        # fixed delays' outputs, computed at the first tick to freeze their
+        # initial values there (MTK observes only what it is asked for)
+        self._tick_delays: List[str] = []
         # whether an equation switches on the time (STEP, PULSE, Time >= 2015):
         # the model then stops at the ticks too (see _finish_ticks)
         self._time_switches: bool = False
@@ -487,8 +491,10 @@ class JuliaSectionBuilder:
         for elem in self.abstract_elements:
             identifier = self.namespace.namespace.get(elem.name)
             if identifier and elem.components:
-                if all(isinstance(c.ast, GetLookupsStructure) for c in elem.components) or \
-                   any(isinstance(c.ast, GetDataStructure) for c in elem.components):
+                # (not a variable whose data parts are lifted: an array)
+                if all(isinstance(c.ast, GetLookupsStructure) for c in elem.components) or (
+                        any(isinstance(c.ast, GetDataStructure) for c in elem.components)
+                        and self._mixed_data_ranges(elem) is None):
                     self._lookup_func_names.add(identifier)
                 if any(isinstance(c.ast, GetDataStructure) for c in elem.components):
                     self._data_names.add(identifier)
@@ -931,6 +937,7 @@ class JuliaSectionBuilder:
         #     [liquids]=f(...)).
         if len(elem.components) > 1:
             elem = self._lift_mixed_constants(elem, identifier)
+            elem = self._lift_mixed_data(elem, identifier)
             _has_except = any(comp.subscripts[1] for comp in elem.components)
             # Only apply per-element detection to plain auxiliary/constant
             # components — skip when the element uses external structures
@@ -1466,6 +1473,68 @@ class JuliaSectionBuilder:
                 value = self._read_get_constants(part, name)
                 self.namespace.namespace[name] = name
                 self.ext_const_decls.append(f"const {name} = {value}")
+                # (indexed by the ranges its part is defined over)
+                over = [sub for sub in (comp.subscripts[0] if comp.subscripts else [])
+                        if sub in self._subs_elems]
+                if over:
+                    self._var_dims[name] = over
+                comp = dataclasses.replace(comp, ast=ReferenceStructure(name))
+            lifted.append(comp)
+        return dataclasses.replace(elem, components=lifted)
+
+    def _mixed_data_ranges(self, elem: AbstractElement) -> Optional[List[List[str]]]:
+        """For a variable whose GET DATA parts _lift_mixed_data lifts: the
+        range each data part is defined over (none, or the variable's own
+        at that position), in order; otherwise None."""
+        comps = elem.components
+        is_data = [isinstance(c.ast, GetDataStructure) for c in comps]
+        if self.data_format == "json" or len(comps) < 2 or not any(is_data) or all(is_data):
+            return None
+        var_dims = [d for d, _ in self._element_dims(elem)]
+        ranges = []
+        for comp, data in zip(comps, is_data):
+            if not data:
+                continue
+            subs = list(comp.subscripts[0]) if comp.subscripts else []
+            over = [(pos, sub) for pos, sub in enumerate(subs) if sub in self._subs_elems]
+            if len(over) > 1 or any(pos >= len(var_dims) or var_dims[pos] != sub
+                                    for pos, sub in over):
+                return None
+            ranges.append([sub for _, sub in over])
+        return ranges
+
+    def _lift_mixed_data(
+        self, elem: AbstractElement, identifier: str
+    ) -> AbstractElement:
+        """A variable defined in parts where some parts are GET DATA and others
+        are not (``x[a1] := GET DIRECT DATA(...)``, ``x[a2] = 5``): each data
+        part is read into a function of its own, of the time (and of the
+        index of the one range it is defined over, if any), and referenced
+        from that part, so the variable is built like any variable defined in
+        parts, as the DSL backend does.  Parts over more than one range, or
+        over a range other than the variable's at that position, are left to
+        _process_get_data."""
+        ranges = self._mixed_data_ranges(elem)
+        if ranges is None:
+            return elem
+        lifted, data_parts = [], iter(ranges)
+        for k, comp in enumerate(elem.components):
+            if isinstance(comp.ast, GetDataStructure):
+                name = f"_{identifier}_data_{k}"
+                ast, over = comp.ast, next(data_parts)
+                self.lookup_const_decls.append(
+                    f"const {name}_fns = pysd_xlsx_build_lookup_dispatch("
+                    f'joinpath(@__DIR__, "{ast.file}"), "{ast.tab}", '
+                    f'"{ast.time_row_or_col}", "{ast.cell}"{self._dispatch_n(comp)})')
+                args = "i, x" if over else "x"
+                self.lookup_func_decls.append(f"{name}({args}) = {name}_fns[{'i' if over else 1}](x)")
+                self.lookup_register_decls.append(
+                    f"@register_symbolic {name}({'i::Integer, ' if over else ''}x::Real)")
+                self.namespace.namespace[name] = name
+                self.lookup_identifiers.add(name)
+                self._lookup_func_names.add(name)
+                if over:
+                    self._var_dims[name] = over
                 comp = dataclasses.replace(comp, ast=ReferenceStructure(name))
             lifted.append(comp)
         return dataclasses.replace(elem, components=lifted)
@@ -2613,6 +2682,7 @@ class JuliaSectionBuilder:
         in_name = f"_df_in_{identifier}"
         self.namespace.namespace[f"__internal_df_in_{identifier}"] = in_name
         key = self._tick_record(in_name)
+        self._tick_delays.append(identifier)
         if dims:
             idx_vars = self._idx_vars(len(dims))
             idx = ", ".join(idx_vars)
@@ -2832,10 +2902,19 @@ class JuliaSectionBuilder:
                 pp = vnd.visit(ast.pp)
             rhs = (f"pysd_allocate_available({vector(ast.request)}, {pp}, "
                    f"{vnd.visit(ast.avail)})[{idx[-1]}]")
+            if self.backend == "mtk":
+                self._mtk_allocate.add("available")
+                rhs = (f"_allocate_available({vector(ast.request)}, {pp}, "
+                       f"{vnd.visit(ast.avail)}, {idx[-1]})")
         else:
             rhs = (f"pysd_allocate_by_priority({vector(ast.request)}, "
                    f"{vector(ast.priority)}, {vnd.visit(ast.width)}, "
                    f"{vnd.visit(ast.supply)})[{idx[-1]}]")
+            if self.backend == "mtk":
+                self._mtk_allocate.add("by_priority")
+                rhs = (f"_allocate_by_priority({vector(ast.request)}, "
+                       f"{vector(ast.priority)}, {vnd.visit(ast.width)}, "
+                       f"{vnd.visit(ast.supply)}, {idx[-1]})")
         self.aux_decls.append(f"@variables {identifier}(t)[{self._range_str(dims)}]")
         return [f"[{identifier}[{', '.join(idx)}] ~ {rhs} for {self._for_clause(dims, idx)}]..."]
 
@@ -2865,12 +2944,17 @@ class JuliaSectionBuilder:
         if ndim == 0:
             # Scalar DATA variable
             self._tab_data_entries.append((identifier, real_name, method_sym, []))
+            if self.backend == "mtk":
+                self.aux_decls.append(f"@variables {identifier}(t)")
             key = identifier
             return [f"{identifier} ~ _tab_val(\"{key}\", t)"]
 
         # Subscripted: collect element labels per dimension
         dim_names = list(comp_dims.keys())
         dim_elems = [comp_dims[d] for d in dim_names]  # list of label lists
+        if self.backend == "mtk":
+            self.aux_decls.append(
+                f"@variables {identifier}(t)[{', '.join(f'1:{len(e)}' for e in dim_elems)}]")
 
         self._tab_data_entries.append((identifier, real_name, method_sym, dim_elems))
 
@@ -2964,9 +3048,8 @@ class JuliaSectionBuilder:
                     self.lookup_const_decls.append(const_decl)
                 else:
                     self.lookup_const_decls.append(
-                        f"const {itp_name} = LinearInterpolation([0.0], [0.0];"
-                        " extrapolation_left=ExtrapolationType.Constant,"
-                        " extrapolation_right=ExtrapolationType.Constant)"
+                        # (an element with no definition: NaN, as Python PySD)
+                        f"const {itp_name} = _ -> NaN"
                     )
                 itp_names.append(itp_name)
             arr_name = f"{identifier}_itps"
@@ -3005,9 +3088,7 @@ class JuliaSectionBuilder:
                         self.lookup_const_decls.append(const_decl)
                     else:
                         self.lookup_const_decls.append(
-                            f"const {itp_name} = LinearInterpolation([0.0], [0.0];"
-                            " extrapolation_left=ExtrapolationType.Constant,"
-                            " extrapolation_right=ExtrapolationType.Constant)"
+                            f"const {itp_name} = _ -> NaN"
                         )
                     row_itp_names.append(itp_name)
                 row_lists.append("[" + ", ".join(row_itp_names) + "]")
@@ -3922,10 +4003,16 @@ class JuliaSectionBuilder:
             parts.append((comp, elems))
         target = next((r for r, e in self._subs_elems.items()
                        if isinstance(e, list) and sorted(e) == sorted(covered)), None)
+        empty = "zeros({})"
         if target is None:
-            return None
+            # defined over part of the variable's range: the rest is NaN, as
+            # Python PySD
+            dims = self._element_dims(elem)
+            if len(dims) != 1 or not set(covered) <= set(self._subs_elems.get(dims[0][0], [])):
+                return None
+            target, empty = dims[0][0], "fill(NaN, {})"
         order = self._subs_elems[target]
-        lines = [f"let _v = zeros({len(order)})"]
+        lines = [f"let _v = {empty.format(len(order))}"]
         for comp, elems in parts:
             positions = ", ".join(str(order.index(e) + 1) for e in elems)
             if isinstance(comp.ast, GetConstantsStructure):
@@ -4456,8 +4543,19 @@ class JuliaSectionBuilder:
         return header
 
     def _helpers_block(self) -> str:
-        # Helpers are provided by `using PySD` — nothing to inline.
-        return ""
+        # Helpers are provided by `using PySD`; with MTK, the allocations as
+        # one element each, registered so that MTK calls them as they are
+        # (they sort and search numbers) when the model runs
+        out = []
+        if "by_priority" in self._mtk_allocate:
+            out += ["_allocate_by_priority(request::AbstractVector, priority::AbstractVector, width::Real, supply::Real, i::Integer) =",
+                    "    pysd_allocate_by_priority(request, priority, width, supply)[i]",
+                    "@register_symbolic _allocate_by_priority(request::AbstractVector, priority::AbstractVector, width::Real, supply::Real, i::Integer)"]
+        if "available" in self._mtk_allocate:
+            out += ["_allocate_available(request::AbstractVector, pp::AbstractMatrix, avail::Real, i::Integer) =",
+                    "    pysd_allocate_available(request, pp, avail)[i]",
+                    "@register_symbolic _allocate_available(request::AbstractVector, pp::AbstractMatrix, avail::Real, i::Integer)"]
+        return "# ALLOCATE, one element at a time\n" + "\n".join(out) + "\n\n" if out else ""
 
     def _tab_data_block(self) -> str:
         """Emit tab-file DATA variable infrastructure (only when DataStructure
@@ -4520,6 +4618,9 @@ class JuliaSectionBuilder:
         lines.append("end")
         lines.append("")
         lines.append("_tab_val(key::String, t::Real) = haskey(_tab_data, key) ? Float64(_tab_data[key](t)) : 0.0")
+        if self.backend == "mtk":
+            # read when the model runs (the files are loaded then), not when built
+            lines.append("@register_symbolic _tab_val(key::String, t::Real)")
         lines.append("")
 
         # NC data-file infrastructure: registry + _load_nc_data!
@@ -5252,7 +5353,17 @@ class JuliaSectionBuilder:
                     return f"{m.group(1)}d.{name}[{k - idx + 1}] = {m.group(3)}"
         return line
 
+    def _control_equations_mtk(self) -> List[str]:
+        """The control variables as equations, when they change during the run."""
+        if not self._dynamic_controls():
+            return []
+        defaults = {"initial_time": "_initial_time", "final_time": "100.0",
+                    "time_step": "1.0", "saveper": "time_step"}
+        return [f"{name} ~ {self.control_vals.get(name) or defaults[name]}"
+                for name in ("initial_time", "final_time", "time_step", "saveper")]
+
     def _equations_block_mtk(self, equations: List[str]) -> str:
+        equations = list(equations) + self._control_equations_mtk()
         if not equations:
             return "eqs = Equation[]\n"
         eq_lines = ",\n    ".join(equations)
@@ -5754,6 +5865,30 @@ class JuliaSectionBuilder:
         lines += ["", "u0 = initial_state()"]
         return "\n".join(lines) + "\n"
 
+    def _active_initials_mtk(self) -> Dict[str, str]:
+        """The variables defined by ACTIVE INITIAL(expr, initial): their initial
+        expressions, by name."""
+        out = {}
+        for name, (eqs, _) in self.built_elements.items():
+            for eq in eqs:
+                m = re.match(rf"\s*{re.escape(name)}\s*~\s*pysd_active_initial\((.*)\)\s*$", eq)
+                if not m:
+                    continue
+                args, depth, start = [], 0, 0
+                text = m.group(1)
+                for i, ch in enumerate(text):
+                    if ch in "([{":
+                        depth += 1
+                    elif ch in ")]}":
+                        depth -= 1
+                    elif ch == "," and depth == 0:
+                        args.append(text[start:i])
+                        start = i + 1
+                args.append(text[start:])
+                if len(args) == 2 and depth == 0:
+                    out[name] = args[1].strip()
+        return out
+
     def _u0_block_mtk(self) -> str:
         if not self.u0_entries:
             return "u0 = Pair{Num, Float64}[]\n"
@@ -5766,11 +5901,21 @@ class JuliaSectionBuilder:
                 m = re.match(r"(\w+)\s*=\s*(.+)", rest)
                 if m:
                     param_values[m.group(1)] = m.group(2).strip()
+        initials = self._active_initials_mtk()
         lines = []
         for entry in self.u0_entries:
             if "=>" in entry:
                 lhs, rhs = entry.split("=>", 1)
                 rhs = rhs.strip()
+                # an ACTIVE INITIAL variable starts from its initial value (MTK
+                # would follow its equation, the active value)
+                for _ in range(len(initials)):
+                    new = re.sub(r"\b(\w+)\b(?!\s*\()",
+                                 lambda m: f"({initials[m.group(1)]})" if m.group(1) in initials else m.group(1),
+                                 rhs)
+                    if new == rhs:
+                        break
+                    rhs = new
                 m_rng = re.match(r"\s*(\w+)\[(\d+):(\d+)(.*)\]\s*$", lhs)
                 if m_rng:  # all stages of a pipeline cell
                     for pname, pval in param_values.items():
@@ -5799,7 +5944,7 @@ class JuliaSectionBuilder:
         """Whether a control variable depends on Time or on model variables
         (e.g. FINAL TIME = IF THEN ELSE(x > 50, Time, 100)).  The ODE
         backend then evaluates them at every step, as Python PySD."""
-        return self.backend == "ode" and any(
+        return self.backend in ("ode", "mtk") and any(
             self._control_unknowns(self.control_vals.get(name) or "")
             for name in self._CONTROL_NAMES
         )
@@ -5814,6 +5959,18 @@ class JuliaSectionBuilder:
                 if self._control_unknowns(expr) <= {"t"}:
                     return re.sub(r"\bt\b", when, expr)
                 return default
+            if self.backend == "mtk":
+                if self._uses_ticks():
+                    raise ValueError(
+                        "MTK backend: fixed delays, samples and random draws move by steps of TIME "
+                        "STEP, which changes during the run here; use backend='ode' or 'dsl'")
+                return (
+                    "# Simulation control.  These change during the run: variables of the\n"
+                    "# system (their equations are with the others), which run_model reads\n"
+                    "# at every step; the run starts from INITIAL TIME at time 0.\n"
+                    "@variables initial_time(t) final_time(t) time_step(t) saveper(t)\n"
+                    f"const _initial_time = {at_start(it, '0.0', '0.0')}\n"
+                )
             return (
                 "# Simulation control.  These change during the run: observe and\n"
                 "# run_model evaluate them at every time; the values here are the\n"
@@ -5978,6 +6135,63 @@ class JuliaSectionBuilder:
             """).replace("{TAB_LOAD}", tab_lines).replace("{CHECK}", check)
 
     def _run_function_mtk(self) -> str:
+        # data files read when the model runs, as the ODE backend's
+        has_tab = bool(self._tab_data_entries)
+        tab_param = ", tab_data_files=String[], nc_data_files=String[]" if has_tab else ""
+        tab_load = ("\n    isempty(tab_data_files) || _load_tab_data!(tab_data_files)"
+                    "\n    isempty(nc_data_files) || _load_nc_data!(nc_data_files)") if has_tab else ""
+        if self._dynamic_controls():
+            # As Python PySD: Euler steps of the current TIME STEP until the
+            # time reaches the current FINAL TIME, saved every current SAVEPER
+            return textwrap.dedent("""\
+                u0_map = Dict(Symbolics.unwrap(k) => v for (k, v) in u0)
+                u0_full = isempty(unknowns(sys)) ? u0 :
+                    [x => get(u0_map, x, 0.0) for x in unknowns(sys)]
+                prob = ODEProblem(sys, u0_full, (_initial_time, Inf); build_initializeprob = false)
+                # their values at the start
+                tspan = (_initial_time, prob[final_time])
+
+                # The control variables change during the run, so (as Python PySD)
+                # the model takes Euler steps of the current TIME STEP until the
+                # time reaches the current FINAL TIME, and saves every current
+                # SAVEPER from the initial time.
+                function run_model(; u0=u0_full, solver=Euler(){TAB_PARAM}){TAB_LOAD}
+                    isempty(unknowns(sys)) && return _run_without_stocks(solver)
+                    integ = init(remake(prob; u0=u0), solver; dt=prob[time_step], adaptive=false,
+                                 save_everystep=false, save_start=false, save_end=false)
+                    while true
+                        h = integ[time_step]
+                        prec = h * 1e-5
+                        elapsed = integ.t - _initial_time
+                        every = integ[saveper]
+                        if mod(elapsed, every) < prec || mod(-elapsed, every) < prec
+                            OrdinaryDiffEq.SciMLBase.savevalues!(integ, true)
+                        end
+                        integ.t + prec < integ[final_time] || break
+                        OrdinaryDiffEq.SciMLBase.set_proposed_dt!(integ, h)
+                        step!(integ)
+                    end
+                    return integ.sol
+                end
+
+                # Without stocks there is nothing to step: the times from the
+                # settings, then the values there
+                const _settings = ModelingToolkit.SymbolicIndexingInterface.observed(
+                    sys, [time_step, saveper, final_time])
+                function _run_without_stocks(solver)
+                    t, ts = _initial_time, Float64[]
+                    while true
+                        h, every, stop = _settings(Float64[], prob.p, t)
+                        prec = h * 1e-5
+                        elapsed = t - _initial_time
+                        (mod(elapsed, every) < prec || mod(-elapsed, every) < prec) && push!(ts, t)
+                        t + prec < stop || break
+                        t += h
+                    end
+                    return solve(remake(prob; tspan=(_initial_time, t)), solver; dt=prob[time_step],
+                                 saveat=ts, adaptive=false)
+                end
+                """).replace("{TAB_PARAM}", tab_param).replace("{TAB_LOAD}", tab_load)
         ts = self.control_vals.get("time_step") or "time_step"
         # The unknowns are matched to u0 by name (structural_simplify may
         # reorder them, and may add unknowns from algebraic loops, which start
@@ -5987,7 +6201,9 @@ class JuliaSectionBuilder:
         warn_def, warn_call = self._stepwise_guard()
         guard, check = guard + warn_def, check + warn_call
         if self._uses_ticks():
-            values = ", ".join(self._tick_records)
+            # (the delays' own values too: computing them at the first tick
+            # freezes their initial values, as the ODE backend's model! does)
+            values = ", ".join(self._tick_records + self._tick_delays)
             records = "\n".join(f"    pysd_record!(_ticks, {k}, v[{k}])"
                                  for k in range(1, len(self._tick_records) + 1))
             record = textwrap.dedent("""\
@@ -6018,7 +6234,7 @@ class JuliaSectionBuilder:
                 prob = ODEProblem(sys, u0_full, tspan; build_initializeprob = false)
 
                 """) + ticks + guard + textwrap.dedent(f"""\
-                function run_model(; u0=u0_full, tspan=tspan, dt={ts}, solver=Euler(), kwargs...)
+                function run_model(; u0=u0_full, tspan=tspan, dt={ts}, solver=Euler(){tab_param}, kwargs...){tab_load}
                 {{CHECK}}    prob_local = remake(prob; u0=u0, tspan=tspan, callback=_ticks_callback(tspan[2]))
                     sol = solve(prob_local, solver; dt=dt, saveat=tspan[1]:dt:tspan[2], adaptive=false, kwargs...)
                     pysd_free_ticks!(_ticks)
@@ -6031,7 +6247,7 @@ class JuliaSectionBuilder:
                 [x => get(u0_map, x, 0.0) for x in unknowns(sys)]
             prob = ODEProblem(sys, u0_full, tspan; build_initializeprob = false)
 
-            {{GUARD}}function run_model(; u0=u0_full, tspan=tspan, dt={ts}, solver=Euler())
+            {{GUARD}}function run_model(; u0=u0_full, tspan=tspan, dt={ts}, solver=Euler(){tab_param}){tab_load}
             {{CHECK}}    prob_local = remake(prob; u0=u0, tspan=tspan)
                 solve(prob_local, solver; dt=dt, saveat=tspan[1]:dt:tspan[2], adaptive=false)
             end

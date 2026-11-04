@@ -46,6 +46,7 @@ from _pytest.mark.structures import ParameterSet
 
 from pysd.builders.julia.julia_model_builder import expand_subscript_ranges
 from pysd.builders.julia.namespace import JuliaNamespaceManager
+from pysd.py_backend.external import ExtSubscript
 from pysd.py_backend.utils import detect_encoding, load_outputs
 from pysd.tools.benchmarking import assert_frames_close
 
@@ -90,30 +91,10 @@ MTK_SCOPE = os.environ.get("PYSD_JULIA_MTK", "all")
 
 #: (case, backend) -> reason.  Strict xfail: remove the entry once it passes.
 KNOWN_FAILURES = {
-    # partially defined variables (#500)
-    ("vensim:get_mixed_definitions", "mtk"): "GET DATA and GET CONSTANTS in one variable: call with the wrong arguments (#500)",
-    ("vensim:get_mixed_definitions", "ode"): "GET DATA and GET CONSTANTS in one variable: call with the wrong arguments (#500)",
-    ("vensim:partial_range_definitions", "mtk"): "partially defined lookups and data: placeholders and element mapping (#500)",
-    ("vensim:partial_range_definitions", "ode"): "partially defined lookups and data: placeholders and element mapping (#500)",
-    # values differ from the reference (#499)
-    ("vensim:active_initial", "mtk"): "values differ from the reference (#499)",
-    # generated code refers to an undefined name (#500)
-    ("vensim:data_from_other_model", "mtk"): "generated code refers to an undefined name (#500)",
-    # variables missing from the Julia output (#499)
-    ("vensim:get_subscript_3d_arrays_xls", "mtk"): "variables missing from the Julia output (#499)",
-    ("vensim:get_subscript_3d_arrays_xls", "ode"): "variables missing from the Julia output (#499)",
-    # MTK: indexing a symbolic array out of its declared shape (#502)
-    ("vensim:allocate_available", "mtk"): "MTK: indexing a symbolic array out of its declared shape (#502)",
-    # lookup emitted as a constant but called as a function (#500)
-    # MTK: symbolic value in an if/else condition (#502)
-    ("vensim:control_vars", "mtk"): "MTK: symbolic value in an if/else condition (#502)",
-    ("vensim:dynamic_final_time", "mtk"): "MTK: symbolic value in an if/else condition (#502)",
-    # MTK: building the system takes longer than the timeout
-    ("vensim:vector_select", "mtk"): "MTK: VECTOR SELECT with symbolic selections: building the system takes longer than the timeout",
-    # MTK: initial value depends on other variables (#502)
-    ("vensim:active_initial_circular", "mtk"): "MTK: initial value depends on other variables (#502)",
-    # MTK: numeric conversion of a symbolic value (#502)
-    ("vensim:allocate_by_priority", "mtk"): "MTK: numeric conversion of a symbolic value (#502)",
+    # MTK: VECTOR SELECT with symbolic selections: right values, but building
+    # the system takes more than the 600 s timeout (about 15 minutes)
+    ("vensim:vector_select", "mtk"): "MTK: building the system takes longer than the timeout",
+    # MTK: its symbolic simplification changes the last digit before a rounding
     ("vensim:subscripted_round", "mtk"): "values differ from the reference (#499)",
 }
 
@@ -258,9 +239,15 @@ def _id_map(model_file, columns):
     plain = {}
     for section in am.sections:
         for sr in section.subscripts:
-            if isinstance(sr.subscripts, list):
-                ranges[_plain_name(sr.name)] = [_plain_name(s) for s in sr.subscripts]
-                for i, label in enumerate(sr.subscripts):
+            elements = sr.subscripts
+            if isinstance(elements, dict):          # GET DIRECT SUBSCRIPT: read, as the builder does
+                elements = ExtSubscript(
+                    file_name=elements["file"], tab=elements["tab"], firstcell=elements["firstcell"],
+                    lastcell=elements["lastcell"], prefix=elements["prefix"], root=model_file.parent,
+                ).subscript
+            if isinstance(elements, list):
+                ranges[_plain_name(sr.name)] = [_plain_name(s) for s in elements]
+                for i, label in enumerate(elements):
                     labels.setdefault(_plain_name(label), i + 1)
     for section in am.sections:
         for sr in section.subscripts:

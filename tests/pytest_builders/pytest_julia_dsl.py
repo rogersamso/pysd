@@ -435,6 +435,24 @@ b = +a * Time
     assert re.search(r"b ~ a \* t", code)
 
 
+def test_macro_with_several_outputs(tmp_path):
+    # PySD's parser doesn't read their calls yet; a macro section that has
+    # them stops the translation, naming it
+    import dataclasses
+    from pysd.translators.vensim.vensim_file import VensimFile
+    from pysd.builders.julia.dsl_builder import DSLError, _expand_macros
+    path = tmp_path / "macro.mdl"
+    path.write_text("{UTF-8}\n:MACRO: TWO(a)\nTWO = a + 1\n\t~\tDmnl\n\t~\t\t|\n\n:END OF MACRO:\n"
+                    "y = TWO(1)\n\t~\tDmnl\n\t~\t\t|\n\n" + CONTROL, encoding="utf-8")
+    vf = VensimFile(path)
+    vf.parse()
+    model = vf.get_abstract_model()
+    macro = dataclasses.replace(model.sections[1], returns=["second"])
+    model = dataclasses.replace(model, sections=(model.sections[0], macro))
+    with pytest.raises(DSLError, match="macro two: macros with several outputs"):
+        _expand_macros(model)
+
+
 def test_pulse_with_times_of_an_array(tmp_path):
     _, code = translate(tmp_path, """
 dim: a, b
