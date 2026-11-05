@@ -81,6 +81,16 @@ from pysd.translators.structures.abstract_model import (
 # ---------------------------------------------------------------------------
 
 
+_REPO = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _in_tmp_path(tmp_path, monkeypatch):
+    """The sections here have a relative path: what they write goes to a
+    temporary folder, not to the folder the tests run from."""
+    monkeypatch.chdir(tmp_path)
+
+
 def _make_section(
     elements=None,
     subscripts=(),
@@ -1247,7 +1257,7 @@ class TestTranslateToJulia:
     def test_vensim_model_produces_jl_file(self, tmp_path):
         """End-to-end smoke test with the split_model fixture."""
         import shutil
-        src = Path("tests/more-tests/split_model/test_split_model.mdl")
+        src = _REPO.joinpath("tests/more-tests/split_model/test_split_model.mdl")
         if not src.exists():
             pytest.skip("test-models submodule not checked out")
 
@@ -4506,7 +4516,7 @@ class TestMacroExpansion:
         """No 'not found in namespace' or 'Unknown Vensim function' warnings."""
         import shutil
         import warnings
-        mdl_src = Path("tests/test-models/tests/macro_expression/test_macro_expression.mdl")
+        mdl_src = _REPO.joinpath("tests/test-models/tests/macro_expression/test_macro_expression.mdl")
         if not mdl_src.exists():
             pytest.skip("macro_expression model not found")
         dst = tmp_path / "test_macro_expression.mdl"
@@ -4747,7 +4757,7 @@ class TestMdlFileTranslation:
     def test_data_from_other_model_emits_tab_infrastructure(self, tmp_path):
         """data_from_other_model (DataStructure + AbstractData) emits tab-data helpers."""
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/data_from_other_model/test_data_from_other_model.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/data_from_other_model/test_data_from_other_model.mdl")
         if not mdl.exists():
             pytest.skip("data_from_other_model test model not found")
         dst = tmp_path / mdl.name
@@ -4765,7 +4775,7 @@ class TestMdlFileTranslation:
     def test_data_from_other_model_no_unsupported_warning(self, tmp_path):
         """DataStructure variables should not produce 'not supported' warnings."""
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/data_from_other_model/test_data_from_other_model.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/data_from_other_model/test_data_from_other_model.mdl")
         if not mdl.exists():
             pytest.skip("data_from_other_model test model not found")
         dst = tmp_path / mdl.name
@@ -4784,7 +4794,7 @@ class TestMdlFileTranslation:
         comparisons.  They must resolve to integer indices, not emit 'not found'.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/conditional_subscripts/test_conditional_subscripts.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/conditional_subscripts/test_conditional_subscripts.mdl")
         if not mdl.exists():
             pytest.skip("conditional_subscripts test model not found")
         dst = tmp_path / mdl.name
@@ -4802,7 +4812,7 @@ class TestMdlFileTranslation:
         index (2 for 'B', 3 for 'C'), not an undefined variable 'b' or 'c'.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/conditional_subscripts/test_conditional_subscripts.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/conditional_subscripts/test_conditional_subscripts.mdl")
         if not mdl.exists():
             pytest.skip("conditional_subscripts test model not found")
         dst = tmp_path / mdl.name
@@ -4822,7 +4832,7 @@ class TestMdlFileTranslation:
         module object to visitor.visit() instead of an AST node.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/forecast/test_forecast.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/forecast/test_forecast.mdl")
         if not mdl.exists():
             pytest.skip("forecast test model not found")
         dst = tmp_path / mdl.name
@@ -4846,7 +4856,7 @@ class TestMdlFileTranslation:
         element has been processed.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/forecast/test_forecast.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/forecast/test_forecast.mdl")
         if not mdl.exists():
             pytest.skip("forecast test model not found")
         dst = tmp_path / mdl.name
@@ -4912,7 +4922,7 @@ class TestMdlFileTranslation:
         must emit ODE equations, not an 'Unsupported AST node type IntegStructure' warning.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/except/test_except.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/except/test_except.mdl")
         if not mdl.exists():
             pytest.skip("except test model not found")
         dst = tmp_path / mdl.name
@@ -4932,7 +4942,7 @@ class TestMdlFileTranslation:
         0.0 assignments.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/except/test_except.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/except/test_except.mdl")
         if not mdl.exists():
             pytest.skip("except test model not found")
         dst = tmp_path / mdl.name
@@ -4951,7 +4961,7 @@ class TestMdlFileTranslation:
         'Unsupported AST node type LookupsStructure' warnings.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/subscripted_lookups/test_subscripted_lookups.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/subscripted_lookups/test_subscripted_lookups.mdl")
         if not mdl.exists():
             pytest.skip("subscripted_lookups test model not found")
         dst = tmp_path / mdl.name
@@ -4970,7 +4980,7 @@ class TestMdlFileTranslation:
         must contain proper lookup functions with per-element interpolants.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/subscripted_lookups/test_subscripted_lookups.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/subscripted_lookups/test_subscripted_lookups.mdl")
         if not mdl.exists():
             pytest.skip("subscripted_lookups test model not found")
         dst = tmp_path / mdl.name
@@ -4991,7 +5001,7 @@ class TestMdlFileTranslation:
         and use its identifier as the input to the outer SMOOTH.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/arguments/test_arguments.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/arguments/test_arguments.mdl")
         if not mdl.exists():
             pytest.skip("arguments test model not found")
         dst = tmp_path / mdl.name
@@ -5010,7 +5020,7 @@ class TestMdlFileTranslation:
         equations for both the inner delay pipeline and the outer smooth levels.
         """
         import shutil, warnings
-        mdl = Path("tests/test-models/tests/arguments/test_arguments.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/arguments/test_arguments.mdl")
         if not mdl.exists():
             pytest.skip("arguments test model not found")
         dst = tmp_path / mdl.name
@@ -5044,7 +5054,7 @@ class TestMdlFileTranslation:
         """GET DIRECT SUBSCRIPT from Excel: subscript sizes are read from file, no reshape warning."""
         import shutil, warnings
         from pathlib import Path
-        mdl_src = Path("tests/test-models/tests/get_subscript_3d_arrays_xls/test_get_subscript_3d_arrays_xls.mdl")
+        mdl_src = _REPO.joinpath("tests/test-models/tests/get_subscript_3d_arrays_xls/test_get_subscript_3d_arrays_xls.mdl")
         if not mdl_src.exists():
             pytest.skip("get_subscript_3d_arrays_xls model not found")
         # Copy entire folder (Excel file must be present)
@@ -5066,7 +5076,7 @@ class TestMdlFileTranslation:
 class TestXmileDelayFixed:
     """XMILE DELAY(x, n) used inline inside an arithmetic expression."""
 
-    TEST_MODELS = Path("tests/test-models/tests")
+    TEST_MODELS = _REPO.joinpath("tests/test-models/tests")
 
     def test_delay_xmile_no_unsupported_warning(self, tmp_path):
         """DELAY(X, n) embedded in arithmetic must not emit 'Unsupported AST' warning."""
@@ -5141,7 +5151,7 @@ class TestEmbeddedDelayDrain2D:
 class TestXmileMinMax:
     """XMILE MIN/MAX over an entire subscript dimension."""
 
-    TEST_MODELS = Path("tests/test-models/tests")
+    TEST_MODELS = _REPO.joinpath("tests/test-models/tests")
 
     def test_min_max_1arg_no_unknown_function_warning(self, tmp_path):
         """MIN(arr[dim]) in XMILE must not emit 'Unknown Vensim function' warning."""
@@ -5193,7 +5203,7 @@ class TestNcDataFiles:
     Models without any DATA variables must emit none of the above.
     """
 
-    TEST_MODELS = Path("tests/test-models/tests/data_from_other_model")
+    TEST_MODELS = _REPO.joinpath("tests/test-models/tests/data_from_other_model")
 
     def _translate(self, tmp_path):
         import shutil
@@ -5372,7 +5382,7 @@ class TestInvertMatrix:
     def test_invert_matrix_translation_from_mdl(self, tmp_path):
         """Full pipeline: translate test_invert_matrix.mdl and check output."""
         import shutil
-        mdl = Path("tests/test-models/tests/invert_matrix/test_invert_matrix.mdl")
+        mdl = _REPO.joinpath("tests/test-models/tests/invert_matrix/test_invert_matrix.mdl")
         if not mdl.exists():
             pytest.skip("invert_matrix test model not found")
         shutil.copy(mdl, tmp_path / mdl.name)
@@ -7469,7 +7479,7 @@ class TestModuleConstantsNotShadowed:
 
     def test_external_constant_is_not_reallocated(self, tmp_path):
         import shutil, warnings
-        src = Path("tests/test-models/tests/with_lookup")
+        src = _REPO.joinpath("tests/test-models/tests/with_lookup")
         if not src.exists():
             pytest.skip("with_lookup test model not found")
         for f in src.iterdir():

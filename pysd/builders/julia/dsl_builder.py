@@ -368,6 +368,7 @@ class DSLBuilder:
                     continue
                 self.changing[clean(el.name)] = el
             try:
+                self._last_parts(el)
                 self._split_exceptions(el)
             except DSLError as err:
                 self.kind_errors.append(f"{el.name}: {err}")
@@ -402,6 +403,45 @@ class DSLBuilder:
         main = min((q for q, els in self.ranges.items() if own <= set(els)),
                    key=lambda q: (-len(self.ranges[q]), q))
         return self.ranges[main].index(elem) + 1
+
+    def _cells(self, c) -> Tuple[List[List[str]], set]:
+        """A part's elements at each position, and the combinations it defines."""
+        subs, excs = c.subscripts
+        sels = [self._selected(s) for s in subs]
+        cells = set(itertools.product(*sels))
+        for x in excs or []:
+            cells -= set(itertools.product(*(self._selected(s) for s in x)))
+        return sels, cells
+
+    def _last_parts(self, el):
+        """Parts that define some elements again (Vensim rejects them): each
+        element keeps its last definition, as in the MTK backend; the earlier
+        parts are narrowed to what is left, or dropped."""
+        if len(el.components) < 2:
+            return
+        out, later, changed = [], set(), False
+        for c in reversed(el.components):
+            sels, cells = self._cells(c)
+            kept = cells - later
+            if kept == cells:
+                out.append(c)
+            elif kept:
+                if isinstance(c.ast, np.ndarray):
+                    raise DSLError(f"{el.name}: parts with array values that define "
+                                   "some elements again are not supported yet")
+                subs = list(c.subscripts[0])
+                pieces = self._pieces(subs, sels, set(itertools.product(*sels)) - kept)
+                for piece in reversed(pieces):
+                    names = [name for name, _ in piece]
+                    exceptions = [names[:p] + [x] + names[p + 1:]
+                                  for p, (_, ex) in enumerate(piece) for x in sorted(ex)]
+                    out.append(dataclasses.replace(c, subscripts=(names, exceptions)))
+            changed |= kept != cells
+            later |= cells
+        if changed:
+            warnings.warn(f"'{el.name}' defines some elements more than once: "
+                          "the last definition is used.")
+            el.components = out[::-1]
 
     def _split_exceptions(self, el):
         """A part with an :EXCEPT: narrower at several positions ([store, product]

@@ -394,6 +394,46 @@ x[a] = 2
     assert "x[dim = At(:a)]" in code or "x[dim = Not(At(:a))]" in code
 
 
+def test_elements_defined_again_keep_the_last_definition(tmp_path):
+    with pytest.warns(UserWarning, match="'two d' defines some elements more than once"):
+        _, code = translate(tmp_path, """
+cat: a, b, c
+	~	~		|
+
+reg: r1, r2
+	~	~		|
+
+two d[cat, reg] = 1
+	~	Dmnl
+	~		|
+
+two d[b, r2] = 5 + Time
+	~	Dmnl
+	~		|
+""")
+    assert "two_d[cat = Not(At(:b))] ~ 1" in code
+    assert "two_d[cat = At([:b]), reg = At([:r1])] ~ 1" in code
+    assert "two_d[cat = At(:b), reg = At(:r2)] ~ 5 + t" in code
+
+
+def test_part_defined_again_whole_is_left_out(tmp_path):
+    with pytest.warns(UserWarning, match="'x' defines some elements more than once"):
+        _, code = translate(tmp_path, """
+dim: a, b, c
+	~	~		|
+
+x[dim] :EXCEPT: [b] = 1
+	~	Dmnl
+	~		|
+
+x[dim] = 2
+	~	Dmnl
+	~		|
+""")
+    assert "x[dim] = 2" in code
+    assert " = 1" not in code.split("@parameters", 1)[1].split("end", 1)[0]
+
+
 def test_excel_constant_in_a_variable_that_changes_with_time(tmp_path):
     _, code = translate(tmp_path, """
 growth = GET DIRECT CONSTANTS('inputs.xlsx', 'Sheet1', 'B2') * Time
