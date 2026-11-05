@@ -499,15 +499,15 @@ class TestJuliaASTVisitor:
 
     @pytest.mark.parametrize("vensim_name,julia_name", [
         ("ABS", "abs"),
-        ("EXP", "pysd_exp"),         # the C maths library, as Python
-        ("LN", "pysd_ln"),          # NaN out of the domain, as numpy
-        ("SQRT", "pysd_sqrt"),
-        ("SIN", "pysd_sin"),
-        ("COS", "pysd_cos"),
-        ("TAN", "pysd_tan"),
-        ("ARCSIN", "pysd_asin"),
-        ("ARCCOS", "pysd_acos"),
-        ("ARCTAN", "pysd_atan"),
+        ("EXP", "PythonMath.exp"),   # the C maths library, as Python
+        ("LN", "PythonMath.log"),    # NaN out of the domain, as numpy
+        ("SQRT", "PythonMath.sqrt"),
+        ("SIN", "PythonMath.sin"),
+        ("COS", "PythonMath.cos"),
+        ("TAN", "PythonMath.tan"),
+        ("ARCSIN", "PythonMath.asin"),
+        ("ARCCOS", "PythonMath.acos"),
+        ("ARCTAN", "PythonMath.atan"),
         ("MIN", "min"),
         ("MAX", "max"),
         ("INTEGER", "trunc"),
@@ -603,7 +603,7 @@ class TestJuliaASTVisitor:
             arguments=(1.0,),
         )
         result = v.visit(node)
-        assert result == "pysd_sinh(1.0)"
+        assert result == "PythonMath.sinh(1.0)"
 
     def test_cosh_maps_directly(self):
         v, *_ = _visitor_with_namespace()
@@ -612,7 +612,7 @@ class TestJuliaASTVisitor:
             arguments=(1.0,),
         )
         result = v.visit(node)
-        assert result == "pysd_cosh(1.0)"
+        assert result == "PythonMath.cosh(1.0)"
 
     def test_tanh_maps_directly(self):
         v, *_ = _visitor_with_namespace()
@@ -623,7 +623,7 @@ class TestJuliaASTVisitor:
         result = v.visit(node)
         assert result == "tanh(1.0)"
 
-    def test_quantum_pulls_in_trunc(self):
+    def test_quantum_is_a_helper(self):
         v, _, _, needed = _visitor_with_namespace()
         node = CallStructure(
             function=ReferenceStructure(reference="quantum"),
@@ -632,7 +632,23 @@ class TestJuliaASTVisitor:
         result = v.visit(node)
         assert "pysd_quantum" in result
         assert "pysd_quantum" in needed
-        assert "pysd_trunc" in needed
+
+    def test_integer_is_julias_trunc(self):
+        v, *_ = _visitor_with_namespace()
+        node = CallStructure(function=ReferenceStructure(reference="integer"), arguments=(-2.5,))
+        assert v.visit(node) == "trunc(-2.5)"
+
+    def test_integer_in_symbolic_equations(self):
+        """Symbolics has no trunc: toward zero, of floor and ceil (MTK)."""
+        v, *_ = _visitor_with_namespace()
+        v.symbolic = True
+        node = CallStructure(function=ReferenceStructure(reference="integer"), arguments=(-2.5,))
+        assert v.visit(node) == "ifelse(-2.5 < 0, ceil(-2.5), floor(-2.5))"
+
+    def test_log_with_a_base_is_a_quotient_of_logarithms(self):
+        v, *_ = _visitor_with_namespace()
+        node = CallStructure(function=ReferenceStructure(reference="log"), arguments=(8.0, 2.0))
+        assert v.visit(node) == "(PythonMath.log(8.0) / PythonMath.log(2.0))"
 
     def test_random_uniform_registered(self):
         v, _, _, needed = _visitor_with_namespace()
@@ -9244,9 +9260,17 @@ stock= INTEG(1, x) ~ ~ |
 inflow= Time + 2 ~ ~ |
 delayed= DELAY FIXED(inflow, 3, inflow) ~ ~ |
 """, "mtk")
-        assert "observed(sys, [_df_in_delayed, delayed])" in content
-        assert "pysd_record!(_ticks, 1, v[1])" in content
-        assert "pysd_record!(_ticks, 2," not in content
+        assert "_ticked = ModelingToolkit.SymbolicIndexingInterface.observed(sys, [_df_in_delayed])" in content
+        assert "_initials = ModelingToolkit.SymbolicIndexingInterface.observed(sys, [delayed])" in content
+        assert "pysd_at_first_tick(() -> _initials(u, p, t), _ticks)" in content
+
+    def test_fixed_delay_with_a_number_as_initial_value_not_computed_at_ticks(self, tmp_path):
+        content = _translate_controls(tmp_path, """
+inflow= Time + 2 ~ ~ |
+delayed= DELAY FIXED(inflow, 3, 5) ~ ~ |
+""", "mtk")
+        assert "_initials" not in content
+        assert "pysd_at_first_tick" not in content
 
     def test_allocate_by_priority_is_registered_one_element_at_a_time(self, tmp_path):
         content = _translate_controls(tmp_path, """
@@ -9313,3 +9337,90 @@ pc[a]= GET DIRECT CONSTANTS('in.xlsx', 'S', 'D3') ~ ~ |
         assert "let _v = fill(NaN, 3)" in content
         assert '_v[[3]] .= pysd_xlsx_read_constant(joinpath(@__DIR__, "in.xlsx"), "S", "B2")' in content
         assert '_v[[1]] .= pysd_xlsx_read_constant(joinpath(@__DIR__, "in.xlsx"), "S", "D3")' in content
+
+
+class TestMtkModelsMore:
+    """MTK: ALLOCATE AVAILABLE, DATA variables from .tab files and chained
+    ACTIVE INITIALs."""
+
+    def test_allocate_available_is_registered_one_element_at_a_time(self, tmp_path):
+        content = _translate_controls(tmp_path, """
+r: r1, r2 ~ ~ |
+p: ptype, ppriority, pwidth, pextra ~ ~ |
+req[r]= 3, 4 ~ ~ |
+pp[r, p]= 1, 5, 1, 0; 1, 3, 1, 0; ~ ~ |
+supply= Time ~ ~ |
+alloc[r]= ALLOCATE AVAILABLE(req[r], pp[r, ptype], supply) ~ ~ |
+""", "mtk")
+        assert ("@register_symbolic _allocate_available(request::AbstractVector, "
+                "pp::AbstractMatrix, avail::Real, i::Integer)") in content
+        assert "_allocate_available([req[_v] for _v in 1:N_R]," in content
+
+    def test_tab_data_declared_and_registered(self, tmp_path):
+        """A DATA variable read from .tab files: declared, and its value read
+        while the system runs, not once while it is built."""
+        content = _translate_controls(tmp_path, """
+r: r1, r2 ~ ~ |
+scalar data:INTERPOLATE: ~ ~ |
+array data[r]:HOLD BACKWARD: ~ ~ |
+out[r]= scalar data + array data[r] ~ ~ |
+""", "mtk")
+        assert "@variables scalar_data(t)" in content
+        assert "@variables array_data(t)[1:2]" in content
+        assert "[array_data[_i] ~ _tab_val(\"array_data_$(_i)\", t) for _i in 1:2]..." in content
+        assert "@register_symbolic _tab_val(key::String, t::Real)" in content
+
+    def test_stock_starts_from_chained_active_initials(self, tmp_path):
+        content = _translate_controls(tmp_path, """
+y= Time + 3 ~ ~ |
+x= ACTIVE INITIAL(y * 2, 5) ~ ~ |
+z= ACTIVE INITIAL(x + y, x * 2) ~ ~ |
+stock= INTEG(1, z) ~ ~ |
+""", "mtk")
+        assert "stock => (((5.0) * 2.0))" in content
+
+
+class TestConstantsInPartsJson:
+    """GET DIRECT CONSTANTS in parts with the JSON data format: read when
+    translated, each value at its elements."""
+
+    def test_read_when_translated(self, tmp_path, mocker):
+        import xarray as xr
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = xr.DataArray([7.0, 9.0], coords={"r": ["a", "b"]}, dims=["r"])
+        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+        sr = _make_subscript_range("r", ["a", "b"])
+        comps = [AbstractComponent(subscripts=[[e], []],
+                                   ast=GetConstantsStructure(file="d.xlsx", tab="S", cell=c))
+                 for e, c in (("b", "B2"), ("a", "D3"))]
+        elem = AbstractElement(name="PC", components=comps)
+        sb = JuliaSectionBuilder(_make_section([elem], subscripts=[sr], path=tmp_path / "m.mdl"),
+                                 data_format="json")
+        sb.build_section()
+        assert any(d == "const pc = [7.0, 9.0]" for d in sb.ext_const_decls), sb.ext_const_decls
+        # each part read at its elements
+        assert [c.args[-1] for c in mock_ext.add.call_args_list] == [{"r": ["a"]}]
+
+    def test_data_in_parts_read_when_translated(self, tmp_path, mocker):
+        """GET DIRECT DATA in parts with the JSON data format: the series read
+        when translated, each part at its element."""
+        import xarray as xr
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = xr.DataArray([[1.0, 10.0], [2.0, 20.0]],
+                                     coords={"time": [0.0, 1.0], "r": ["a", "b"]},
+                                     dims=["time", "r"])
+        mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
+        sr = _make_subscript_range("r", ["a", "b"])
+        comps = [AbstractData(subscripts=[[e], []], keyword="interpolate",
+                              ast=GetDataStructure(file="d.xlsx", tab="S",
+                                                   time_row_or_col="time", cell=c))
+                 for e, c in (("a", "B2"), ("b", "C2"))]
+        elem = AbstractElement(name="PD", components=comps)
+        sb = JuliaSectionBuilder(_make_section([elem], subscripts=[sr], path=tmp_path / "m.mdl"),
+                                 data_format="json")
+        sb.build_section()
+        assert [c.args[-1] for c in mock_ext.add.call_args_list] == [{"r": ["b"]}]
+        # a series per element
+        assert sb._json_data["data"]["pd_1"]["values"] == [1.0, 2.0]
+        assert sb._json_data["data"]["pd_2"]["values"] == [10.0, 20.0]
+        assert "const pd_fns = [pd_1, pd_2]" in sb.lookup_const_decls

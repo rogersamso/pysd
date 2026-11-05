@@ -66,23 +66,23 @@ LOGIC_OPS: dict = {
 # Keys are matched after .upper(), so include both "SPACE FORM" and "UNDERSCORE_FORM"
 # because the Vensim parser may store names either way.
 BUILTIN_FUNCTIONS: dict = {
-    # Basic math.  pysd_exp, pysd_ln, pysd_sin...: the C maths library, as in
-    # Python PySD (Julia's own functions differ in the last digit)
+    # Basic math, with Python PySD's digits: the C maths library, and NaN out
+    # of the domain, as numpy (PySD.jl's PythonMath)
     "ABS": "abs",
-    "EXP": "pysd_exp",
-    "LN": "pysd_ln",
-    "SQRT": "pysd_sqrt",
-    "SIN": "pysd_sin",
-    "COS": "pysd_cos",
-    "TAN": "pysd_tan",
-    "ARCSIN": "pysd_asin",
-    "ARCCOS": "pysd_acos",
-    "ARCTAN": "pysd_atan",
-    "SINH": "pysd_sinh",
-    "COSH": "pysd_cosh",
+    "EXP": "PythonMath.exp",
+    "LN": "PythonMath.log",
+    "SQRT": "PythonMath.sqrt",
+    "SIN": "PythonMath.sin",
+    "COS": "PythonMath.cos",
+    "TAN": "PythonMath.tan",
+    "ARCSIN": "PythonMath.asin",
+    "ARCCOS": "PythonMath.acos",
+    "ARCTAN": "PythonMath.atan",
+    "SINH": "PythonMath.sinh",
+    "COSH": "PythonMath.cosh",
     "TANH": "tanh",
-    "INTEGER": "pysd_trunc",
-    "INT": "pysd_trunc",
+    "INTEGER": "trunc",            # MTK: of floor and ceil (no symbolic trunc)
+    "INT": "trunc",
     "POWER": "pysd_power",
     "MIN": "min",
     "MAX": "max",
@@ -110,7 +110,7 @@ BUILTIN_FUNCTIONS: dict = {
     "ACTIVE INITIAL": "pysd_active_initial",
     "ACTIVE_INITIAL": "pysd_active_initial",
     # SD helpers provided by PySD.jl
-    "LOG": "pysd_log_base",        # written as pysd_ln(x) / pysd_ln(base)
+    "LOG": "pysd_log_base",        # written as PythonMath.log(x) / PythonMath.log(base)
     "XIDZ": "pysd_xidz",
     "ZIDZ": "pysd_zidz",
     "PULSE": "pysd_pulse",
@@ -147,10 +147,9 @@ BUILTIN_FUNCTIONS: dict = {
 # These are no longer inlined into generated files — the generated model does
 # `using PySD` which re-exports every ``pysd_*`` helper.  The set is retained so
 # the AST visitor / model builder can track which helpers an equation requires
-# (e.g. to pull in ``pysd_trunc`` when ``pysd_quantum`` is used).
+# (e.g. ``pysd_quantum``).
 HELPER_IMPLEMENTATIONS: frozenset = frozenset({
-    "pysd_trunc", "pysd_xidz", "pysd_zidz",
-    "pysd_exp", "pysd_sin", "pysd_cos", "pysd_tan", "pysd_atan", "pysd_sinh", "pysd_cosh",
+    "pysd_xidz", "pysd_zidz",
     "pysd_pulse", "pysd_pulse_train", "pysd_ramp", "pysd_step",
     "pysd_active_initial", "pysd_ifelse", "pysd_sum",
     "pysd_inv_mat2d_elem", "pysd_inv_mat3d_elem",
@@ -304,8 +303,11 @@ class JuliaASTVisitor:
         root=None,
         macro_names: Optional[Set[str]] = None,
         bang_subs: Optional[Dict[str, str]] = None,
+        symbolic: bool = False,
     ) -> None:
         self.namespace = namespace
+        # equations of symbolic variables (MTK): only functions Symbolics knows
+        self.symbolic = symbolic
         self.registry = inline_registry
         self.needed_helpers = needed_helpers
         # active_subs: dim_name -> julia index variable (e.g. {"sector": "_i"})
@@ -465,6 +467,7 @@ class JuliaASTVisitor:
             root=self._root,
             macro_names=self._macro_names,
             bang_subs=self._bang_subs,
+            symbolic=self.symbolic,
         )
 
     def _with_bang_subs(self, extra: Dict[str, str]) -> "JuliaASTVisitor":
@@ -483,6 +486,7 @@ class JuliaASTVisitor:
             root=self._root,
             macro_names=self._macro_names,
             bang_subs={**self._bang_subs, **extra},
+            symbolic=self.symbolic,
         )
 
     def _next_ii(self) -> int:
@@ -1374,8 +1378,6 @@ class JuliaASTVisitor:
 
         if julia_func in HELPER_IMPLEMENTATIONS:
             self.needed_helpers.add(julia_func)
-            if julia_func == "pysd_quantum":
-                self.needed_helpers.add("pysd_trunc")
 
         # sum/prod/vmax/vmin with ! subscripts: generate ONE comprehension that
         # covers ALL references sharing the same ! dim, rather than separate
@@ -1413,11 +1415,14 @@ class JuliaASTVisitor:
         args = [self.visit(a) for a in node.arguments]
 
         # Julia's own where there is one: π, and LOG(x, base) as the quotient
-        # of PySD.jl's ln (NaN out of the domain, Python's digits)
+        # of logarithms (NaN out of the domain, Python's digits)
         if julia_func == "pysd_pi":
             return "π"
         if julia_func == "pysd_log_base" and len(args) == 2:
-            return f"(pysd_ln({args[0]}) / pysd_ln({args[1]}))"
+            return f"(PythonMath.log({args[0]}) / PythonMath.log({args[1]}))"
+        # Symbolics has no trunc: toward zero, of floor and ceil
+        if julia_func == "trunc" and self.symbolic and len(args) == 1:
+            return f"ifelse({args[0]} < 0, ceil({args[0]}), floor({args[0]}))"
 
         # pysd_ifelse dispatches on the condition type.  Vensim IF THEN ELSE
         # accepts any numeric condition (nonzero = true), so a bare variable or

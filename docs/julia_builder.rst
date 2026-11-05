@@ -262,7 +262,7 @@ What a translated model gives you, besides running:
   form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
   layer per variable over the time and its dimensions.
 
-These need PySD.jl 0.9.0, which the model's package requires.
+These need PySD.jl 0.10.0, which the model's package requires.
 
 What it translates: stocks, auxiliaries and constants; subscripts (ranges,
 subranges, ranges defined with other ranges, mappings, arrays of up to 3
@@ -711,6 +711,16 @@ Supported Vensim features
    * - ``IF THEN ELSE``
      - Supported (``ifelse``)
      - Supported (``ifelse``)
+   * - ``EXP``, ``LN``, ``LOG``, ``SQRT``, the trigonometric functions
+     - Supported (PySD.jl's ``PythonMath.exp``, ``PythonMath.log``, ...:
+       Python PySD's digits, and NaN out of the domain, as numpy)
+     - Supported (the same)
+   * - ``INTEGER``
+     - Supported (Julia's ``trunc(x)``, as the DSL backend)
+     - Supported, written ``ifelse(x < 0, ceil(x), floor(x))``: Symbolics
+       has no ``trunc`` for symbolic variables (only ``floor`` and
+       ``ceil``).  The values are the same; the generated equations read
+       differently from the ODE backend's
    * - ``PULSE``, ``STEP``, ``RAMP``, ``PULSE TRAIN``
      - Supported
      - Supported

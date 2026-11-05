@@ -154,7 +154,7 @@ def _ast_children(node) -> list:
 
 
 #: PySD.jl version the generated models are written for (checked on load).
-PYSD_JL_VERSION = "0.9.0"
+PYSD_JL_VERSION = "0.10.0"
 
 # Control variable identifiers produced by Vensim
 _CONTROL_IDENTIFIERS = frozenset(
@@ -189,6 +189,15 @@ _T0_MATH = {
     "ln": math.log, "log": math.log10, "sqrt": math.sqrt, "abs": abs,
     "integer": math.trunc, "max": max, "min": min,
 }
+
+
+def _is_number(expr: str) -> bool:
+    """Whether Julia code *expr* is a number (``5.0``, ``-20.0``)."""
+    try:
+        float(expr)
+    except ValueError:
+        return False
+    return True
 
 
 def _non_negative_flow(ast: IntegStructure, flow_expr: str, stock_ref: str) -> str:
@@ -415,8 +424,8 @@ class JuliaSectionBuilder:
         # What is recorded at the model's ticks (fixed delays' inputs, samples'
         # values), by key: its position here, from 1 (PySD.jl's PySDTicks)
         self._tick_records: List[str] = []
-        # fixed delays' outputs, computed at the first tick to freeze their
-        # initial values there (MTK observes only what it is asked for)
+        # fixed delays whose initial value is an expression: computed at the
+        # first tick to freeze it there (MTK observes only what it is asked for)
         self._tick_delays: List[str] = []
         # whether an equation switches on the time (STEP, PULSE, Time >= 2015):
         # the model then stops at the ticks too (see _finish_ticks)
@@ -861,7 +870,7 @@ class JuliaSectionBuilder:
             active_subs=active_subs, var_dims=self._var_dims,
             subs_sizes=self._subs_sizes, subs_elems=self._subs_elems,
             lookup_names=self._lookup_func_names, root=self.root,
-            macro_names=self._known_macro_names,
+            macro_names=self._known_macro_names, symbolic=self.backend == "mtk",
         )
 
 
@@ -986,7 +995,7 @@ class JuliaSectionBuilder:
             self.namespace, self.inline_registry, self.needed_helpers,
             var_dims=self._var_dims, subs_sizes=self._subs_sizes,
             subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
-            root=self.root, macro_names=self._known_macro_names,
+            root=self.root, macro_names=self._known_macro_names, symbolic=self.backend == "mtk",
         )
 
         # ---- Named lookup table ----------------------------------------
@@ -1579,7 +1588,7 @@ class JuliaSectionBuilder:
             visitor = JuliaASTVisitor(
                 self.namespace, self.inline_registry, self.needed_helpers,
                 subs_sizes=self._subs_sizes, root=self.root,
-                macro_names=self._known_macro_names,
+                macro_names=self._known_macro_names, symbolic=self.backend == "mtk",
             )
             rhs = visitor.visit(comp.ast)
             if not is_control:
@@ -1651,7 +1660,7 @@ class JuliaSectionBuilder:
                     self.namespace, self.inline_registry, self.needed_helpers,
                     var_dims=self._var_dims, subs_sizes=self._subs_sizes,
                     subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
-                    root=self.root, macro_names=self._known_macro_names,
+                    root=self.root, macro_names=self._known_macro_names, symbolic=self.backend == "mtk",
                 )
                 value_expr = visitor.visit(comp.ast)
                 for idx in covered_indices:
@@ -1668,7 +1677,7 @@ class JuliaSectionBuilder:
                         ),
                         var_dims=self._var_dims, subs_sizes=self._subs_sizes,
                         subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
-                        root=self.root, macro_names=self._known_macro_names,
+                        root=self.root, macro_names=self._known_macro_names, symbolic=self.backend == "mtk",
                     )
                     flow_expr = vis_idx.visit(comp.ast.flow)
                     init_expr = vis_idx.visit(comp.ast.initial)
@@ -1688,7 +1697,7 @@ class JuliaSectionBuilder:
                         ),
                         var_dims=self._var_dims, subs_sizes=self._subs_sizes,
                         subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
-                        root=self.root, macro_names=self._known_macro_names,
+                        root=self.root, macro_names=self._known_macro_names, symbolic=self.backend == "mtk",
                     )
                     input_expr = vis_idx.visit(comp.ast.input)
                     delay_expr = vis_idx.visit(comp.ast.delay_time)
@@ -1722,7 +1731,7 @@ class JuliaSectionBuilder:
                         ),
                         var_dims=self._var_dims, subs_sizes=self._subs_sizes,
                         subs_elems=self._subs_elems, lookup_names=self._lookup_func_names,
-                        root=self.root, macro_names=self._known_macro_names,
+                        root=self.root, macro_names=self._known_macro_names, symbolic=self.backend == "mtk",
                     )
                     rhs_expr = vis_idx.visit(comp.ast)
                     equations.append(f"{identifier}[{idx}] ~ {rhs_expr}")
@@ -2682,7 +2691,8 @@ class JuliaSectionBuilder:
         in_name = f"_df_in_{identifier}"
         self.namespace.namespace[f"__internal_df_in_{identifier}"] = in_name
         key = self._tick_record(in_name)
-        self._tick_delays.append(identifier)
+        if not _is_number(initial_expr):
+            self._tick_delays.append(identifier)
         if dims:
             idx_vars = self._idx_vars(len(dims))
             idx = ", ".join(idx_vars)
@@ -3764,7 +3774,7 @@ class JuliaSectionBuilder:
             v = JuliaASTVisitor(
                 self.namespace, self.inline_registry, self.needed_helpers,
                 subs_sizes=self._subs_sizes, root=self.root,
-                macro_names=self._known_macro_names,
+                macro_names=self._known_macro_names, symbolic=self.backend == "mtk",
             )
             init_expr = v.visit(inner_ast)
             self.stock_decls.append(f"@variables {identifier}(t)")
@@ -3922,69 +3932,9 @@ class JuliaSectionBuilder:
         if placed is not None:
             return placed
 
-        # ----- Multi-component with 2D+ subscripts: fall back to baked-in -----
-        comp0_coords = self._comp_coords(elem.components[0])
-        if len(comp0_coords) >= 2 and len(elem.components) > 1:
-            return self._read_get_constants_baked(elem, identifier)
-
-        # ----- Multi-component: emit single pysd_xlsx_read_constant with vector -----
-        # Build a Julia vector literal of specs: strings for range names,
-        # vectors for literal values.
-        specs = []
-        file_expr = None
-        tab = None
-        transpose = False
-        for comp in elem.components:
-            if isinstance(comp.ast, GetConstantsStructure):
-                cell = comp.ast.cell
-                if cell.endswith('*'):
-                    transpose = True
-                clean_cell = _cell_block(
-                    cell.rstrip('*'), self._comp_coords(comp), cell.endswith('*'))
-                if file_expr is None:
-                    file_expr = f'joinpath(@__DIR__, "{comp.ast.file}")'
-                    tab = comp.ast.tab
-                specs.append(f'"{clean_cell}"')
-            elif isinstance(comp.ast, (int, float)):
-                val = format_number(comp.ast)
-                coords = self._comp_coords(comp)
-                n_elems = 1
-                for dim_elems in coords.values():
-                    n_elems *= max(len(dim_elems), 1)
-                if n_elems > 1:
-                    specs.append(f"fill({val}, {n_elems})")
-                else:
-                    specs.append(f"[{val}]")
-            else:  # pragma: no cover  # unreachable: _const_like ensures GCS or numeric only
-                visitor = JuliaASTVisitor(
-                    self.namespace, self.inline_registry,
-                    self.needed_helpers,
-                    lookup_names=self.lookup_identifiers,
-                    macro_names=self._known_macro_names,
-                )
-                val = visitor.visit(comp.ast)
-                coords = self._comp_coords(comp)
-                n_elems = 1
-                for dim_elems in coords.values():
-                    n_elems *= max(len(dim_elems), 1)
-                if n_elems > 1:
-                    specs.append(f"fill({val}, {n_elems})")
-                else:
-                    specs.append(f"[{val}]")
-
-        if file_expr is None:  # pragma: no cover  # unreachable: _const_like has at least one GCS
-            return None
-        specs_str = ", ".join(specs)
-        kw_parts = []
-        if transpose:
-            kw_parts.append("transpose=true")
-        # Multi-dimensional reshaping is handled by the equation generator
-        # which uses flat indexing, so we keep the result flat here.
-        kw = ("; " + ", ".join(kw_parts)) if kw_parts else ""
-        return (
-            f'pysd_xlsx_read_constant({file_expr}, '
-            f'"{tab}", [{specs_str}]{kw})'
-        )
+        # ----- Other parts (several subscripts, the JSON data format): read
+        # now, each value at its elements -----
+        return self._read_get_constants_baked(elem, identifier)
 
     def _placed_constants_1d(self, elem: AbstractElement) -> Optional[str]:
         """A 1-D constant defined in parts, as a ``let`` block that fills
@@ -6201,19 +6151,25 @@ class JuliaSectionBuilder:
         warn_def, warn_call = self._stepwise_guard()
         guard, check = guard + warn_def, check + warn_call
         if self._uses_ticks():
-            # (the delays' own values too: computing them at the first tick
-            # freezes their initial values, as the ODE backend's model! does)
-            values = ", ".join(self._tick_records + self._tick_delays)
+            values = ", ".join(self._tick_records)
             records = "\n".join(f"    pysd_record!(_ticks, {k}, v[{k}])"
                                  for k in range(1, len(self._tick_records) + 1))
+            initials, first = "", ""
+            if self._tick_delays:
+                # the delays whose initial value is an expression, computed at
+                # the first tick only, which freezes it there
+                initials = ("const _initials = ModelingToolkit.SymbolicIndexingInterface.observed("
+                            f"sys, [{', '.join(self._tick_delays)}])\n")
+                first = "    pysd_at_first_tick(() -> _initials(u, p, t), _ticks)\n"
             record = textwrap.dedent("""\
                 const _ticked = ModelingToolkit.SymbolicIndexingInterface.observed(sys, [{VALUES}])
-                function _record_ticks!(u, t, p = prob.p)
+                {INITIALS}function _record_ticks!(u, t, p = prob.p)
                     v = _ticked(u, p, t)
                 {RECORDS}
-                    return nothing
+                {FIRST}    return nothing
                 end
-                """).replace("{VALUES}", values).replace("{RECORDS}", records) if self._tick_records else \
+                """).replace("{VALUES}", values).replace("{RECORDS}", records) \
+                .replace("{INITIALS}", initials).replace("{FIRST}", first) if self._tick_records else \
                 "_record_ticks!(u, t, p = prob.p) = nothing          # (nothing to record: switches on the time or random draws only)\n"
             ticks = textwrap.dedent("""\
                 # Fixed delays and samples move at the model's ticks, every TIME STEP,

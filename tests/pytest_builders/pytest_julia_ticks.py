@@ -121,8 +121,7 @@ def test_ode_records_what_model_gives(tmp_path):
 
 def test_mtk_records_the_observed_values(tmp_path):
     _, code = _translate(tmp_path, STEPWISE, "mtk")
-    # (the delay itself too: computing it at the first tick freezes its initial value)
-    assert "observed(sys, [_df_in_delayed, sampled, delayed])" in code
+    assert "observed(sys, [_df_in_delayed, sampled])" in code
     assert "prob = remake(prob; callback = _ticks_callback())" in code
 
 

@@ -46,7 +46,7 @@ New Features
   yet.  Translated models use Julia's functions where there is one (``rem``
   for ``MODULO``, ``trunc`` for ``QUANTUM``, ``mod`` for ``PULSE TRAIN``,
   ``error`` for a function not translated; with the ODE and MTK backends,
-  ``π`` for ``PI`` and ``pysd_ln(x) / pysd_ln(base)`` for ``LOG``).  PySD.jl
+  ``π`` for ``PI`` and a quotient of logarithms for ``LOG``).  PySD.jl
   0.8.0.
 - Julia builder, DSL backend: time settings that change during the run
   (``FINAL TIME``, ``TIME STEP`` and ``SAVEPER`` that depend on ``Time`` or
@@ -164,6 +164,12 @@ Bug fixes
   truncated to [min, max] and ``RANDOM EXPONENTIAL`` takes Vensim's (min,
   max, shift, stretch, seed), as the Python builder; the translation with
   PySD.jl 0.5.0 cut the draws at the bounds and took the shift as the scale.
+- Julia builder, ODE and MTK backends: translated models call PySD.jl's
+  maths functions with Python PySD's digits by Julia's names
+  (``PythonMath.exp``, ``PythonMath.log``, ...) and ``INTEGER`` as Julia's
+  ``trunc`` (MTK: of ``floor`` and ``ceil``), instead of ``pysd_exp``,
+  ``pysd_ln``, ..., ``pysd_trunc`` (deprecated in PySD.jl 0.10.0, which
+  translated models need).
 - Julia builder, ODE and MTK backends: a variable defined in parts of which
   some are ``GET DIRECT DATA`` and others not reads each data part as its
   own series; ``GET DIRECT CONSTANTS`` of some elements of a range, in any
@@ -188,8 +194,8 @@ Bug fixes
   (``pysd_sum``: pairwise, the last subscript varying fastest;
   ``pysd_sum_seq`` where numpy adds one after the other), ``INVERT MATRIX``
   uses the same LAPACK routine as ``numpy.linalg.inv``, and ``EXP``, ``LN``,
-  ``SIN``, ..., and ``^`` call the C maths library, as numpy (``pysd_exp``,
-  ``pysd_sin``...).  Before, values equal up to rounding (``x < 0`` with
+  ``SIN``, ..., and ``^`` call the C maths library, as numpy
+  (``PythonMath.exp``, ``PythonMath.sin``, ... and ``pysd_power``).  Before, values equal up to rounding (``x < 0`` with
   ``x`` about ``1e-16``) could take the other branch of an ``IF THEN ELSE``
   than in Python.  NaN elements count as 0 in ``SUM``, as in Python.
 - Julia builder (ODE backend): the elements a model does not define are
