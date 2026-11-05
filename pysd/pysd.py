@@ -207,7 +207,7 @@ def translate_to_julia(
     split_views=False,
     encoding=None,
     data_format="hardcoded",
-    backend="ode",
+    backend="dsl",
     **kwargs,
 ):
     """
@@ -229,20 +229,18 @@ def translate_to_julia(
         from the model file header; defaults to ``'UTF-8'``.
 
     data_format: str (optional)
-        How to store external numeric data in the generated file.
-        ``"hardcoded"`` (default) reads Excel files at Julia load time via
-        ``PySD.jl`` helpers.  ``"json"`` writes a companion
-        ``<model>_data.json`` file and reads it at startup via ``JSON3.jl``.
+        MTK backend only: how to store external numeric data in the
+        generated file.  ``"hardcoded"`` (default) reads Excel files at
+        Julia load time via ``PySD.jl`` helpers.  ``"json"`` writes a
+        companion ``<model>_data.json`` file and reads it at startup via
+        ``JSON3.jl``.
 
     backend: str (optional)
-        Julia ODE backend.  ``"ode"`` (default) emits ``params()`` (the
-        constants, lookups and data, computed once and changeable between
-        runs), ``initial_state`` and one ``model!(d, s, p, t)`` over the
-        stocks by name (ComponentArrays), solved by ``OrdinaryDiffEq.jl``.
-        ``"mtk"`` emits a ``ModelingToolkit.jl`` ``ODESystem``.
-        ``"dsl"`` writes the model in PySD.jl's DSL (``@equations`` and
-        ``Model``): a folder ``<model>_dsl/`` with one file per view (with
-        ``split_views=True``), the dimensions and the input sheets.
+        ``"dsl"`` (default) writes the model in PySD.jl's DSL
+        (``@equations`` and ``Model``): a folder ``<model>_dsl/`` with one
+        file per view (with ``split_views=True``), the dimensions and the
+        input sheets.  ``"mtk"`` emits a ``ModelingToolkit.jl``
+        ``ODESystem``, for symbolic work on the model.
 
     subview_sep: list (optional)
         Passed to ``parse_sketch`` when ``split_views=True`` (Vensim only).
@@ -257,8 +255,15 @@ def translate_to_julia(
     --------
     >>> path = translate_to_julia('my_model.mdl')
     >>> path = translate_to_julia('my_model.mdl', backend='mtk')
-    >>> path = translate_to_julia('my_model.mdl', data_format='json')
+    >>> path = translate_to_julia('my_model.mdl', backend='mtk',
+    ...                           data_format='json')
     """
+    if backend not in ("dsl", "mtk"):
+        raise ValueError(
+            f"backend must be 'dsl' or 'mtk', got {backend!r}"
+            + (" (the 'ode' backend was removed: 'dsl' runs the model "
+               "with OrdinaryDiffEq.jl's solvers)" if backend == "ode" else "")
+        )
     from pathlib import Path as _Path
     from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
 
@@ -287,8 +292,7 @@ def translate_to_julia(
     if backend == "dsl":
         from pysd.builders.julia.dsl_builder import DSLBuilder
         return DSLBuilder(abs_model).build_model()
-    return JuliaModelBuilder(abs_model, data_format=data_format,
-                             backend=backend).build_model()
+    return JuliaModelBuilder(abs_model, data_format=data_format).build_model()
 
 
 def load(py_model_file, data_files=None, data_files_encoding=None,

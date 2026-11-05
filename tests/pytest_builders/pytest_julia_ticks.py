@@ -7,7 +7,7 @@ stops at every tick, where each delay's input and each sample's value are
 recorded, and they are held in between.  With Euler steps of TIME STEP the
 values are Vensim's (and Python PySD's); other solvers run the same model.
 
-Both the ODE and the MTK backends do this.
+The MTK backend does this (the DSL backend has its own tests).
 """
 import json
 import os
@@ -99,7 +99,7 @@ def _translate(tmp_path, text, backend, name="model"):
 
 # --- what the translation writes ---------------------------------------------
 
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_records_delays_and_samples_at_the_ticks(tmp_path, backend):
     _, code = _translate(tmp_path, STEPWISE, backend)
     assert "const _ticks = PySDTicks(initial_time, time_step)" in code
@@ -112,20 +112,13 @@ def test_records_delays_and_samples_at_the_ticks(tmp_path, backend):
     assert "_ticks_callback(" in code and "pysd_free_ticks!(_ticks)" in code
 
 
-def test_ode_records_what_model_gives(tmp_path):
-    _, code = _translate(tmp_path, STEPWISE, "ode")
-    assert "pysd_record!(_ticks, 1, hasproperty(v, :_df_in_delayed) ? v._df_in_delayed : p._df_in_delayed)" in code
-    assert "pysd_record!(_ticks, 2, hasproperty(v, :sampled) ? v.sampled : p.sampled)" in code
-    assert "prob = ODEProblem(rhs!, u0, tspan, _problem_p(_params); callback = _ticks_callback())" in code
-
-
 def test_mtk_records_the_observed_values(tmp_path):
     _, code = _translate(tmp_path, STEPWISE, "mtk")
     assert "observed(sys, [_df_in_delayed, sampled])" in code
     assert "prob = remake(prob; callback = _ticks_callback())" in code
 
 
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_records_a_changing_delay_time(tmp_path, backend):
     _, code = _translate(tmp_path, CHANGING_DELAY, backend)
     assert "_dlt_in_delayed" in code
@@ -133,7 +126,7 @@ def test_records_a_changing_delay_time(tmp_path, backend):
     assert "_check_euler" not in code
 
 
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_other_models_have_no_ticks(tmp_path, backend):
     _, code = _translate(tmp_path, PLAIN, backend)
     assert "_ticks" not in code
@@ -149,13 +142,8 @@ def _require_julia(backend):
         pytest.skip(reason)
 
 
-# the values at every month, of each solver's run (ODE: from observe; MTK: from
-# the solution, by symbol)
+# the values at every month, of each solver's run (from the solution, by symbol)
 _VALUES = {
-    "ode": """
-vals_of(sol, n) = (obs = [observe(u, t) for (u, t) in zip(sol.u, sol.t)];
-                  [obs[i][n] for (i, t) in enumerate(sol.t) if isinteger(t)])
-""",
     "mtk": """
 vals_of(sol, n) = (v = sol[getproperty(@__MODULE__, Symbol(n))];
                   [v[i] for (i, t) in enumerate(sol.t) if isinteger(t)])
@@ -164,7 +152,7 @@ vals_of(sol, n) = (v = sol[getproperty(@__MODULE__, Symbol(n))];
 
 
 @pytest.mark.julia
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_any_solver(tmp_path, backend):
     _require_julia(backend)
     import pysd
@@ -237,7 +225,7 @@ lookahead(
 """.replace("FINAL TIME = 10", "") + CONTROL.replace("FINAL TIME = 10", "FINAL TIME = 4")
 
 
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_switches_on_the_time_stop_at_the_ticks(tmp_path, backend):
     _, code = _translate(tmp_path, SWITCHES, backend)
     assert "const _ticks = PySDTicks(initial_time, time_step)" in code
@@ -247,7 +235,7 @@ def test_switches_on_the_time_stop_at_the_ticks(tmp_path, backend):
     assert "_record_ticks!(u, t, p = " in code and "pysd_record!" not in code
 
 
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_equations_written_for_steps_of_time_step_are_named(tmp_path, backend):
     _, code = _translate(tmp_path, SWITCHES, backend)
     assert "function _warn_stepwise(solver, dt)" in code
@@ -258,19 +246,18 @@ def test_equations_written_for_steps_of_time_step_are_named(tmp_path, backend):
     assert "ahead" not in code.split("function _warn_stepwise")[1].split("end")[0]
 
 
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_models_without_them_have_neither(tmp_path, backend):
     _, code = _translate(tmp_path, PLAIN.replace("STEP(1, 1)", "Time / 10"), backend)
     assert "_ticks" not in code and "_warn_stepwise" not in code
 
 
 @pytest.mark.julia
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_switches_are_exact_with_any_solver(tmp_path, backend):
     _require_julia(backend)
     jl, _ = _translate(tmp_path, SWITCHES, backend)
-    final = {"ode": "observe(sol.u[end], sol.t[end])[n]",
-             "mtk": "sol[getproperty(@__MODULE__, Symbol(n))][end]"}[backend]
+    final = {"mtk": "sol[getproperty(@__MODULE__, Symbol(n))][end]"}[backend]
     script = f"""
 include({json.dumps(str(jl))})
 using OrdinaryDiffEq, Logging
@@ -321,7 +308,7 @@ stock = INTEG(noise, 0)
 """ + CONTROL
 
 
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_random_calls_are_drawn_at_the_ticks(tmp_path, backend):
     _, code = _translate(tmp_path, RANDOMS, backend)
     # standard draws, once per tick, from each call's stream (its number and its seed)
@@ -333,7 +320,7 @@ def test_random_calls_are_drawn_at_the_ticks(tmp_path, backend):
 
 
 @pytest.mark.julia
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_random_draws_hold_between_ticks_and_repeat(tmp_path, backend):
     _require_julia(backend)
     jl, _ = _translate(tmp_path, RANDOMS, backend)
@@ -370,7 +357,7 @@ report("rk4", run_model(solver = RK4()))
         np.testing.assert_allclose(out[f"{label}:stock"], out["euler:stock"], rtol=1e-12, atol=1e-12)
 
 
-@pytest.mark.parametrize("backend", ["ode", "mtk"])
+@pytest.mark.parametrize("backend", ["mtk"])
 def test_every_random_function(tmp_path, backend):
     _, code = _translate(tmp_path, """{UTF-8}
 my seed = 5

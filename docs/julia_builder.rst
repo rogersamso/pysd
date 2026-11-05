@@ -2,8 +2,7 @@ Julia Builder
 =============
 
 PySD can translate Vensim (``.mdl``) and Stella (``.xmile`` / ``.stmx``) models
-into standalone Julia files that run without Python or PySD at runtime.
-Three backends are available:
+into Julia, to run without Python or PySD.  Two backends are available:
 
 .. list-table::
    :header-rows: 1
@@ -12,26 +11,23 @@ Three backends are available:
    * - Backend
      - How it works
      - When to use
-   * - ``"ode"`` *(default)*
-     - Emits plain Julia functions (``params()``, ``model!``) solved by
-       ``OrdinaryDiffEq.jl``; constants, lookups and data can be changed
-       between runs (see `Scenarios`_)
-     - General use; fast startup, full subscript support
-   * - ``"mtk"``
-     - Emits a ``ModelingToolkit.ODESystem``; ModelingToolkit performs
-       symbolic simplification before solving
-     - Small-to-medium models where you want symbolic analysis, LaTeX
-       export, or automatic sparsity detection
-   * - ``"dsl"``
+   * - ``"dsl"`` *(default)*
      - Writes the model in PySD.jl's language for models (``@equations``,
        one file per view), to read and edit as Julia code; PySD.jl builds and
        runs it (see `The DSL backend`_)
-     - Models you want to keep working on in Julia
+     - General use, large models, models you want to keep working on in
+       Julia; changing parameters and inputs between runs; derivatives and
+       uncertainties through a run
+   * - ``"mtk"``
+     - Writes a ``ModelingToolkit.ODESystem``; ModelingToolkit simplifies it
+       symbolically before solving (see `The MTK backend`_)
+     - Small-to-medium models where you want symbolic analysis, LaTeX
+       export of the simplified system, or automatic sparsity detection
 
 .. note::
    The MTK backend runs ``structural_simplify`` before solving, which can
-   take minutes to hours for large subscripted models.  For production runs
-   the ODE backend is recommended.
+   take minutes to hours for large subscripted models.  For large models use
+   the DSL backend.
 
 
 Prerequisites
@@ -41,25 +37,25 @@ Julia 1.10 or later. Install via `juliaup <https://github.com/JuliaLang/juliaup>
 
    curl -fsSL https://install.julialang.org | sh
 
-Install the required Julia packages once::
-
-   julia -e 'using Pkg; Pkg.add([
-       "OrdinaryDiffEq",
-       "OrdinaryDiffEqLowOrderRK",
-       "DataInterpolations",
-       "ComponentArrays",
-       "NCDatasets",
-       "JSON3",
-       "ModelingToolkit",   # only needed for the mtk backend
-       "Symbolics",         # only needed for the mtk backend
-   ])'
-
-Then install the ``PySD.jl`` companion library. It lives in a submodule of
-the PySD repo (``pysd/builders/julia/PySD.jl/``) and can also be found at
+Then install the ``PySD.jl`` companion library, which the translated models
+use.  It lives in a submodule of the PySD repo
+(``pysd/builders/julia/PySD.jl/``) and can also be found at
 https://github.com/rogersamso/PySD.jl.  From the root of your PySD checkout::
 
    git submodule update --init pysd/builders/julia/PySD.jl
    julia -e 'using Pkg; Pkg.develop(path="pysd/builders/julia/PySD.jl")'
+
+That is all the DSL backend needs.  The MTK backend also needs::
+
+   julia -e 'using Pkg; Pkg.add([
+       "OrdinaryDiffEq",
+       "OrdinaryDiffEqLowOrderRK",
+       "ModelingToolkit",
+       "Symbolics",
+       "DataInterpolations",
+       "NCDatasets",
+       "JSON3",
+   ])'
 
 
 Translating a model
@@ -72,31 +68,34 @@ From Python
 
    import pysd
 
-   # ODE backend (default)
+   # DSL backend (default): a folder model_dsl/
    path = pysd.translate_to_julia("model.mdl")
 
-   # MTK backend
-   path = pysd.translate_to_julia("model.mdl", backend="mtk")
-
-   # Split views — one module file per Vensim view
+   # Split views: one file per Vensim view
    path = pysd.translate_to_julia("model.mdl", split_views=True)
 
-   # JSON data format — companion _data.json instead of inline Excel reads
-   path = pysd.translate_to_julia("model.mdl", data_format="json")
+   # MTK backend: one model.jl
+   path = pysd.translate_to_julia("model.mdl", backend="mtk")
+
+   # MTK backend, JSON data format: a companion _data.json instead of
+   # Excel reads at load time
+   path = pysd.translate_to_julia("model.mdl", backend="mtk", data_format="json")
 
 **Parameters**
 
 ``backend``
-   ``"ode"`` (default), ``"mtk"`` or ``"dsl"``.
+   ``"dsl"`` (default) or ``"mtk"``.  (The former ``"ode"`` backend, a
+   plain ODE function, was removed: the DSL backend runs the model with the
+   same solvers, faster.)
 
 ``split_views``
    When ``True`` and the model has multiple Vensim views, the output is
-   split into a main ``.jl`` file and one module file per view under a
-   ``modules_<name>/`` directory.
+   split into one file per view (with the MTK backend, a main ``.jl`` file
+   and one module file per view under a ``modules_<name>/`` directory).
 
 ``data_format``
-   ``"hardcoded"`` (default) reads Excel files at Julia startup via
-   ``PySD.jl`` helpers.  ``"json"`` writes a companion
+   MTK backend only.  ``"hardcoded"`` (default) reads Excel files at Julia
+   startup via ``PySD.jl`` helpers.  ``"json"`` writes a companion
    ``<model>_data.json`` file and reads it via ``JSON3.jl``.
 
 ``encoding``
@@ -109,47 +108,6 @@ From the command line
 .. code-block:: bash
 
    python -c "import pysd; pysd.translate_to_julia('model.mdl')"
-
-
-Running the model
------------------
-
-The generated ``.jl`` file is self-contained and can be run directly::
-
-   julia --project=/path/to/PySD.jl model.jl
-
-It prints progress to stdout, runs the simulation, and writes a NetCDF
-results file (``<model>_results.nc``) next to the ``.jl`` file.
-
-You can also ``include`` the file interactively:
-
-.. code-block:: julia
-
-   include("model.jl")       # defines run_model, u0, tspan, …
-
-   sol = run_model()         # run with defaults
-
-The ``run_model`` function accepts keyword arguments:
-
-.. code-block:: julia
-
-   # Higher-order solver
-   sol = run_model(solver=Tsit5())
-
-   # Finer time step
-   sol = run_model(dt=0.01)
-
-   # Custom time span
-   sol = run_model(tspan=(2000.0, 2100.0))
-
-   # Custom initial conditions
-   sol = run_model(u0=my_u0)
-
-   # Other constants, lookups or data (see Scenarios below)
-   sol = run_model(params=params(growth_rate=0.1))
-
-   # Other keywords go to OrdinaryDiffEq's solve, e.g. save whole years only
-   sol = run_model(saveat=1995.0:1.0:2050.0)
 
 
 The DSL backend
@@ -317,103 +275,41 @@ Limits to know:
   there.
 
 
-Structure of the generated model (ODE backend)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The MTK backend
+---------------
 
-When Julia is installed, the expressions are written with only the
-parentheses they need (``a * b * c`` rather than ``((a * b) * c)``): the
-builder prints each statement again with Julia's own parser and printer
-(``pysd/builders/julia/tidy.jl``), so the expressions are the same.  Without
-Julia the file keeps the extra parentheses, with a warning; set
-``PYSD_JULIA_TIDY=0`` to skip this step.
+``backend="mtk"`` writes one ``model.jl``: the variables and parameters, the
+equations as a ``ModelingToolkit.ODESystem``, its structural simplification,
+and ``run_model``.  It can be run directly::
 
-Three or more consecutive elements of a variable whose formulas differ only
-in the element index are written as one loop over those elements::
+   julia --project=/path/to/PySD.jl model.jl
 
-   for i in 1:3
-       d.level[i] = flow[i] - flow[i + 1]
-   end
-   d.level[4] = flow[4]
+It prints progress to stdout, runs the simulation, and writes a NetCDF
+results file (``<model>_results.nc``) next to the ``.jl`` file.
 
-The generated file has these parts, in this order:
-
-``params(; sheets, files, values...)``
-   The model's lookups, data and constants, and every variable computed
-   from them alone (not from time or the stocks), as a ``NamedTuple``.
-   They are computed once, when the model is loaded (``_params``), not at
-   every time step.
-
-``_state_axes``
-   The stocks by name and shape.  The solver works on one flat vector;
-   `ComponentArrays.jl <https://github.com/SciML/ComponentArrays.jl>`_
-   gives each stock its name and shape on top of it (``s.population``,
-   ``s.inventory[2, 3]``) without copying.
-
-``model!(d, s, p, t)``
-   The equations of the variables that change during the run.  It writes
-   each stock's rate of change into ``d`` (``d.population = births``) and
-   returns the other variables, by name.  ``rhs!(du, u, p, t)``, the
-   function the solver calls, and ``observe`` both use it, so every
-   equation is written once.
-
-``initial_state(p)``
-   The stocks at the initial time, computed from the constants ``p``.
-
-``run_model(; params, u0, tspan, dt, solver)``
-   Builds the ``ODEProblem`` and solves it.
-
-
-Scenarios
-^^^^^^^^^
-
-``params()`` takes new values for any lookup, data series or constant,
-by name (the Julia name: lower case, spaces as underscores).  Everything
-computed from them follows: other constants, and the initial values of the
-stocks.  The model's own values are not changed, so several scenarios can
-be run one after the other:
+You can also ``include`` the file interactively:
 
 .. code-block:: julia
 
-   include("model.jl")
+   include("model.jl")       # defines sys, run_model, u0, tspan, …
 
-   base = run_model()
+   sol = run_model()         # run with defaults
 
-   # A constant, and a subscripted constant (an array of its size, or a
-   # number for all elements)
-   p = params(growth_rate = 0.1, weights = [3.0, 2.0, 1.0])
-   high = run_model(params = p)
+The ``run_model`` function accepts keyword arguments:
 
-   # A lookup or data series: (x, y) vectors, interpolated linearly and
-   # held constant outside x (one column of y per element for a
-   # subscripted one), any function, or an interpolation from
-   # DataInterpolations.jl
-   p = params(effect = ([0.0, 10.0], [1.0, 2.0]))
-   p = params(policy = t -> t < 2030 ? 0.0 : 1.0)
+.. code-block:: julia
 
-   # A constant computed from others can be given too
-   p = params(initial_population = 50.0)
+   # Higher-order solver
+   sol = run_model(solver=Tsit5())
 
-   # Excel inputs from other sheets or files: a Dict from the name in the
-   # model to the new one (a file by its path as written in the model, or
-   # its name)
-   p = params(sheets = Dict("BAU" => "high growth"))
-   p = params(files = Dict("inputs.xlsx" => "inputs_2050.xlsx"))
+   # Finer time step
+   sol = run_model(dt=0.01)
 
-   # Read the results of a scenario with its own values
-   o = observe(high.u[end], high.t[end]; p = p)
+   # Custom time span
+   sol = run_model(tspan=(2000.0, 2100.0))
 
-New values keep the types of the model's own (lookups and data are all
-``PySDFunction``, whatever function they hold), so a scenario runs without
-compiling the model again: only the first run after loading compiles.
-
-A name that is not a lookup, data series or constant of the model (for
-instance a misspelt one, or a variable that changes during the run), or an
-array of the wrong size, is an error.  So is a new value for a constant the
-translation used, such as the delay time that sets the number of stages of
-a ``DELAY FIXED`` or the order of a ``SMOOTH N``: translate the model again
-with the new value instead.  This is the equivalent of Python
-PySD's ``model.run(params={...})`` (between runs; changing a value in the
-middle of a run is not supported).
+   # Custom initial values of the stocks (pairs, as u0)
+   sol = run_model(u0=my_u0)
 
 
 Choosing a solver
@@ -422,10 +318,11 @@ Choosing a solver
 The default is ``Euler()`` with steps of ``TIME STEP``, which matches
 Vensim's integration method.  All solvers from `OrdinaryDiffEq.jl
 <https://docs.sciml.ai/DiffEqDocs/stable/solvers/ode_solve/>`_ work, with
-both backends: ``run_model(solver = RK4())``, ``run_model(dt = time_step / 4)``,
-``run_model(solver = Tsit5(), adaptive = true)``.  Other solvers give more
-accurate stocks (and so other numbers than Vensim's), which shows whether
-``TIME STEP`` is small enough.
+both backends: ``run_model(m, RK4())`` or ``run_model(m, BS3(); reltol =
+1e-8)`` with the DSL backend, ``run_model(solver = RK4())`` or
+``run_model(dt = time_step / 4)`` with the MTK backend.  Other solvers give
+more accurate stocks (and so other numbers than Vensim's), which shows
+whether ``TIME STEP`` is small enough.
 
 ``DELAY FIXED`` and ``SAMPLE IF TRUE`` are defined by steps of ``TIME STEP``,
 the model's ticks: a fixed delay gives its input N ticks before, a sample
@@ -481,31 +378,14 @@ Accessing results
 ^^^^^^^^^^^^^^^^^
 
 ``sol`` is a standard
-`DiffEq solution object <https://docs.sciml.ai/DiffEqDocs/stable/basics/solution/>`_.
-
-**ODE backend** — use ``observe(u, t)`` to read any variable at any saved
-time step (``observe(u, t; p = p)`` for a run with other ``params``):
+`DiffEq solution object <https://docs.sciml.ai/DiffEqDocs/stable/basics/solution/>`_;
+read any variable symbolically via ``sys``:
 
 .. code-block:: julia
 
-   # All saved time points
-   sol.t
-
-   # Read a scalar variable at every time step
-   obs = [mod.observe(sol.u[i], sol.t[i]) for i in eachindex(sol.t)]
-   population = [o["population"] for o in obs]
-
-   # Read a subscripted variable (returns a Vector)
-   stock_a = [o["stock_a"] for o in obs]
-
-   # Individual subscript element
-   stock_a_entry1 = [o["stock_a"][1] for o in obs]
-
-**MTK backend** — access variables symbolically via ``sys``:
-
-.. code-block:: julia
-
+   sol.t                      # the saved times
    sol[sys.population]        # time series for a scalar variable
+   sol[sys.stock_a[2]]        # an element of a subscripted variable
    sol(2025.0)[sys.gdp]       # interpolate at a specific time
 
 
@@ -518,18 +398,11 @@ also call it manually:
 
 .. code-block:: julia
 
-   # ODE backend
-   save_results(sol, _state_map, _dim_labels, "output.nc")
-
-   # MTK backend
    save_results(sol, sys, _dim_labels, "output.nc")
 
-With the ODE backend the file holds the model's stocks (not the internal
-ones the translation adds, such as the stages of a ``SMOOTH3``). A subscripted stock
-gets one NetCDF dimension per subscript range, named after the range and
-holding its element labels, in the order ``(time, dim_1, ..., dim_n)`` (the
-same layout as PySD's Python NetCDF output, so the file can be passed to
-another model's ``run_model(nc_data_files=[...])``).
+The file holds the unknowns of the simplified system, a series over time
+each.  (With the DSL backend, ``DataFrame(r)``, ``CSV.write(path, r)`` and
+``DimStack(r)`` give the results; see `The DSL backend`_.)
 
 Read the results with any NetCDF library, e.g. in Python:
 
@@ -606,9 +479,8 @@ These read ``.xlsx``, ``.xlsm``, ``.xls`` and delimited text files.
 
 **Result writer**
 
-- ``save_results(sol, state_map_or_sys, dim_labels, path)`` — writes a
-  NetCDF file; dispatches on ODE ``state_map`` (``AbstractVector``) or MTK
-  ``sys`` (``AbstractSystem``)
+- ``save_results(sol, sys, dim_labels, path)`` — writes a NetCDF file of
+  an MTK model's results
 
 **LaTeX export** *(MTK backend only)*
 
@@ -645,154 +517,118 @@ Latexify.jl):
    pysd_export_latex(m; filename = "model.tex")
 
 
-Supported Vensim features
---------------------------
+Supported Vensim features (MTK backend)
+---------------------------------------
+
+For the DSL backend, see `The DSL backend`_ (what it translates and what
+not yet).
 
 .. list-table::
    :header-rows: 1
 
    * - Feature
-     - ODE backend
      - MTK backend
    * - Stocks (``INTEG``)
      - Supported
-     - Supported
    * - Auxiliaries
-     - Supported
      - Supported
    * - Constants / parameters
      - Supported
-     - Supported
    * - Subscripts / arrays (1D, 2D, 3D; numerically validated against Vensim)
-     - Supported
      - Supported
    * - Lookup tables (inline)
      - Supported
-     - Supported
    * - ``GET DIRECT CONSTANTS``
-     - Supported
      - Supported
    * - ``GET DIRECT LOOKUPS``
      - Supported
-     - Supported
    * - ``GET DIRECT DATA``
      - Supported
-     - Supported
    * - ``GET DIRECT SUBSCRIPT`` (subscript ranges from Excel)
-     - Supported
      - Supported (read at translation time; correct array shapes)
    * - ``SMOOTH`` / ``SMOOTH3`` / ``SMOOTHN``
      - Supported (also over several subscript dimensions)
-     - Supported
    * - ``DELAY1`` / ``DELAY3`` / ``DELAYN``
      - Supported (as the Python builder: the order is read at the initial
        time and truncated, and lowered while order × TIME STEP exceeds the
-       delay time; with a changing delay time each stage keeps the delay
-       time it started with)
-     - Supported
+       delay time; with a changing delay time each stage keeps the delay time
+       it started with)
    * - ``DELAY FIXED``
      - Supported (the input recorded at every tick, read N ticks later, with
        any solver; N comes from the delay time at the initial time, as in the
        Python builder)
-     - Supported (the same)
    * - ``TREND``, ``FORECAST``
      - Supported (as the Python builder, also subscripted)
-     - Supported
    * - ``SAMPLE IF TRUE``
      - Supported (its value recorded at every tick and held in between, with
        any solver)
-     - Supported (the same)
    * - ``INITIAL``
-     - Supported
      - Supported
    * - ``ACTIVE INITIAL``
      - Supported (its initial value while the initial values are computed)
-     - Supported (the same)
    * - ``IF THEN ELSE``
-     - Supported (``ifelse``)
      - Supported (``ifelse``)
    * - ``EXP``, ``LN``, ``LOG``, ``SQRT``, the trigonometric functions
      - Supported (PySD.jl's ``PythonMath.exp``, ``PythonMath.log``, ...:
        Python PySD's digits, and NaN out of the domain, as numpy)
-     - Supported (the same)
    * - ``INTEGER``
-     - Supported (Julia's ``trunc(x)``, as the DSL backend)
-     - Supported, written ``ifelse(x < 0, ceil(x), floor(x))``: Symbolics
-       has no ``trunc`` for symbolic variables (only ``floor`` and
-       ``ceil``).  The values are the same; the generated equations read
-       differently from the ODE backend's
+     - Supported, written ``ifelse(x < 0, ceil(x), floor(x))``: Symbolics has
+       no ``trunc`` for symbolic variables (only ``floor`` and ``ceil``).
+       The values are the same; the generated equations read differently from
+       the DSL backend's (``trunc``)
    * - ``PULSE``, ``STEP``, ``RAMP``, ``PULSE TRAIN``
-     - Supported
      - Supported
    * - ``XIDZ``, ``ZIDZ``
      - Supported
-     - Supported
    * - Multiple views (``split_views=True``)
-     - Supported
      - Supported
    * - ``GAME``
      - Supported (passes through; interactive play ignored)
-     - Supported
    * - ``ELMCOUNT``
      - Supported (resolved to integer literal at translation time)
-     - Supported
    * - ``DATA`` variables (tab-delimited ``.tab`` files)
-     - Supported (runtime ``_tab_val`` interpolation via ``tab_data_files=`` parameter)
-     - Supported (the same)
+     - Supported (runtime ``_tab_val`` interpolation via ``tab_data_files=``
+       parameter)
    * - ``DATA`` variables fed from another model's NetCDF output
-     - Supported (pass ``nc_data_files=["results.nc"]`` to ``run_model()``; scalars and
-       subscripted variables supported)
      - Not supported
    * - Subscripted ``GET DIRECT LOOKUPS`` > 2D
      - Partial (flattened to first column with warning)
-     - Partial
    * - ``SMOOTH N`` with non-integer order
      - Partial (order rounded to the nearest integer)
-     - Partial
    * - ``EXCEPT`` exclusion on 3-D subscripts
      - Supported (per-index comprehension equations)
-     - Supported
    * - Macros (``MACRO`` … ``END OF MACRO``, including stocks and macros
        calling other macros)
      - Supported (expanded in place before building: each call gets its own
        copies of the macro's variables, named
        ``<variable>_<macro>_<element>``)
-     - Supported
    * - Subranges, subscript mapping, ranges defined with other ranges,
        subscripts used as values
      - Supported (as the Python builder: a subscript used as a value is its
        position in the largest range containing it)
-     - Supported
    * - XMILE ``MIN``/``MAX`` aggregation (``vmin_xmile``, ``vmax_xmile``)
      - Supported
-     - Supported
    * - XMILE ``DELAY`` embedded in expression
-     - Supported (lifted to an auxiliary, a fixed delay recorded at the ticks)
-     - Supported
+     - Supported (lifted to an auxiliary, a fixed delay recorded at the
+       ticks)
    * - ``ALLOCATE AVAILABLE`` / ``ALLOCATE BY PRIORITY``
      - Supported (exact Vensim algorithm via PySD.jl helpers; subscripted
        variables allocate along their last dimension, as the Python builder)
-     - Supported
    * - ``VECTOR SORT ORDER``, ``VECTOR RANK``, ``VECTOR REORDER``
-     - Supported (along the last subscript of the argument, as the Python
-       builder)
-     - Supported (with comparisons, which ModelingToolkit can build
-       equations from)
+     - Supported (with comparisons, which ModelingToolkit can build equations
+       from)
    * - ``VECTOR SELECT``
-     - Supported (over the ``!`` subscripts of either array, as the Python
-       builder)
      - Partial (the error actions are not checked; with selections that are
        variables, building the system can take very long)
    * - ``GET TIME VALUE``
      - Supported for the current time plus an offset (``GET TIME VALUE(0,
        offset, 0)``), as the Python builder
-     - Supported
    * - Control variables that change during the run (``FINAL TIME``,
        ``TIME STEP``, ``SAVEPER`` depending on ``Time`` or on model variables)
-     - Supported (as the Python builder: evaluated at every step; ``run_model``
-       takes Euler steps)
-     - Supported (the same; not with fixed delays, samples, random draws or
-       switches on the time, which move by steps of ``TIME STEP``)
+     - Supported (as the Python builder: evaluated at every step;
+       ``run_model`` takes Euler steps; not with fixed delays, samples,
+       random draws or switches on the time, which move by steps of ``TIME
+       STEP``)
 
 .. note::
    When the builder encounters an unsupported or partially-supported construct
@@ -826,8 +662,8 @@ parse.  The Julia builder does not yet cover:
      - Not supported — ``run_model()`` always runs the full simulation in one call
    * - Changing constants, lookups and data (``model.run(params=...)``)
      - Full — also in the middle of a run, and any variable's equation
-     - Between runs: ``run_model(params=params(name=value, ...))`` for
-       constants, lookups and data (see `Scenarios`_)
+     - Between runs, with the DSL backend: ``run_model(m; params = (; name =
+       value))`` and ``run_model(m; inputs = ...)`` (see `The DSL backend`_)
    * - State export/import (``model.export()`` / ``model.import_()``)
      - Full — snapshot and restore model state for warm restarts or ensemble branching
      - Not supported
@@ -874,36 +710,24 @@ Limitations
 
 - **MTK structural analysis** scales poorly with model size.  For models
   with hundreds of subscripted equations (which expand into thousands of
-  scalar equations) ``structural_simplify`` can take hours.  Use the ODE
+  scalar equations) ``structural_simplify`` can take hours.  Use the DSL
   backend for large models.
 
 - **EXCEPT subscript exclusion** on 4-D or higher subscripts emits a
   plain broadcast equation (the exclusion is ignored) with a warning.
   1-D, 2-D, and 3-D EXCEPT are fully supported.
 
-- **SAMPLE IF TRUE** uses an ODE hold-stock to track the last sampled value
-  and instantaneously outputs ``ifelse(condition, input, hold)`` at each step.
-  Behaviour matches Vensim when using the Euler solver (up to the last
-  digit, see *Last digits* below).
-
-- **DELAY FIXED** is implemented as an N-stage Euler pipeline
-  (``N = round(delay_time / time_step)``), with both backends, exact up to
-  the last digit (see *Last digits* below).  As in Vensim
-  and the Python builder, N is fixed by the delay time at the initial time,
-  which may be an expression (e.g. ``2.5 * TIME STEP`` or
-  ``4 + STEP(2, 15)``).  Only if the delay time cannot be evaluated at
-  translation time (e.g. it depends on external data) does the builder fall
-  back to a first-order ODE approximation, with a warning.
-  The stages of each delay are one array stock (``_df_pipe_<name>``, with
-  the stage as its first index), so long delays (hundreds of time steps)
-  add one loop to the generated code, not one variable per stage.
+- **DELAY FIXED** (MTK backend): as in Vensim and the Python builder, the
+  number of ticks N is fixed by the delay time at the initial time, which
+  may be an expression (e.g. ``2.5 * TIME STEP`` or ``4 + STEP(2, 15)``).
+  Only if the delay time cannot be evaluated at translation time (e.g. it
+  depends on external data) does the builder fall back to a first-order
+  delay, exact only with Euler steps of ``TIME STEP``, with a warning.
 
 - **Last digits.**  A few constructs can still differ from Python PySD in
-  the last digit: ``DELAY FIXED`` and ``SAMPLE IF TRUE`` keep their values
-  in the ODE state, so a value is passed on as ``b + (a - b)`` instead of
-  copied; ``SUM`` over an array that Python stores transposed adds the
-  elements in another order; and ``TANH`` uses Julia's function (numpy has
-  its own).  Such differences only change a result where the model compares
+  the last digit: ``SUM`` over an array that Python stores transposed adds
+  the elements in another order, and ``TANH`` uses Julia's function (numpy
+  has its own).  Such differences only change a result where the model compares
   two values that are equal up to rounding (``x < 0`` with ``x`` about
   ``1e-16``).
 
@@ -912,10 +736,10 @@ Limitations
   DELAY N order that cannot be evaluated at translation time defaults to 3,
   with a warning.  DELAY N orders are truncated, as in the Python builder.
 
-- **Tab-delimited DATA variables** (``.tab`` file sources) are supported for
-  the ODE backend.  Pass the file paths as ``run_model(tab_data_files=["data.tab"])``;
-  the model reads and interpolates the time series at runtime.  The MTK backend
-  does not yet support tab-delimited DATA variables.
+- **Tab-delimited DATA variables** (``.tab`` file sources), MTK backend:
+  pass the file paths as ``run_model(tab_data_files=["data.tab"])``; the
+  model reads and interpolates the time series at runtime.  (The DSL backend
+  reads them with ``data(parents, :name)``; see `The DSL backend`_.)
 
 - **Step-by-step execution** is not available.  The Python builder exposes
   ``model.set_stepper()`` / ``model.step()`` for advancing the simulation one
@@ -928,8 +752,8 @@ Limitations
   builder's ``model.set_components()`` can replace any variable's equation
   with a new function or constant value at any point during a run.  In the
   Julia builder, constants, lookups and data are changed between runs with
-  ``params()`` (see `Scenarios`_); variables that change during the run
-  cannot be replaced.
+  the DSL backend's ``run_model(m; params = ..., inputs = ...)`` (see `The
+  DSL backend`_); variables that change during the run cannot be replaced.
 
 - **State export/import** is not available.  The Python builder's
   ``model.export()`` / ``model.import_()`` snapshot and restore the full model

@@ -5,6 +5,10 @@ v3.15.0 (unreleased)
 --------------------
 New Features
 ~~~~~~~~~~~~
+- Julia builder: two backends, ``"dsl"`` (the default) and ``"mtk"``
+  (``translate_to_julia(model, backend="mtk")``, a ModelingToolkit system).
+  The DSL backend runs the model with SciML's ODE solvers, faster than the
+  former plain-ODE backend (``"ode"``), which is removed.
 - Julia builder, DSL backend (``translate_to_julia(model, backend="dsl")``):
   writes a Vensim or XMILE model in PySD.jl's language for models, to read and edit as
   Julia code: one file per view (``split_views=True``), every name declared
@@ -32,7 +36,7 @@ New Features
   value), and data or lookups given in parts over several subscripts
   (``x[A, X, company]``, ``x[A, Y, company]``, ...).  ``ALLOCATE BY
   PRIORITY`` and ``ALLOCATE AVAILABLE`` (PySD.jl's ``allocate_by_priority``
-  and ``allocate_available``, with Vensim's algorithms, as the ODE backend).
+  and ``allocate_available``, with Vensim's algorithms, as the MTK backend).
   PySD.jl 0.7.0.
 - Julia builder, DSL backend: macros (written in place, a copy of their
   equations per call), ``:EXCEPT:`` narrower at several positions, ``INITIAL``
@@ -45,8 +49,8 @@ New Features
   backend; the two whose time settings change during the run don't translate
   yet.  Translated models use Julia's functions where there is one (``rem``
   for ``MODULO``, ``trunc`` for ``QUANTUM``, ``mod`` for ``PULSE TRAIN``,
-  ``error`` for a function not translated; with the ODE and MTK backends,
-  ``π`` for ``PI`` and a quotient of logarithms for ``LOG``).  PySD.jl
+  ``error`` for a function not translated; with the MTK backend, ``π`` for
+  ``PI`` and a quotient of logarithms for ``LOG``).  PySD.jl
   0.8.0.
 - Julia builder, DSL backend: time settings that change during the run
   (``FINAL TIME``, ``TIME STEP`` and ``SAVEPER`` that depend on ``Time`` or
@@ -68,16 +72,16 @@ New Features
   Python builder: the translation warns that the model will crash and writes
   ``pysd_not_implemented("NAME", ...)`` (the DSL backend, Julia's
   ``error("Not implemented function 'NAME' ...")``), which raises an error
-  naming it when the model evaluates it.  Before, the ODE and MTK backends wrote a call
+  naming it when the model evaluates it.  Before, the MTK backend wrote a call
   to an undefined name, or 0.0 for a structure they did not handle, and the
   DSL backend stopped the translation.
-- Julia builder, ODE and MTK backends: switches on the time (``STEP``,
+- Julia builder, MTK backend: switches on the time (``STEP``,
   ``PULSE``, comparisons with ``Time``) are exact at the model's ticks with
   any solver; the ``RANDOM`` functions draw once per tick, seeded, the same in
   every run and with any solver; ``run_model`` warns, once, about equations
   written for Euler steps of ``TIME STEP`` when another solver runs the model.
   PySD.jl 0.5.0.  See :doc:`julia_builder`, "Choosing a solver".
-- Julia builder, ODE and MTK backends: ``DELAY FIXED``, ``SAMPLE IF TRUE``
+- Julia builder, MTK backend: ``DELAY FIXED``, ``SAMPLE IF TRUE``
   and a ``DELAY N`` whose delay time changes run with any solver.  They are
   recorded at the model's ticks (PySD.jl's ``PySDTicks``, PySD.jl 0.4.0)
   instead of being written as stocks that are exact only with Euler steps of
@@ -124,29 +128,9 @@ New Features
   and delimited text files (``.csv``, ``.tab``, ...), as the Python builder
   does, and subscripted variables read one row or column per element in
   row/column mode; generated models require PySD.jl 0.2.2 (:issue:`501`).
-- Julia builder (ODE backend): scenarios.  ``params(name = value, ...)``
-  gives any constant, lookup or data series of a generated model another
-  value, and everything computed from them (other constants, the initial
-  values of the stocks) follows; ``sheets`` and ``files`` read the Excel
-  inputs from other sheets or files.  Run with
-  ``run_model(params = params(...))``.  Generated models require PySD.jl
-  0.2.7.
-- Julia builder (ODE backend): when Julia is installed, the generated
-  expressions have only the parentheses they need (printed again by Julia's
-  own parser and printer, ``tidy.jl``; ``PYSD_JULIA_TIDY=0`` skips it).
-- Julia builder (ODE backend): three or more consecutive elements of a
-  variable with the same formula are written as one loop
-  (``for i in 1:3 ... x[i] = y[i] - y[i + 1] ... end``) instead of one line each.
 
 Breaking changes
 ~~~~~~~~~~~~~~~~
-- Julia builder (ODE backend): new layout of the generated model.  The
-  constants, lookups and data are computed once in ``params()``; the stocks
-  are named and shaped (ComponentArrays.jl, a new required package); the
-  equations are written once, in ``model!(d, s, p, t)``, which ``rhs!`` and
-  ``observe`` use; ``initial_state(p)`` gives the initial values.
-  ``run_model``, ``observe(u, t)``, ``u0`` and ``save_results`` keep working
-  as before.
 
 Deprecations
 ~~~~~~~~~~~~
@@ -160,24 +144,24 @@ Bug fixes
   and delays lower their order while order × ``TIME STEP`` exceeds the delay
   time; models with stocks whose initial value is given in parts, lookups by
   element or values by element of the first subscript build.
-- Julia builder, ODE and MTK backends: ``RANDOM NORMAL`` is a normal
+- Julia builder, MTK backend: ``RANDOM NORMAL`` is a normal
   truncated to [min, max] and ``RANDOM EXPONENTIAL`` takes Vensim's (min,
   max, shift, stretch, seed), as the Python builder; the translation with
   PySD.jl 0.5.0 cut the draws at the bounds and took the shift as the scale.
-- Julia builder, ODE and MTK backends: translated models call PySD.jl's
+- Julia builder, MTK backend: translated models call PySD.jl's
   maths functions with Python PySD's digits by Julia's names
   (``PythonMath.exp``, ``PythonMath.log``, ...) and ``INTEGER`` as Julia's
   ``trunc`` (MTK: of ``floor`` and ``ceil``), instead of ``pysd_exp``,
   ``pysd_ln``, ..., ``pysd_trunc`` (deprecated in PySD.jl 0.10.0, which
   translated models need).
-- Julia builder, ODE and MTK backends: a variable defined in parts of which
+- Julia builder, MTK backend: a variable defined in parts of which
   some are ``GET DIRECT DATA`` and others not reads each data part as its
   own series; ``GET DIRECT CONSTANTS`` of some elements of a range, in any
   order, go to their elements, and the elements with no definition are NaN,
   as those of an inline lookup defined for some elements.
-- Julia builder, MTK backend: time settings that change during the run (as
-  the ODE backend: ``run_model`` takes a step of the current ``TIME STEP``
-  and stops at the current ``FINAL TIME``), stocks whose initial value is an
+- Julia builder, MTK backend: time settings that change during the run
+  (``run_model`` takes a step of the current ``TIME STEP`` and stops at the
+  current ``FINAL TIME``), stocks whose initial value is an
   ``ACTIVE INITIAL``, ``DATA`` variables from ``.tab`` files, ``ALLOCATE BY
   PRIORITY`` and ``ALLOCATE AVAILABLE``; a ``DELAY FIXED`` whose initial
   value is an expression keeps its value at the initial time.
@@ -198,8 +182,6 @@ Bug fixes
   (``PythonMath.exp``, ``PythonMath.sin``, ... and ``pysd_power``).  Before, values equal up to rounding (``x < 0`` with
   ``x`` about ``1e-16``) could take the other branch of an ``IF THEN ELSE``
   than in Python.  NaN elements count as 0 in ``SUM``, as in Python.
-- Julia builder (ODE backend): the elements a model does not define are
-  NaN, as in Python PySD; before, they were 0.
 - Julia builder: a lookup or data series of one point has the same value
   everywhere, as in Python PySD (PySD.jl 0.2.5); before, the model failed
   to load.
@@ -214,9 +196,6 @@ Bug fixes
 - Julia builder: a named range local to several sheets of a workbook (a
   scenario sheet and its older copy) is read from the requested sheet
   (PySD.jl 0.2.6).
-- Julia builder (ODE backend): the results file (``save_results``) holds
-  the model's stocks only; the internal stocks of ``DELAY FIXED``,
-  ``SAMPLE IF TRUE`` and others were saved as their first cell.
 - Julia builder: fix multi-dimensional (2D/3D) subscripted variables, which ran
   with wrong values or failed to run. Multi-dimensional stocks are now laid out
   in Julia's column-major order, elements defined one subscript element at a time
@@ -227,29 +206,17 @@ Bug fixes
   now compare 2D/3D test models with their Vensim output (:issue:`494`).
 - Julia builder: delays as in the Python builder.  DELAY FIXED takes its
   number of stages from the delay time at the initial time (also when it is
-  an expression) and uses the exact pipeline with both backends; DELAY N
-  follows a changing delay time stage by stage; DELAY1/3/N lower their order
-  when order × TIME STEP exceeds the delay time.  With the ODE backend,
-  initial values that depend on stocks no longer start from zero
-  (:issue:`511`).
-- Julia builder (ODE backend): control variables that depend on ``Time`` or
-  on model variables (e.g. ``FINAL TIME = IF THEN ELSE(x > 50, Time, 100)``)
-  are evaluated at every step, as in the Python builder; initial values that
-  use ``Time`` or call functions with the same name as a variable no longer
-  fail (:issue:`520`).
+  an expression) and uses the exact pipeline; DELAY N follows a changing
+  delay time stage by stage; DELAY1/3/N lower their order when order × TIME
+  STEP exceeds the delay time (:issue:`511`).
 - Julia builder: subscripted ``SMOOTH`` over several dimensions, subscripted
   ``TREND`` and ``FORECAST`` (with the Python builder's formulas), subscripted
-  ``DELAY FIXED`` inputs, and array constants and ``TABBED ARRAY`` values in
-  the ODE backend now generate valid Julia (:issue:`521`).
+  ``DELAY FIXED`` inputs now generate valid Julia (:issue:`521`).
 - Julia builder: ``ALLOCATE AVAILABLE`` and ``ALLOCATE BY PRIORITY`` on
   subscripted variables, ``VECTOR SORT ORDER``, ``VECTOR RANK`` and ``VECTOR
   REORDER`` (along the last subscript), ``GET TIME VALUE`` of the current
   time, and data defined element by element over several dimensions, as in
-  the Python builder.  With the ODE backend, ``ACTIVE INITIAL`` gives its
-  initial value while the initial values are computed, constants defined
-  element by element are placed at their elements whatever the order of the
-  definitions, and ``GET DIRECT CONSTANTS`` arrays are no longer hidden by
-  local arrays of zeros (:issue:`522`).
+  the Python builder (:issue:`522`).
 - Julia builder: ``VECTOR SELECT`` with Vensim's arguments and numerical
   actions, also when the selection and the expression run over different
   dimensions, and ``:RAW:`` DATA (a value at the data times only), with
@@ -286,10 +253,6 @@ Documentation
 
 Performance
 ~~~~~~~~~~~
-- Julia builder (ODE backend): constants are computed once instead of at
-  every time step, and each equation is compiled once.  On a large model
-  (1,800 variables) a run takes about 2 s instead of about 56 s once
-  compiled, and loading and compiling is faster too.
 - Julia builder: a ``DELAY FIXED`` is a record of its input at the model's
   ticks, instead of one stock per step of its delay.  Models with long fixed
   delays generate far less code (a large model with 1,760-step delays went
@@ -299,7 +262,7 @@ Performance
 Internal Changes
 ~~~~~~~~~~~~~~~~
 - Julia builder: reference tests for every test model of the Python integration
-  pathways, with both Julia backends (ODE and MTK), compared with the reference
+  pathways, with the Julia backends, compared with the reference
   outputs; known failures are tracked in :issue:`499`, :issue:`500`, :issue:`501`
   and :issue:`502`.  Generated models run and save only when executed as a
   script, and now require PySD.jl 0.2.0.

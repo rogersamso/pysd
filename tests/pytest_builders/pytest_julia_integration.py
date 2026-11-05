@@ -33,12 +33,6 @@ SAMPLES_DIR = Path("tests/test-models/samples")
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _no_tidy(monkeypatch):
-    """These tests read the generated text as the builder writes it: without
-    the parentheses pass (tidy.jl, tested in TestTidy)."""
-    monkeypatch.setenv("PYSD_JULIA_TIDY", "0")
-
 def _all_mdl_files() -> List[Tuple[str, Path]]:
     """Return (folder_name, model_path) for every model in tests/test-models/tests/.
 
@@ -244,7 +238,7 @@ class TestTranslationAllModels:
 
         from pysd import translate_to_julia
 
-        jl_path = translate_to_julia(dst)
+        jl_path = translate_to_julia(dst, backend="mtk")
         assert jl_path.exists(), f"{folder}: .jl file was not created"
         assert jl_path.suffix == ".jl"
 
@@ -262,13 +256,12 @@ class TestTranslationAllModels:
 
         from pysd import translate_to_julia
 
-        jl_path = translate_to_julia(dst)
+        jl_path = translate_to_julia(dst, backend="mtk")
         content = jl_path.read_text(encoding="utf-8")
 
-        assert "using OrdinaryDiffEq" in content, f"{folder}: missing 'using OrdinaryDiffEq'"
-        assert "function model!" in content, f"{folder}: missing 'function model!'"
+        assert "using ModelingToolkit, OrdinaryDiffEq" in content, f"{folder}: missing 'using'"
+        assert "@named sys = ODESystem(eqs, t)" in content, f"{folder}: missing the system"
         assert "run_model" in content, f"{folder}: missing 'run_model'"
-        assert "function observe" in content, f"{folder}: missing 'function observe'"
 
 
 class TestTranslationCleanModels:
@@ -290,7 +283,7 @@ class TestTranslationCleanModels:
 
         # With filterwarnings=error in pytest.ini, any UserWarning becomes an
         # error, so we just call translate_to_julia normally.
-        jl_path = translate_to_julia(dst)
+        jl_path = translate_to_julia(dst, backend="mtk")
         assert jl_path.exists()
 
     @pytest.mark.parametrize(
@@ -307,10 +300,10 @@ class TestTranslationCleanModels:
 
         from pysd import translate_to_julia
 
-        jl_path = translate_to_julia(dst)
+        jl_path = translate_to_julia(dst, backend="mtk")
         content = jl_path.read_text(encoding="utf-8")
-        # Every model has at minimum the ODE boilerplate
-        assert "function model!" in content
+        # Every model has at minimum the system
+        assert "@named sys = ODESystem(eqs, t)" in content
 
     @pytest.mark.parametrize(
         "folder,mdl_path",
@@ -326,7 +319,7 @@ class TestTranslationCleanModels:
 
         from pysd import translate_to_julia
 
-        jl_path = translate_to_julia(dst)
+        jl_path = translate_to_julia(dst, backend="mtk")
         content = jl_path.read_text(encoding="utf-8")
         assert "initial_time" in content
         assert "final_time" in content
@@ -346,11 +339,11 @@ class TestTranslationFeatures:
         dst = tmp_path / mdl.name
         _shutil.copy(mdl, dst)
         from pysd import translate_to_julia
-        return translate_to_julia(dst).read_text(encoding="utf-8")
+        return translate_to_julia(dst, backend="mtk").read_text(encoding="utf-8")
 
     def test_integ_emits_ode(self, tmp_path):
         content = self._translate("abs", tmp_path)
-        assert re.search(r"\bd\.\w+", content), "INTEG must produce d.<stock> = ... rates of change"
+        assert re.search(r"\bD\(\w+", content), "INTEG must produce D(<stock>) ~ ... rates of change"
 
     def test_lookup_emits_interpolation(self, tmp_path):
         content = self._translate("lookups_inline", tmp_path)
@@ -385,14 +378,14 @@ class TestTranslationFeatures:
     def test_game_passthrough(self, tmp_path):
         """GAME should not break translation."""
         content = self._translate("game", tmp_path)
-        assert "function model!" in content
+        assert "@named sys = ODESystem(eqs, t)" in content
 
     @pytest.mark.filterwarnings("ignore::UserWarning")
     def test_delay_emits_pipeline_levels(self, tmp_path):
         """DELAY1 / DELAY3 expand into auxiliary _dl level stocks."""
         content = self._translate("delays", tmp_path)
         assert "_dl" in content, "DELAY must introduce pipeline level variables"
-        assert re.search(r"\bd\.\w+", content), "each DELAY level must have its own rate of change"
+        assert re.search(r"\bD\(_dl\w+", content), "each DELAY level must have its own rate of change"
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +494,7 @@ class TestNewConstructsTranslation:
         dst = tmp_path / mdl_path.name
         _shutil.copy(mdl_path, dst)
         from pysd import translate_to_julia
-        jl_path = translate_to_julia(dst)
+        jl_path = translate_to_julia(dst, backend="mtk")
         assert jl_path.exists(), f"{mdl_path.name}: .jl was not created"
         return jl_path.read_text(encoding="utf-8")
 
@@ -513,7 +506,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_delay_fixed test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "function model!" in content
+        assert "@named sys = ODESystem(eqs, t)" in content
 
     def test_delay_fixed_emits_tick_records(self, tmp_path, julia_model):
         """DELAY FIXED: its input recorded at every tick, read N ticks later
@@ -526,7 +519,7 @@ class TestNewConstructsTranslation:
         assert "DELAY FIXED is not supported" not in content
         # delay_time=2 and time_step=0.0625 → 32 ticks
         assert re.search(r"pysd_fixed_delay\(PySDRecord\(_ticks, 1, 32\), ", content)
-        assert "pysd_record!(_ticks, 1, hasproperty(v, :_df_in_output) ? v._df_in_output : p._df_in_output)" in content
+        assert "observed(sys, [_df_in_output])" in content
         assert "_df_pipe_" not in content
 
     # --- TREND ---
@@ -537,7 +530,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_trend test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "function model!" in content
+        assert "@named sys = ODESystem(eqs, t)" in content
 
     def test_trend_emits_smooth_stock_and_output(self, tmp_path, julia_model):
         """TREND must introduce a smooth level stock and an algebraic output."""
@@ -547,7 +540,7 @@ class TestNewConstructsTranslation:
         content = self._translate(mdl, tmp_path)
         # Internal smooth level
         assert "_sm_" in content, "TREND must declare a _sm_ smooth stock"
-        assert re.search(r"\bd\.\w+", content), "TREND must produce a d.<stock> = ... rate of change"
+        assert re.search(r"\bD\(_sm_\w+", content), "TREND must produce a D(<stock>) ~ ... rate of change"
         # Output must be computed (not another ODE)
         assert "trend_of_input" in content
 
@@ -559,7 +552,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_forecast test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "function model!" in content
+        assert "@named sys = ODESystem(eqs, t)" in content
 
     def test_forecast_emits_smooth_stock_and_projection(self, tmp_path, julia_model):
         """FORECAST must introduce a smooth level and project input forward."""
@@ -568,7 +561,7 @@ class TestNewConstructsTranslation:
             pytest.skip("julia_forecast test model not found")
         content = self._translate(mdl, tmp_path)
         assert "_sm_" in content, "FORECAST must declare a _sm_ smooth stock"
-        assert re.search(r"\bd\.\w+", content), "FORECAST must produce a d.<stock> = ... rate of change"
+        assert re.search(r"\bD\(_sm_\w+", content), "FORECAST must produce a D(<stock>) ~ ... rate of change"
         # Projection formula: input * (1.0 + trend * horizon)
         assert "* (1.0 +" in content or "*(1.0 +" in content, \
             "FORECAST output must multiply input by (1 + trend*horizon)"
@@ -581,7 +574,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_sample_if_true test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "function model!" in content
+        assert "@named sys = ODESystem(eqs, t)" in content
 
     def test_sample_if_true_emits_a_tick_record(self, tmp_path, julia_model):
         """SAMPLE IF TRUE: its value recorded at every tick, and held in
@@ -590,8 +583,8 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_sample_if_true test model not found")
         content = self._translate(mdl, tmp_path)
-        assert re.search(r"sample_simple = pysd_sampled\(PySDRecord\(_ticks, \d+, 0\), ", content)
-        assert re.search(r"pysd_record!\(_ticks, \d+, hasproperty\(v, :sample_simple\)", content)
+        assert re.search(r"sample_simple ~ pysd_sampled\(PySDRecord\(_ticks, \d+, 0\), ", content)
+        assert re.search(r"observed\(sys, \[[^]]*\bsample_simple\b", content)
         assert "_sit_" not in content
 
     # --- Built-in function expansions ---
@@ -609,7 +602,7 @@ class TestNewConstructsTranslation:
         _sh.copy(mdl_src, dst)
         with _w.catch_warnings(record=True) as captured:
             _w.simplefilter("always")
-            translate_to_julia(dst)
+            translate_to_julia(dst, backend="mtk")
         unknown = [str(x.message) for x in captured
                    if "Unknown Vensim function 'sum'" in str(x.message)]
         assert not unknown, f"SUM should not produce an 'Unknown function' warning: {unknown}"
@@ -625,7 +618,7 @@ class TestNewConstructsTranslation:
         from pysd import translate_to_julia
         with _w.catch_warnings(record=True) as captured:
             _w.simplefilter("always")
-            translate_to_julia(dst)
+            translate_to_julia(dst, backend="mtk")
         delay_fixed_warns = [str(x.message) for x in captured
                              if "DELAY FIXED" in str(x.message)
                              and "not supported" in str(x.message)]
@@ -681,7 +674,7 @@ TIME STEP  = 1
         import warnings as _w
         with _w.catch_warnings(record=True) as captured:
             _w.simplefilter("always")
-            jl = translate_to_julia(mdl_path)
+            jl = translate_to_julia(mdl_path, backend="mtk")
 
         # Check no "Unknown Vensim function 'population_table'" warning
         unknown = [str(x.message) for x in captured
@@ -868,9 +861,9 @@ class TestNewFeatureIntegration:
         )
         path = JuliaModelBuilder(model).build_model()
         content = path.read_text(encoding="utf-8")
-        # numbers for every element: one array (the second component, over
-        # the whole range, is the last one to set each element)
-        assert "my_var = pysd_input(_given, :my_var, pysd_safe(fill(2.0, 3)))" in content
+        # the EXCEPT part: every element but B
+        assert "my_var[1] ~ 1.0" in content and "my_var[3] ~ 1.0" in content
+        assert "my_var[2] ~ 1.0" not in content
 
     def test_description_and_units_emitted_as_comments(self, tmp_path):
         """Variables with documentation and/or units must have them as # comments."""
@@ -947,7 +940,7 @@ class TestNewFeatureIntegration:
         from pysd import translate_to_julia
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
-            path = translate_to_julia(dst)
+            path = translate_to_julia(dst, backend="mtk")
         assert path.exists()
         # Should emit an unsupported-structure warning
         unsupported = [w for w in captured
@@ -973,7 +966,7 @@ class TestNewFeatureIntegration:
         from pysd import translate_to_julia
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
-            path = translate_to_julia(tmp_path / mdl.name)
+            path = translate_to_julia(tmp_path / mdl.name, backend="mtk")
         unsupported_3d = [w for w in captured if "3D" in str(w.message)]
         assert not unsupported_3d, \
             f"Unexpected 3D-unsupported warnings: {[str(w.message) for w in unsupported_3d]}"
@@ -995,7 +988,7 @@ class TestNewFeatureIntegration:
         from pysd import translate_to_julia
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
-            path = translate_to_julia(tmp_path / mdl.name)
+            path = translate_to_julia(tmp_path / mdl.name, backend="mtk")
         content = path.read_text(encoding="utf-8")
         assert "pysd_allocate_available(" in content, \
             "Expected pysd_allocate_available() in generated Julia"
@@ -1017,7 +1010,7 @@ class TestNewFeatureIntegration:
         from pysd import translate_to_julia
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
-            path = translate_to_julia(dst_dir / mdl.name)
+            path = translate_to_julia(dst_dir / mdl.name, backend="mtk")
         content = path.read_text(encoding="utf-8")
         assert "pysd_allocate_by_priority(" in content, \
             "Expected pysd_allocate_by_priority() in generated Julia"

@@ -15,8 +15,7 @@ seconds is reported as a timeout and the remaining models continue in a new
 process.
 
 Environment variables:
-    PYSD_JULIA_BACKENDS  comma-separated backends to test (default "ode,mtk";
-                         "dsl" for the DSL backend)
+    PYSD_JULIA_BACKENDS  comma-separated backends to test (default "dsl,mtk")
     PYSD_JULIA_MTK       "all" (default) or "subset" (MTK_SUBSET only)
     PYSD_JULIA_CASES     comma-separated model names (e.g. "vector_order,game"):
                          translate and run only these
@@ -55,7 +54,7 @@ from tests.pytest_integration import pytest_integration_xmile_pathway as _xmile
 
 
 TEST_MODELS = Path(__file__).parents[1] / "test-models" / "tests"
-BACKENDS = [b for b in os.environ.get("PYSD_JULIA_BACKENDS", "ode,mtk").split(",") if b]
+BACKENDS = [b for b in os.environ.get("PYSD_JULIA_BACKENDS", "dsl,mtk").split(",") if b]
 MODEL_TIMEOUT = int(os.environ.get("PYSD_JULIA_TIMEOUT", "600"))
 #: Extra seconds for the first model of each Julia process (package loading).
 STARTUP_ALLOWANCE = int(os.environ.get("PYSD_JULIA_STARTUP", "600"))
@@ -121,7 +120,6 @@ CASES, PYTHON_XFAIL = _cases()
 
 #: Julia packages the generated models load, per backend.
 JULIA_PACKAGES = {
-    "ode": ["PySD", "OrdinaryDiffEq", "NCDatasets", "DataInterpolations", "ComponentArrays"],
     "mtk": ["PySD", "OrdinaryDiffEq", "NCDatasets", "DataInterpolations",
             "ModelingToolkit", "Symbolics"],
     "dsl": ["PySD", "DimensionalData"],
@@ -414,42 +412,30 @@ function _pysd_values(m, sol, ids::Vector{String}, t_ref::Vector{Float64})
         (Symbol(mt[1]), mt[2] === nothing ? Int[] : parse.(Int, split(mt[2], ",")))
     end
     pick(v, idx) = isempty(idx) ? Float64(v) : Float64(v[idx...])
-    if isdefined(m, :observe)                       # ODE backend
-        for (r, i) in enumerate(rows)
-            obs = Base.invokelatest(m.observe, sol.u[i], sol.t[i])
-            for (c, (s, idx)) in enumerate(parsed)
-                v = get(obs, String(s), nothing)
-                v === nothing && isdefined(m, s) && (v = getfield(m, s))
-                v === nothing && continue
-                try out[r, c] = pick(v, idx) catch end
+    for (c, (s, idx)) in enumerate(parsed)
+        isdefined(m, s) || continue
+        v = getfield(m, s)
+        # plain numbers are constants; symbolic variables (Num <: Number) are not
+        const_types = Union{AbstractFloat, Integer}
+        if v isa const_types || v isa AbstractArray{<:const_types}
+            try out[:, c] .= pick(v, idx) catch end
+            continue
+        end
+        target = isempty(idx) ? v : v[idx...]
+        series = try
+            sol[target]
+        catch
+            try
+                fill(sol.ps[target], length(sol.t))
+            catch
+                # a parameter no equation uses is not in the simplified
+                # system: its value is its default
+                try fill(Float64(m.ModelingToolkit.getdefault(target)), length(sol.t)) catch; nothing end
             end
         end
-    else                                            # MTK backend
-        for (c, (s, idx)) in enumerate(parsed)
-            isdefined(m, s) || continue
-            v = getfield(m, s)
-            # plain numbers are constants; symbolic variables (Num <: Number) are not
-            const_types = Union{AbstractFloat, Integer}
-            if v isa const_types || v isa AbstractArray{<:const_types}
-                try out[:, c] .= pick(v, idx) catch end
-                continue
-            end
-            target = isempty(idx) ? v : v[idx...]
-            series = try
-                sol[target]
-            catch
-                try
-                    fill(sol.ps[target], length(sol.t))
-                catch
-                    # a parameter no equation uses is not in the simplified
-                    # system: its value is its default
-                    try fill(Float64(m.ModelingToolkit.getdefault(target)), length(sol.t)) catch; nothing end
-                end
-            end
-            series === nothing && continue
-            for (r, i) in enumerate(rows)
-                try out[r, c] = Float64(series[i]) catch end
-            end
+        series === nothing && continue
+        for (r, i) in enumerate(rows)
+            try out[r, c] = Float64(series[i]) catch end
         end
     end
     return out
