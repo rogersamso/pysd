@@ -95,8 +95,13 @@ From Python
 
 ``data_format``
    MTK backend only.  ``"hardcoded"`` (default) reads Excel files at Julia
-   startup via ``PySD.jl`` helpers.  ``"json"`` writes a companion
-   ``<model>_data.json`` file and reads it via ``JSON3.jl``.
+   startup via ``PySD.jl`` helpers.  ``"json"`` reads the external data
+   (GET CONSTANTS, GET LOOKUPS, GET DATA) when the model is translated and
+   writes it to a companion ``<model>_data.json``, which the model reads
+   via ``JSON3.jl``: the model no longer needs the Excel files.  Arrays
+   are stored flattened in Julia's (column-major) order with their
+   ``shape``; missing values are ``null``.  Constants written in the model
+   itself stay in the ``.jl`` file.
 
 ``encoding``
    Source file encoding (Vensim only). If ``None`` the encoding is

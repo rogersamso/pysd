@@ -3606,10 +3606,12 @@ class TestJSONDataBackend:
         import json
         model = self._minimal_model_with_lookup(tmp_path)
         JuliaModelBuilder(model, data_format="json").build_model()
+        # a constant written in the model stays in the .jl: the JSON holds
+        # the external data only
         data = json.loads((tmp_path / "my_model_data.json").read_text())
-        assert "birth_rate" in data["constants"]
-        assert data["constants"]["birth_rate"]["values"] == pytest.approx(0.03)
-        assert data["constants"]["birth_rate"]["units"] == "1/year"
+        assert "birth_rate" not in data["constants"]
+        content = (tmp_path / "my_model.jl").read_text()
+        assert "@parameters birth_rate = 0.03" in content
 
     def test_json_file_contains_lookup(self, tmp_path):
         import json
@@ -3940,12 +3942,10 @@ class TestJSONAccumulateConstant:
         assert "da_const" in data["constants"]
         assert data["constants"]["da_const"]["values"] == pytest.approx(9.9)
 
-    def test_exception_in_accumulate_uses_julia_val_fallback(self, mocker, tmp_path):
-        """If _json_accumulate_constant raises, the julia runtime-read literal is stored."""
+    def test_unreadable_constant_read_when_model_loads(self, mocker, tmp_path):
+        """If the constant cannot be read when translated, the model reads
+        it from the file when it loads, and the JSON does not hold it."""
         import json
-        # _read_get_constants now emits pysd_xlsx_read_constant (no ExtConstant call).
-        # Only _json_accumulate_constant calls ExtConstant; when it raises, the
-        # fallback stores julia_val (the runtime xlsx call string).
         mock_ext = mocker.MagicMock()
         mock_ext.initialize.side_effect = RuntimeError("accumulate fails")
         mocker.patch(
@@ -3965,11 +3965,12 @@ class TestJSONAccumulateConstant:
             elements=[elem] + controls, path=tmp_path / "m.mdl"
         )
         model = AbstractModel(original_path=tmp_path / "m.mdl", sections=(section,))
-        JuliaModelBuilder(model, data_format="json").build_model()
+        with pytest.warns(UserWarning, match="Could not read external constant"):
+            path = JuliaModelBuilder(model, data_format="json").build_model()
         data = json.loads((tmp_path / "m_data.json").read_text())
-        # Fallback stores the julia runtime-read expression
-        assert "fallback_const" in data["constants"]
-        assert "pysd_xlsx_read_constant" in data["constants"]["fallback_const"]["values"]
+        assert "fallback_const" not in data["constants"]
+        assert ('@parameters fallback_const = pysd_xlsx_read_constant('
+                in path.read_text())
 
 
 # ===========================================================================
@@ -4111,9 +4112,15 @@ class TestVariableLimits:
         content = path.read_text()
         assert "#= limits:" in content
 
-    def test_limits_stored_in_json(self, tmp_path):
+    def test_limits_stored_in_json(self, mocker, tmp_path):
         import json
-        comp = AbstractUnchangeableConstant(subscripts=[[], []], ast=0.5)
+        import numpy as np
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = np.float64(0.5)
+        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+        comp = AbstractComponent(
+            subscripts=[[], []],
+            ast=GetConstantsStructure(file="d.xlsx", tab="S", cell="A1"))
         elem = AbstractElement(name="Rate", components=[comp], limits=(0.0, 1.0))
         controls = [
             _make_control_element("INITIAL TIME", 0.0),
@@ -4147,7 +4154,7 @@ class TestExceptSubscriptExclusion:
         )
         # comp2: covers just the excepted elements (no EXCEPT)
         comp2 = AbstractComponent(
-            subscripts=[[dim_name], []],
+            subscripts=[list(except_labels), []],
             ast=comp2_ast,
         )
         return AbstractElement(name=name, components=[comp1, comp2])
@@ -4155,7 +4162,7 @@ class TestExceptSubscriptExclusion:
     def test_except_element_generates_per_index_equations(self):
         sr = _make_subscript_range("category", ["A", "B", "C"])
         # comp1: category = 1.0, EXCEPT [B]
-        # comp2: all category = 2.0 (no EXCEPT)
+        # comp2: B = 2.0
         elem = self._make_except_element(
             "My Var", "category", ["A", "B", "C"],
             comp1_ast=1.0, comp2_ast=2.0,
@@ -4563,10 +4570,7 @@ class TestGetConstantsPiecewise1D:
             gcs_comps=[gcs_comp],
             lit_comps=[lit_comp2, lit_comp3],
         )
-        assert result is not None
-        assert "2.5" in result
-        assert "0.0" in result or "0" in result
-        assert "5.0" in result or "5" in result
+        assert list(result) == [2.5, 0.0, 5.0]
 
     def test_piecewise_1d_scalar_gcs_single_element(self, mocker, tmp_path):
         """1-D piecewise: GCS returns scalar (arr.ndim == 0), single result."""
@@ -4588,8 +4592,7 @@ class TestGetConstantsPiecewise1D:
             gcs_comps=[gcs_comp],
             lit_comps=[],
         )
-        assert result is not None
-        assert "3.14" in result or "3.1" in result
+        assert list(result) == [3.14, 0.0, 0.0]
 
     def test_piecewise_1d_range_name_literal(self, tmp_path):
         """1-D piecewise: literal comp uses a RANGE NAME subscript (covers 3537-3538)."""
@@ -4612,8 +4615,7 @@ class TestGetConstantsPiecewise1D:
             gcs_comps=[],
             lit_comps=[lit_comp],
         )
-        assert result is not None
-        assert "3.0" in result or "3" in result
+        assert list(result) == [3.0, 3.0]
 
     def test_piecewise_1d_no_parent_range(self, tmp_path):
         """1-D piecewise: elements not in any range → parent_range=None (covers 3570)."""
@@ -4667,9 +4669,7 @@ class TestGetConstantsPiecewise1D:
             gcs_comps=[gcs_comp],
             lit_comps=[],
         )
-        assert result is not None
-        assert "5" in result
-        assert "[" not in result  # single value, no brackets
+        assert result == 5.0  # single value, not an array
 
 
 class TestExceptConstantComponent:
@@ -4684,7 +4684,7 @@ class TestExceptConstantComponent:
             subscripts=[["dim"], [["Y"]]], ast=1.0
         )
         comp2 = AbstractUnchangeableConstant(
-            subscripts=[["dim"], []], ast=5.0
+            subscripts=[["Y"], []], ast=5.0
         )
         elem = AbstractElement(name="Const Except", components=[comp1, comp2])
         sb = _section_builder_from_elements([elem], subscripts=[sr])
@@ -6352,7 +6352,7 @@ class TestExceptWithStateful:
             subscripts=[[dim_name], [except_labels]],
             ast=comp1_ast,
         )
-        comp2 = AbstractComponent(subscripts=[[dim_name], []], ast=comp2_ast)
+        comp2 = AbstractComponent(subscripts=[list(except_labels), []], ast=comp2_ast)
         return AbstractElement(name=name, components=[comp1, comp2]), sr
 
     def test_except_1d_integ_emits_stock_decl(self):
@@ -6739,21 +6739,35 @@ class TestSectionBuilderHelpers:
     # Lines 4077 + 4087: json data_format + mtk backend → @register_symbolic
     # ------------------------------------------------------------------
 
-    def test_lookup_block_json_mtk_emits_register_symbolic_for_lookups(self):
-        """In json+mtk mode, _lookup_block emits @register_symbolic for lookup entries (line 4077)."""
+    def test_json_lookup_read_from_the_json(self):
+        """With the JSON data format, a table's points go to the JSON and the
+        model reads them from it; the lookup function is written as usual."""
         sb = _section_builder_from_elements([_make_element("x", 1.0)])
         sb.data_format = "json"
-        sb._json_data["lookups"]["my_lkp"] = {"x": [0.0, 1.0], "y": [0.0, 2.0]}
-        block = sb._lookup_block()
-        assert "@register_symbolic my_lkp(x::Real)" in block
+        const, func, reg = sb._interpolation_code("my_lkp", (0.0, 1.0), (0.0, 2.0), "interpolate")
+        assert sb._json_data["lookups"]["my_lkp"] == {
+            "x": [0.0, 1.0], "y": [0.0, 2.0], "interp_type": "interpolate"}
+        assert ('LinearInterpolation(_json_floats(_model_data["lookups"]["my_lkp"]["y"]), '
+                '_json_floats(_model_data["lookups"]["my_lkp"]["x"])') in const
+        assert func == "my_lkp(x) = my_lkp_itp(x)"
+        assert reg == "@register_symbolic my_lkp(x::Real)"
 
-    def test_lookup_block_json_mtk_emits_register_symbolic_for_data(self):
-        """In json+mtk mode, _lookup_block emits @register_symbolic for data entries (line 4087)."""
+    def test_json_data_read_from_the_json(self):
         sb = _section_builder_from_elements([_make_element("x", 1.0)])
         sb.data_format = "json"
-        sb._json_data["data"]["my_data"] = {"time": [0.0, 1.0], "values": [3.0, 4.0]}
-        block = sb._lookup_block()
-        assert "@register_symbolic my_data(x::Real)" in block
+        const, _, _ = sb._interpolation_code("my_data", (0.0, 1.0), (3.0, float("nan")),
+                                             "hold_backward", kind="data")
+        assert sb._json_data["data"]["my_data"]["time"] == [0.0, 1.0]
+        assert '_json_floats(_model_data["data"]["my_data"]["values"])' in const
+
+    def test_json_nan_written_as_null(self, tmp_path):
+        import json
+        sb = _section_builder_from_elements([_make_element("x", 1.0)], path=tmp_path / "m.mdl")
+        sb.data_format = "json"
+        sb._interpolation_code("my_data", (0.0, 1.0), (3.0, float("nan")),
+                               "interpolate", kind="data")
+        data = json.loads(sb._write_data_json().read_text())
+        assert data["data"]["my_data"]["values"] == [3.0, None]
 
     # ------------------------------------------------------------------
     # Line 1619: EXCEPT 2D continue when all covered rows are excluded
@@ -6937,9 +6951,9 @@ class TestSectionBuilderHelpers:
         result = sb._read_get_constants_piecewise_nd(
             elem, "pc_const", gcs_comps=[], lit_comps=[lit1, lit2, lit3]
         )
-        # Result should be a Julia array literal covering the 2×2 grid
+        # Result should be the values over the 2×2 grid
         assert result is not None
-        assert "[" in result
+        assert result.shape == (2, 2)
 
     # ------------------------------------------------------------------
     # Line 1736: EXCEPT 3D continue when all covered rows are excluded
@@ -8226,9 +8240,15 @@ class TestConstantsInPartsJson:
 
     def test_read_when_translated(self, tmp_path, mocker):
         import xarray as xr
-        mock_ext = mocker.MagicMock()
-        mock_ext.data = xr.DataArray([7.0, 9.0], coords={"r": ["a", "b"]}, dims=["r"])
-        mocker.patch("pysd.py_backend.external.ExtConstant", return_value=mock_ext)
+        # each part reads its own cells: b (B2) is 9, a (D3) is 7
+        cells = {"B2": ("b", 9.0), "D3": ("a", 7.0)}
+
+        def ext_constant(file_name, tab, cell, coords, **kw):
+            ext = mocker.MagicMock()
+            e, v = cells[cell]
+            ext.data = xr.DataArray([v], coords={"r": [e]}, dims=["r"])
+            return ext
+        mocker.patch("pysd.py_backend.external.ExtConstant", side_effect=ext_constant)
         sr = _make_subscript_range("r", ["a", "b"])
         comps = [AbstractComponent(subscripts=[[e], []],
                                    ast=GetConstantsStructure(file="d.xlsx", tab="S", cell=c))
@@ -8237,9 +8257,59 @@ class TestConstantsInPartsJson:
         sb = JuliaSectionBuilder(_make_section([elem], subscripts=[sr], path=tmp_path / "m.mdl"),
                                  data_format="json")
         sb.build_section()
-        assert any(d == "const pc = [7.0, 9.0]" for d in sb.ext_const_decls), sb.ext_const_decls
-        # each part read at its elements
-        assert [c.args[-1] for c in mock_ext.add.call_args_list] == [{"r": ["a"]}]
+        # each value at its element, stored in the JSON and read from it
+        assert sb._json_data["constants"]["pc"]["values"] == [7.0, 9.0]
+        assert sb._json_data["constants"]["pc"]["shape"] == [2]
+        assert ('const pc = reshape(_json_floats(_model_data["constants"]["pc"]["values"]), 2)'
+                in sb.ext_const_decls), sb.ext_const_decls
+
+    def test_subrange_values_in_its_order(self, tmp_path, mocker):
+        """A part over a subrange whose elements are in another order than
+        the parent's (sub: t3, t1): each value goes to its element."""
+        import xarray as xr
+
+        def ext_constant(file_name, tab, cell, coords, **kw):
+            ext = mocker.MagicMock()
+            if cell == "SUB":
+                ext.data = xr.DataArray([3.0, 1.0], coords={"d": ["t3", "t1"]}, dims=["d"])
+            else:
+                ext.data = xr.DataArray([2.0], coords={"d": ["t2"]}, dims=["d"])
+            return ext
+        mocker.patch("pysd.py_backend.external.ExtConstant", side_effect=ext_constant)
+        subs = [_make_subscript_range("d", ["t1", "t2", "t3"]),
+                _make_subscript_range("sub", ["t3", "t1"])]
+        comps = [AbstractComponent(subscripts=[["t2"], []],
+                                   ast=GetConstantsStructure(file="d.xlsx", tab="S", cell="T2")),
+                 AbstractComponent(subscripts=[["sub"], []],
+                                   ast=GetConstantsStructure(file="d.xlsx", tab="S", cell="SUB"))]
+        elem = AbstractElement(name="V", components=comps)
+        sb = JuliaSectionBuilder(_make_section([elem], subscripts=subs, path=tmp_path / "m.mdl"),
+                                 data_format="json")
+        sb.build_section()
+        assert sb._json_data["constants"]["v"]["values"] == [1.0, 2.0, 3.0]
+
+    def test_mixed_data_part_read_when_translated(self, tmp_path, mocker):
+        """A GET DATA part of a variable whose other part is a number: with
+        the JSON data format, its series go to the JSON (no Excel read when
+        the model loads), one function per element."""
+        import xarray as xr
+        mock_ext = mocker.MagicMock()
+        mock_ext.data = xr.DataArray([[1.0, 10.0], [2.0, 20.0]],
+                                     coords={"time": [0.0, 1.0], "r": ["a", "b"]},
+                                     dims=["time", "r"])
+        mocker.patch("pysd.py_backend.external.ExtData", return_value=mock_ext)
+        subs = [_make_subscript_range("t", ["d", "c"]), _make_subscript_range("r", ["a", "b"])]
+        comps = [AbstractData(subscripts=[["d", "r"], []], keyword=None,
+                              ast=GetDataStructure(file="d.xlsx", tab="S",
+                                                   time_row_or_col="4", cell="C5")),
+                 AbstractComponent(subscripts=[["c", "r"], []], ast=2.0)]
+        elem = AbstractElement(name="MD", components=comps)
+        sb = JuliaSectionBuilder(_make_section([elem], subscripts=subs, path=tmp_path / "m.mdl"),
+                                 data_format="json")
+        sb.build_section()
+        assert sb._json_data["data"]["_md_data_0_2"]["values"] == [10.0, 20.0]
+        assert "const _md_data_0_fns = [_md_data_0_1, _md_data_0_2]" in sb.lookup_func_decls
+        assert not any("pysd_xlsx" in d for d in sb.lookup_const_decls)
 
     def test_data_in_parts_read_when_translated(self, tmp_path, mocker):
         """GET DIRECT DATA in parts with the JSON data format: the series read
@@ -8263,4 +8333,5 @@ class TestConstantsInPartsJson:
         # a series per element
         assert sb._json_data["data"]["pd_1"]["values"] == [1.0, 2.0]
         assert sb._json_data["data"]["pd_2"]["values"] == [10.0, 20.0]
-        assert "const pd_fns = [pd_1, pd_2]" in sb.lookup_const_decls
+        # the function table, after the functions it lists
+        assert sb.lookup_func_decls.index("const pd_fns = [pd_1, pd_2]") > sb.lookup_func_decls.index("pd_2(x) = pd_2_itp(x)")

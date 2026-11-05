@@ -470,26 +470,21 @@ class JuliaSectionBuilder:
         # Third pass: process non-control, non-INITIAL elements
         for elem, identifier, is_control in non_control_elems:
             eqs = self._process_element(elem, identifier, is_control)
-            self.built_elements[identifier] = (eqs, is_control)
+            self.built_elements[identifier] = (_last_definitions(elem, eqs), is_control)
 
         # Fourth pass: INITIAL elements (u0_entries now complete)
         for elem, identifier, is_control in initial_elems:
             eqs = self._process_element(elem, identifier, is_control)
-            self.built_elements[identifier] = (eqs, is_control)
+            self.built_elements[identifier] = (_last_definitions(elem, eqs), is_control)
 
         self._finish_ticks()
 
         # Register any inline lookups collected while visiting ASTs
         for lut_name, xs, ys, itp_type in self.inline_registry.entries:
-            const_decl, func_decl, reg_decl = lookup_interpolation_code(lut_name, xs, ys, itp_type)
+            const_decl, func_decl, reg_decl = self._interpolation_code(lut_name, xs, ys, itp_type)
             self.lookup_const_decls.append(const_decl)
             self.lookup_func_decls.append(func_decl)
             self.lookup_register_decls.append(reg_decl)
-            if self.data_format == "json":
-                self._json_data["lookups"][lut_name] = {
-                    "x": list(xs), "y": list(ys),
-                    "interp_type": itp_type, "subscripts": [],
-                }
 
         if self.split and self.views_dict:
             self._build_modular()
@@ -914,7 +909,7 @@ class JuliaSectionBuilder:
 
         # ---- Named lookup table ----------------------------------------
         if isinstance(comp, AbstractLookup) and isinstance(ast, LookupsStructure):
-            const_decl, func_decl, reg_decl = lookup_interpolation_code(
+            const_decl, func_decl, reg_decl = self._interpolation_code(
                 identifier, ast.x, ast.y, ast.type
             )
             self.lookup_const_decls.append(const_decl)
@@ -1084,14 +1079,18 @@ class JuliaSectionBuilder:
             for c in elem.components
         )
         if _const_like:
-            julia_val = self._read_get_constants(elem, identifier)
+            julia_val = None
+            if self.data_format == "json" and not is_control:
+                # read now and stored in the JSON; read from the file when
+                # the model loads if that fails
+                julia_val = self._json_constant(elem, identifier)
+            if julia_val is None:
+                julia_val = self._read_get_constants(elem, identifier)
             if julia_val is not None:
                 if is_control:
                     if identifier in self.control_vals:
                         self.control_vals[identifier] = julia_val
                     return []
-                if self.data_format == "json":
-                    self._json_accumulate_constant(elem, identifier, julia_val)
                 has_subs = any(
                     bool(self._comp_coords(c)) for c in elem.components
                 )
@@ -1175,16 +1174,6 @@ class JuliaSectionBuilder:
                 self.param_decls.append(
                     f"@parameters {identifier} = {value_expr}{lim_comment}"
                 )
-                if self.data_format == "json":
-                    try:
-                        self._json_data["constants"][identifier] = {
-                            "dims": [], "coords": {},
-                            "values": float(value_expr),
-                            "units": elem.units or "",
-                        }
-                        self._json_add_limits(elem, identifier)
-                    except (ValueError, TypeError):
-                        pass
             else:
                 import numpy as _np
                 if isinstance(ast, _np.ndarray) and ndim >= 2:
@@ -1385,7 +1374,10 @@ class JuliaSectionBuilder:
             if isinstance(comp.ast, GetConstantsStructure):
                 name = f"_{identifier}_constant_{k}"
                 part = AbstractElement(name=name, components=[comp])
-                value = self._read_get_constants(part, name)
+                value = (self._json_constant(part, name)
+                         if self.data_format == "json" else None)
+                if value is None:
+                    value = self._read_get_constants(part, name)
                 self.namespace.namespace[name] = name
                 self.ext_const_decls.append(f"const {name} = {value}")
                 # (indexed by the ranges its part is defined over)
@@ -1403,7 +1395,7 @@ class JuliaSectionBuilder:
         at that position), in order; otherwise None."""
         comps = elem.components
         is_data = [isinstance(c.ast, GetDataStructure) for c in comps]
-        if self.data_format == "json" or len(comps) < 2 or not any(is_data) or all(is_data):
+        if len(comps) < 2 or not any(is_data) or all(is_data):
             return None
         var_dims = [d for d, _ in self._element_dims(elem)]
         ranges = []
@@ -1437,11 +1429,14 @@ class JuliaSectionBuilder:
             if isinstance(comp.ast, GetDataStructure):
                 name = f"_{identifier}_data_{k}"
                 ast, over = comp.ast, next(data_parts)
-                self.lookup_const_decls.append(
-                    f"const {name}_fns = pysd_xlsx_build_lookup_dispatch("
-                    f'joinpath(@__DIR__, "{ast.file}"), "{ast.tab}", '
-                    f'"{ast.time_row_or_col}", "{ast.cell}"{self._dispatch_n(comp)})')
                 args = "i, x" if over else "x"
+                if self.data_format == "json":
+                    self._json_data_part(name, comp)
+                else:
+                    self.lookup_const_decls.append(
+                        f"const {name}_fns = pysd_xlsx_build_lookup_dispatch("
+                        f'joinpath(@__DIR__, "{ast.file}"), "{ast.tab}", '
+                        f'"{ast.time_row_or_col}", "{ast.cell}"{self._dispatch_n(comp)})')
                 self.lookup_func_decls.append(f"{name}({args}) = {name}_fns[{'i' if over else 1}](x)")
                 self.lookup_register_decls.append(
                     f"@register_symbolic {name}({'i::Integer, ' if over else ''}x::Real)")
@@ -1453,6 +1448,32 @@ class JuliaSectionBuilder:
                 comp = dataclasses.replace(comp, ast=ReferenceStructure(name))
             lifted.append(comp)
         return dataclasses.replace(elem, components=lifted)
+
+    def _json_data_part(self, name: str, comp: "AbstractComponent") -> None:
+        """A GET DATA part of a variable defined in parts, read now with the
+        JSON data format: one series per element of the part (in the JSON),
+        and ``<name>_fns``, the functions of the time that give them."""
+        import numpy as np
+        from pysd.py_backend.external import ExtData
+        ast, coords = comp.ast, self._comp_coords(comp)
+        ext = ExtData(
+            file_name=ast.file, tab=ast.tab, time_row_or_col=ast.time_row_or_col,
+            cell=ast.cell, interp=getattr(comp, "keyword", None) or "interpolate",
+            coords=coords, root=self.root, final_coords=coords, py_name=name)
+        ext.initialize()
+        xs = [float(t) for t in ext.data.coords["time"].values]
+        # time first, then one column per element of the part
+        cols = np.asarray(ext.data.values, dtype=float).reshape(len(xs), -1)
+        itp = _vensim_keyword_to_itp_type(getattr(comp, "keyword", None))
+        fns = []
+        for k in range(cols.shape[1]):
+            const_decl, func_decl, _ = self._interpolation_code(
+                f"{name}_{k + 1}", xs, cols[:, k], itp, kind="data")
+            self.lookup_const_decls.append(const_decl)
+            self.lookup_func_decls.append(func_decl)
+            fns.append(f"{name}_{k + 1}")
+        # after the functions it lists
+        self.lookup_func_decls.append(f"const {name}_fns = [{', '.join(fns)}]")
 
     def _process_except_element(
         self,
@@ -2930,7 +2951,7 @@ class JuliaSectionBuilder:
                 lkp = idx_to_lkp.get(i)
                 itp_name = f"{identifier}_{i}_itp"
                 if lkp is not None:
-                    const_decl, _, _ = lookup_interpolation_code(
+                    const_decl, _, _ = self._interpolation_code(
                         f"{identifier}_{i}", lkp.x, lkp.y, lkp.type
                     )
                     self.lookup_const_decls.append(const_decl)
@@ -2970,7 +2991,7 @@ class JuliaSectionBuilder:
                     lkp = idx_to_lkp2d.get((i, j))
                     itp_name = f"{identifier}_{i}_{j}_itp"
                     if lkp is not None:
-                        const_decl, _, _ = lookup_interpolation_code(
+                        const_decl, _, _ = self._interpolation_code(
                             f"{identifier}_{i}_{j}", lkp.x, lkp.y, lkp.type
                         )
                         self.lookup_const_decls.append(const_decl)
@@ -3004,7 +3025,7 @@ class JuliaSectionBuilder:
             all_itp_names: List[str] = []
             for k, (idxs, lkp) in enumerate(comp_entries, 1):
                 itp_name = f"{identifier}_{k}_itp"
-                const_decl, _, _ = lookup_interpolation_code(
+                const_decl, _, _ = self._interpolation_code(
                     f"{identifier}_{k}", lkp.x, lkp.y, lkp.type
                 )
                 self.lookup_const_decls.append(const_decl)
@@ -3174,17 +3195,12 @@ class JuliaSectionBuilder:
             # For scalar lookups, data has shape (n_points,)
             if arr.ndim == 1:
                 ys = tuple(float(y) for y in arr)
-                const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                const_decl, func_decl, reg_decl = self._interpolation_code(
                     identifier, xs, ys, "interpolate"
                 )
                 self.lookup_const_decls.append(const_decl)
                 self.lookup_func_decls.append(func_decl)
                 self.lookup_register_decls.append(reg_decl)
-                if self.data_format == "json":
-                    self._json_data["lookups"][identifier] = {
-                        "x": list(xs), "y": list(ys),
-                        "interp_type": "interpolate", "subscripts": [],
-                    }
                 return []
             elif arr.ndim == 2:
                 # 2D: shape (n_points, n_subs).
@@ -3196,7 +3212,7 @@ class JuliaSectionBuilder:
                 for k in range(n_subs):
                     col_ys = tuple(float(y) for y in arr[:, k])
                     sub_name = f"{identifier}_{k + 1}"
-                    const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                    const_decl, func_decl, reg_decl = self._interpolation_code(
                         sub_name, xs, col_ys, "interpolate"
                     )
                     self.lookup_const_decls.append(const_decl)
@@ -3208,7 +3224,8 @@ class JuliaSectionBuilder:
                 # const identifier_fns = [identifier_1, identifier_2, ...]
                 # identifier(i, x) = identifier_fns[i](x)
                 fn_list = ", ".join(sub_func_names)
-                self.lookup_const_decls.append(
+                # after the functions it lists
+                self.lookup_func_decls.append(
                     f"const {identifier}_fns = [{fn_list}]"
                 )
                 self.lookup_func_decls.append(
@@ -3217,14 +3234,6 @@ class JuliaSectionBuilder:
                 self.lookup_register_decls.append(
                     f"@register_symbolic {identifier}(i::Integer, x::Real)"
                 )
-                if self.data_format == "json":
-                    for k in range(n_subs):
-                        sub_name = f"{identifier}_{k + 1}"
-                        col_ys = tuple(float(y) for y in arr[:, k])
-                        self._json_data["lookups"][sub_name] = {
-                            "x": list(xs), "y": list(col_ys),
-                            "interp_type": "interpolate", "subscripts": [],
-                        }
                 return []
             elif arr.ndim == 3:
                 # 3D: shape (n_points, n_dim1, n_dim2).
@@ -3236,21 +3245,17 @@ class JuliaSectionBuilder:
                     for j in range(n_dim2):
                         col_ys = tuple(float(y) for y in arr[:, i, j])
                         sub_name = f"{identifier}_{i + 1}_{j + 1}"
-                        const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                        const_decl, func_decl, reg_decl = self._interpolation_code(
                             sub_name, xs, col_ys, "interpolate"
                         )
                         self.lookup_const_decls.append(const_decl)
                         self.lookup_func_decls.append(func_decl)
                         self.lookup_register_decls.append(reg_decl)
-                        if self.data_format == "json":
-                            self._json_data["lookups"][sub_name] = {
-                                "x": list(xs), "y": list(col_ys),
-                                "interp_type": "interpolate", "subscripts": [],
-                            }
                         row.append(sub_name)
                     rows.append(row)
                 inner = ", ".join("[" + ", ".join(r) + "]" for r in rows)
-                self.lookup_const_decls.append(
+                # after the functions it lists
+                self.lookup_func_decls.append(
                     f"const {identifier}_fns = [{inner}]"
                 )
                 self.lookup_func_decls.append(
@@ -3267,7 +3272,7 @@ class JuliaSectionBuilder:
                     "are supported. Emitting flattened first-column lookup as approximation."
                 )
                 ys = tuple(float(y) for y in arr.reshape(arr.shape[0], -1)[:, 0])
-                const_decl, func_decl, reg_decl = lookup_interpolation_code(
+                const_decl, func_decl, reg_decl = self._interpolation_code(
                     identifier, xs, ys, "interpolate"
                 )
                 self.lookup_const_decls.append(const_decl)
@@ -3501,7 +3506,8 @@ class JuliaSectionBuilder:
                 tab=ast0.tab,
                 time_row_or_col=ast0.time_row_or_col,
                 cell=ast0.cell,
-                interp="interpolate",  # always interpolate when reading at translate time
+                # missing values filled with the variable's method, as Python PySD
+                interp=getattr(comp, "keyword", None) or "interpolate",
                 coords=coords0,
                 root=self.root,
                 final_coords=final_coords,
@@ -3511,7 +3517,8 @@ class JuliaSectionBuilder:
             for c in data_comps[1:]:
                 ai = c.ast
                 comp_coords = self._comp_coords_split(c, split_ranges)
-                ext.add(ai.file, ai.tab, ai.time_row_or_col, ai.cell, "interpolate", comp_coords)
+                ext.add(ai.file, ai.tab, ai.time_row_or_col, ai.cell,
+                        getattr(c, "keyword", None) or "interpolate", comp_coords)
 
             ext.initialize()
 
@@ -3531,17 +3538,12 @@ class JuliaSectionBuilder:
 
             if arr.ndim == 1:
                 ys = tuple(float(y) for y in arr)
-                const_decl, func_decl, reg_decl = lookup_interpolation_code(
-                    identifier, xs, ys, julia_itp
+                const_decl, func_decl, reg_decl = self._interpolation_code(
+                    identifier, xs, ys, julia_itp, kind="data"
                 )
                 self.lookup_const_decls.append(const_decl)
                 self.lookup_func_decls.append(func_decl)
                 self.lookup_register_decls.append(reg_decl)
-                if self.data_format == "json":
-                    self._json_data["data"][identifier] = {
-                        "time": list(xs), "values": list(ys),
-                        "interp_type": julia_itp, "subscripts": [],
-                    }
                 return []
             elif arr.ndim == 2:
                 # Subscripted time-series: shape (n_time, n_subs)
@@ -3550,21 +3552,17 @@ class JuliaSectionBuilder:
                 for k in range(n_subs):
                     col_ys = tuple(float(y) for y in arr[:, k])
                     sub_name = f"{identifier}_{k + 1}"
-                    const_decl, func_decl, reg_decl = lookup_interpolation_code(
-                        sub_name, xs, col_ys, julia_itp
+                    const_decl, func_decl, reg_decl = self._interpolation_code(
+                        sub_name, xs, col_ys, julia_itp, kind="data"
                     )
                     self.lookup_const_decls.append(const_decl)
                     self.lookup_func_decls.append(func_decl)
                     self.lookup_register_decls.append(reg_decl)
-                    if self.data_format == "json":
-                        self._json_data["data"][sub_name] = {
-                            "time": list(xs), "values": list(col_ys),
-                            "interp_type": julia_itp, "subscripts": [],
-                        }
                     sub_func_names.append(sub_name)
 
                 fn_list = ", ".join(sub_func_names)
-                self.lookup_const_decls.append(
+                # after the functions it lists
+                self.lookup_func_decls.append(
                     f"const {identifier}_fns = [{fn_list}]"
                 )
                 self.lookup_func_decls.append(
@@ -3583,21 +3581,17 @@ class JuliaSectionBuilder:
                     for j in range(n_dim2):
                         col_ys = tuple(float(y) for y in arr[:, i, j])
                         sub_name = f"{identifier}_{i + 1}_{j + 1}"
-                        const_decl, func_decl, reg_decl = lookup_interpolation_code(
-                            sub_name, xs, col_ys, julia_itp
+                        const_decl, func_decl, reg_decl = self._interpolation_code(
+                            sub_name, xs, col_ys, julia_itp, kind="data"
                         )
                         self.lookup_const_decls.append(const_decl)
                         self.lookup_func_decls.append(func_decl)
                         self.lookup_register_decls.append(reg_decl)
-                        if self.data_format == "json":
-                            self._json_data["data"][sub_name] = {
-                                "time": list(xs), "values": list(col_ys),
-                                "interp_type": julia_itp, "subscripts": [],
-                            }
                         row.append(sub_name)
                     rows.append(row)
                 inner = ", ".join("[" + ", ".join(r) + "]" for r in rows)
-                self.lookup_const_decls.append(
+                # after the functions it lists
+                self.lookup_func_decls.append(
                     f"const {identifier}_fns = [{inner}]"
                 )
                 self.lookup_func_decls.append(
@@ -3859,6 +3853,13 @@ class JuliaSectionBuilder:
         self, elem: "AbstractElement", identifier: str
     ) -> Optional[str]:
         """Fall back to reading constants at translation time for complex cases."""
+        values = self._external_constant_values(elem, identifier)
+        return None if values is None else _format_julia_value(values)
+
+    def _external_constant_values(self, elem: "AbstractElement", identifier: str):
+        """The values of an external constant (GET XLS/DIRECT CONSTANTS, in
+        one or several parts, possibly mixed with numbers), read now; None if
+        they cannot be read."""
         try:
             from pysd.py_backend.external import ExtConstant
 
@@ -3901,7 +3902,7 @@ class JuliaSectionBuilder:
                 ext.add(ast_i.file, ast_i.tab, ast_i.cell, comp_coords)
 
             ext.initialize()
-            return _format_julia_value(ext.data)
+            return ext.data
 
         except Exception as exc:  # pragma: no cover
             warn(
@@ -3931,7 +3932,6 @@ class JuliaSectionBuilder:
         """
         import numpy as np
         from pysd.py_backend.external import ExtConstant
-        from pysd.builders.julia.julia_expressions_builder import format_number
 
         all_comps = elem.components
 
@@ -3996,8 +3996,8 @@ class JuliaSectionBuilder:
             vals = [elem_values.get(e, 0.0) for e in ordered_elems]
 
         if len(vals) == 1:
-            return format_number(vals[0])
-        return "[" + ", ".join(format_number(v) for v in vals) + "]"
+            return vals[0]
+        return np.asarray(vals, dtype=float)
 
     def _read_get_constants_piecewise_nd(
         self,
@@ -4045,9 +4045,9 @@ class JuliaSectionBuilder:
                 if s is None:
                     idx_arrs.append(np.arange(len(elems)))
                 elif s in self._subs_elems:
-                    # Sub-range: indices of its elements in the parent dim
-                    sub_els = set(self._subs_elems[s])
-                    idxs = [i for i, e in enumerate(elems) if e in sub_els]
+                    # Sub-range: indices of its elements in the parent dim,
+                    # in the sub-range's order (the order of its values)
+                    idxs = [elems.index(e) for e in self._subs_elems[s]]
                     idx_arrs.append(np.array(idxs, dtype=int))
                 elif s in elems:
                     idx_arrs.append(np.array([elems.index(s)], dtype=int))
@@ -4097,54 +4097,87 @@ class JuliaSectionBuilder:
                     f"(component {comp_subs}): {exc}"
                 )
 
-        return _format_julia_value(full_arr)
+        return full_arr
 
     # ------------------------------------------------------------------
     # JSON helpers
     # ------------------------------------------------------------------
 
-    def _json_accumulate_constant(
-        self, elem: "AbstractElement", identifier: str, julia_val: str
-    ) -> None:
-        """Store an external constant's value in ``_json_data["constants"]``."""
+    def _interpolation_code(self, name: str, xs, ys, itp_type: str,
+                            kind: str = "lookups") -> Tuple[str, str, str]:
+        """``lookup_interpolation_code`` for a table (``kind="lookups"``) or a
+        time series (``kind="data"``); with the JSON data format, its points
+        are stored in the JSON and read from it when the model loads."""
+        if self.data_format == "json":
+            x_key, y_key = ("time", "values") if kind == "data" else ("x", "y")
+            self._json_data[kind][name] = {
+                x_key: [float(x) for x in xs], y_key: [float(y) for y in ys],
+                "interp_type": itp_type,
+            }
+            ref = f'_model_data["{kind}"]["{name}"]'
+            xs, ys = (f'_json_floats({ref}["{x_key}"])',
+                      f'_json_floats({ref}["{y_key}"])')
+        return lookup_interpolation_code(name, xs, ys, itp_type)
+
+    def _part_constant_values(self, comp: "AbstractComponent", identifier: str):
+        """The values of one GET CONSTANTS part, over its own elements: an
+        array over the ranges it is defined over (the positions fixed to one
+        element dropped), as the part's Excel cells; None if not read."""
         import numpy as np
+        from pysd.py_backend.external import ExtConstant
         try:
-            from pysd.py_backend.external import ExtConstant
-            comp0 = elem.components[0]
-            coords0 = self._comp_coords(comp0)
+            coords = self._comp_coords(comp)
             ext = ExtConstant(
-                file_name=comp0.ast.file,
-                tab=comp0.ast.tab,
-                cell=comp0.ast.cell,
-                coords=coords0,
-                root=self.root,
-                final_coords={k: self._subs_elems.get(k, v) for k, v in coords0.items()},
-                py_name=identifier,
-            )
+                file_name=comp.ast.file, tab=comp.ast.tab, cell=comp.ast.cell,
+                coords=coords, root=self.root, final_coords=coords,
+                py_name=identifier)
             ext.initialize()
-            raw = ext.data
-            if hasattr(raw, "values"):
-                raw = raw.values
-            arr = np.asarray(raw, dtype=float)
-            if arr.ndim == 0:
-                values: object = float(arr)
-                dims: list = []
-            else:
-                values = arr.tolist()
-                dims = [f"dim{i}" for i in range(arr.ndim)]
-            self._json_data["constants"][identifier] = {
-                "dims": dims,
-                "coords": {},
-                "values": values,
-                "units": elem.units or "",
-            }
-        except Exception:
-            # Best-effort; fall back to the Julia literal string
-            self._json_data["constants"][identifier] = {
-                "dims": [], "coords": {},
-                "values": julia_val,
-                "units": elem.units or "",
-            }
+        except Exception as exc:
+            warn(f"Could not read external constant for '{identifier}': {exc}")
+            return None
+        data = ext.data
+        if not hasattr(data, "dims"):
+            return data
+        subs = list(comp.subscripts[0]) if comp.subscripts else []
+        fixed = [dim for dim, sub in zip(coords, subs) if sub not in self._subs_elems]
+        return np.asarray(data.squeeze([d for d in fixed if d in data.dims]).values,
+                          dtype=float)
+
+    def _json_constant(
+        self, elem: "AbstractElement", identifier: str
+    ) -> Optional[str]:
+        """Store an external constant's values in ``_json_data["constants"]``
+        and return the Julia expression that reads them from ``_model_data``
+        (None if the values cannot be read)."""
+        import numpy as np
+        values = None
+        if len(elem.components) == 1:
+            values = self._part_constant_values(elem.components[0], identifier)
+        if len(elem.components) > 1:
+            # in parts: each part's values at its elements
+            values = self._read_get_constants_piecewise_nd(
+                elem, identifier,
+                [c for c in elem.components if isinstance(c.ast, GetConstantsStructure)],
+                [c for c in elem.components if not isinstance(c.ast, GetConstantsStructure)])
+        if values is None:
+            values = self._external_constant_values(elem, identifier)
+        if values is None:
+            return None
+        if hasattr(values, "values"):
+            values = values.values
+        arr = np.asarray(values, dtype=float)
+        # arrays flattened in Julia's (column-major) order, with their shape
+        self._json_data["constants"][identifier] = {
+            "shape": list(arr.shape),
+            "values": float(arr) if arr.ndim == 0
+                      else arr.flatten(order="F").tolist(),
+            "units": elem.units or "",
+        }
+        self._json_add_limits(elem, identifier)
+        ref = f'_model_data["constants"]["{identifier}"]["values"]'
+        if arr.ndim == 0:
+            return f"_json_float({ref})"
+        return f"reshape(_json_floats({ref}), {', '.join(str(n) for n in arr.shape)})"
 
     # ------------------------------------------------------------------
     # JSON data file
@@ -4160,9 +4193,8 @@ class JuliaSectionBuilder:
             {
               "constants": {
                 "<jl_id>": {
-                  "dims": [...],
-                  "coords": {...},
-                  "values": <scalar|list>,
+                  "shape": [...],
+                  "values": <scalar|list in column-major order>,
                   "units": ""
                 }
               },
@@ -4170,16 +4202,14 @@ class JuliaSectionBuilder:
                 "<jl_id>": {
                   "x": [...],
                   "y": [...],
-                  "interp_type": "interpolate",
-                  "subscripts": []
+                  "interp_type": "interpolate"
                 }
               },
               "data": {
                 "<jl_id>": {
                   "time": [...],
                   "values": [...],
-                  "interp_type": "interpolate",
-                  "subscripts": []
+                  "interp_type": "interpolate"
                 }
               }
             }
@@ -4189,8 +4219,19 @@ class JuliaSectionBuilder:
         # Use self.path.stem (not self.model_name) so macro sections write
         # their data file next to their own .jl file.
         json_path = self.path.with_name(f"{self.path.stem}_data.json")
+        def no_nan(value):
+            # JSON has no NaN: a missing value is written as null
+            if isinstance(value, dict):
+                return {k: no_nan(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [no_nan(v) for v in value]
+            if isinstance(value, float) and math.isnan(value):
+                return None
+            return value
+
         json_path.write_text(
-            json.dumps(self._json_data, indent=2), encoding="UTF-8"
+            json.dumps(no_nan(self._json_data), indent=2, allow_nan=False),
+            encoding="UTF-8"
         )
         return json_path
 
@@ -4344,7 +4385,10 @@ class JuliaSectionBuilder:
         if self.data_format == "json":
             json_fname = f"{self.path.stem}_data.json"
             header += (
-                f'const _model_data = JSON3.read(read(joinpath(@__DIR__, "{json_fname}"), String))\n\n'
+                f'const _model_data = JSON3.read(read(joinpath(@__DIR__, "{json_fname}"), String))\n'
+                "# JSON has no NaN: a missing value is null\n"
+                "_json_float(x) = Float64(something(x, NaN))\n"
+                "_json_floats(v) = Float64[_json_float(x) for x in v]\n\n"
             )
         return header
 
@@ -4475,37 +4519,12 @@ class JuliaSectionBuilder:
         return "\n".join(lines) + "\n"
 
     def _lookup_block(self) -> str:
-        if not self.lookup_const_decls and not self._json_data.get("lookups") \
-                and not self._json_data.get("data"):
+        if not self.lookup_const_decls:
             return ""
         lines = ["# Lookup tables"]
-        if self.data_format == "json":
-            # JSON mode: build LinearInterpolation from _model_data at startup
-            for key in list(self._json_data.get("lookups", {})):
-                itp_name = f"{key}_itp"
-                lines.append(
-                    f'const {itp_name} = LinearInterpolation('
-                    f'Float64.(_model_data["lookups"]["{key}"]["y"]), '
-                    f'Float64.(_model_data["lookups"]["{key}"]["x"]))'
-                )
-                lines.append(f"{key}(x) = {itp_name}(x)")
-                lines.append(f"@register_symbolic {key}(x::Real)")
-            for key in list(self._json_data.get("data", {})):
-                itp_name = f"{key}_itp"
-                lines.append(
-                    f'const {itp_name} = LinearInterpolation('
-                    f'Float64.(_model_data["data"]["{key}"]["values"]), '
-                    f'Float64.(_model_data["data"]["{key}"]["time"]))'
-                )
-                lines.append(f"{key}(x) = {itp_name}(x)")
-                lines.append(f"@register_symbolic {key}(x::Real)")
-        else:
-            for const_decl in self.lookup_const_decls:
-                lines.append(const_decl)
-            for func_decl in self.lookup_func_decls:
-                lines.append(func_decl)
-            for reg_decl in self.lookup_register_decls:
-                lines.append(reg_decl)
+        lines += self.lookup_const_decls
+        lines += self.lookup_func_decls
+        lines += self.lookup_register_decls
         return "\n".join(lines) + "\n\n"
 
     def _declarations_block(self) -> str:
@@ -4953,6 +4972,26 @@ def _path_to_eq_var(path: Path) -> str:
     name = re.sub(r"[^a-z0-9_]", "_", name.lower())
     name = re.sub(r"_+", "_", name).strip("_")
     return f"{name}_eqs"
+
+
+_ELEMENT_LHS = re.compile(r"^(D\()?\w+\[[0-9, ]+\]\)?$")
+
+
+def _last_definitions(elem: "AbstractElement", eqs: List[str]) -> List[str]:
+    """The equations of a variable whose definitions overlap, each element
+    with its last definition only (an element defined twice would make the
+    system overdetermined).  Only equations for one element each are
+    checked: the parts of a variable are written that way."""
+    def element(eq):
+        lhs = eq.split(" ~ ", 1)[0].strip()
+        return lhs if _ELEMENT_LHS.match(lhs) else None
+    last = {element(eq): pos for pos, eq in enumerate(eqs)}
+    kept = [eq for pos, eq in enumerate(eqs)
+            if element(eq) is None or last[element(eq)] == pos]
+    if len(kept) < len(eqs):
+        warn(f"'{elem.name}' defines some elements more than once: "
+             "the last definition is used.")
+    return kept
 
 
 def _format_julia_value(data) -> str:

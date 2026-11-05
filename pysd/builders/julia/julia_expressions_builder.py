@@ -228,9 +228,11 @@ def lookup_interpolation_code(
     ``@register_symbolic`` tells ModelingToolkit that this is an opaque
     external function so it is called at every timestep rather than being
     constant-folded during structural_simplify.
+
+    ``xs`` and ``ys`` are the points, or Julia expressions that give them.
     """
-    xs_vec = format_vector(xs)
-    ys_vec = format_vector(ys)
+    xs_vec = xs if isinstance(xs, str) else format_vector(xs)
+    ys_vec = ys if isinstance(ys, str) else format_vector(ys)
     itp_name = f"{name}_itp"
 
     _extrap = "ExtrapolationType.Constant"

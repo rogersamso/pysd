@@ -165,6 +165,15 @@ Bug fixes
   ``ACTIVE INITIAL``, ``DATA`` variables from ``.tab`` files, ``ALLOCATE BY
   PRIORITY`` and ``ALLOCATE AVAILABLE``; a ``DELAY FIXED`` whose initial
   value is an expression keeps its value at the initial time.
+- Julia builder, MTK backend, ``data_format="json"``: the model reads all
+  its external data from the JSON file, not from Excel (``GET CONSTANTS``
+  were read from Excel, and most lookups and data, and variables mixing data
+  and other parts, were not defined); missing values are ``null``, and data
+  missing in the file is filled with the variable's method, as in Python.
+- Julia builder, MTK backend: an element defined more than once (parts of a
+  variable that overlap) keeps its last definition, with a warning, not two
+  equations; a constant in parts over a subrange whose elements are in
+  another order than its range's puts each value at its element.
 - Fix setting parmas with dimensions (:issue:`484`). (`@enekomartinmartinez <https://github.com/enekomartinmartinez>`_)
 - No deprecation warnings with pandas 3.1: results are indexed by time
   without ``inplace``, and spreadsheets are read with an explicit engine

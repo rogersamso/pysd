@@ -713,7 +713,7 @@ class TestNewFeatureIntegration:
             _ctrl("SAVEPER", 1.0),
         ]
 
-    def _make_model(self, elements, tmp_path, name="test_model"):
+    def _make_model(self, elements, tmp_path, name="test_model", subscripts=()):
         from pysd.translators.structures.abstract_model import (
             AbstractSection, AbstractModel,
         )
@@ -724,7 +724,7 @@ class TestNewFeatureIntegration:
             type="main",
             params=[],
             returns=[],
-            subscripts=(),
+            subscripts=subscripts,
             elements=tuple(elements + self._minimal_controls()),
             constraints=(),
             test_inputs=(),
@@ -859,11 +859,28 @@ class TestNewFeatureIntegration:
             original_path=tmp_path / "except_model.mdl",
             sections=(section,),
         )
-        path = JuliaModelBuilder(model).build_model()
+        with pytest.warns(UserWarning, match="more than once"):
+            path = JuliaModelBuilder(model).build_model()
         content = path.read_text(encoding="utf-8")
-        # the EXCEPT part: every element but B
+        # the definitions overlap: each element once, with its last definition
+        for i in (1, 2, 3):
+            assert content.count(f"my_var[{i}] ~") == 1
+            assert f"my_var[{i}] ~ 2.0" in content
+
+    def test_except_part_written_per_element(self, tmp_path):
+        """A variable defined by an EXCEPT part and the excepted element."""
+        from pysd.builders.julia.julia_model_builder import JuliaModelBuilder
+        from pysd.translators.structures.abstract_model import (
+            AbstractComponent, AbstractElement, AbstractSubscriptRange,
+        )
+        comp1 = AbstractComponent(subscripts=[["cat"], [["B"]]], ast=1.0)
+        comp2 = AbstractComponent(subscripts=[["B"], []], ast=2.0)
+        elem = AbstractElement(name="My Var", components=[comp1, comp2])
+        model = self._make_model([elem], tmp_path, "except_parts", subscripts=(
+            AbstractSubscriptRange(name="cat", subscripts=["A", "B", "C"], mapping=[]),))
+        content = JuliaModelBuilder(model).build_model().read_text(encoding="utf-8")
         assert "my_var[1] ~ 1.0" in content and "my_var[3] ~ 1.0" in content
-        assert "my_var[2] ~ 1.0" not in content
+        assert "my_var[2] ~ 2.0" in content and "my_var[2] ~ 1.0" not in content
 
     def test_description_and_units_emitted_as_comments(self, tmp_path):
         """Variables with documentation and/or units must have them as # comments."""

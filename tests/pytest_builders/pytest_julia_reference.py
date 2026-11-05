@@ -16,6 +16,8 @@ process.
 
 Environment variables:
     PYSD_JULIA_BACKENDS  comma-separated backends to test (default "dsl,mtk")
+    PYSD_JULIA_DATA_FORMAT  the MTK backend's data format, "hardcoded"
+                         (default) or "json"
     PYSD_JULIA_MTK       "all" (default) or "subset" (MTK_SUBSET only)
     PYSD_JULIA_CASES     comma-separated model names (e.g. "vector_order,game"):
                          translate and run only these
@@ -55,6 +57,8 @@ from tests.pytest_integration import pytest_integration_xmile_pathway as _xmile
 
 TEST_MODELS = Path(__file__).parents[1] / "test-models" / "tests"
 BACKENDS = [b for b in os.environ.get("PYSD_JULIA_BACKENDS", "dsl,mtk").split(",") if b]
+# the MTK backend's data format ("hardcoded" or "json")
+DATA_FORMAT = os.environ.get("PYSD_JULIA_DATA_FORMAT", "hardcoded")
 MODEL_TIMEOUT = int(os.environ.get("PYSD_JULIA_TIMEOUT", "600"))
 #: Extra seconds for the first model of each Julia process (package loading).
 STARTUP_ALLOWANCE = int(os.environ.get("PYSD_JULIA_STARTUP", "600"))
@@ -616,7 +620,8 @@ class _Batch:
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    jl_path = translate_to_julia(model, backend=backend)
+                    kw = {"data_format": DATA_FORMAT} if backend == "mtk" else {}
+                    jl_path = translate_to_julia(model, backend=backend, **kw)
                     ids = _dsl_id_map(jl_path.parent / "names.tsv", list(canon.columns)) \
                         if backend == "dsl" else _id_map(model, list(canon.columns))
             except Exception as exc:  # translation error is a test result
