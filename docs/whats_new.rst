@@ -58,6 +58,14 @@ New Features
   of the model that ``Model`` reads at every step, as the Python builder.
   All the test models that the Python pathway runs match Vensim's output with
   the DSL backend (186).  PySD.jl 0.9.0.
+- Julia builder, DSL backend: each declaration carries the variable's name as
+  written in the model (``title = "..."``) and its limits
+  (``limits = (min, max)`` or ``(min, max, step)``, no longer in the
+  description); with ``split_views=True`` each view's equation set has the
+  view's name as written (``@equations title = "..." begin``). Variables the
+  translator adds are marked ``helper = true``. PySD.jl's
+  ``variables(model)`` lists all of it, and its PySDExplorer shows it in a
+  web page. Translated models need PySD.jl 0.11.0.
 - Julia builder, DSL backend: ``DELAY FIXED`` of an expression (a variable of
   its own, delayed), ``GET TIME VALUE(1, offset, 0)`` (the initial time plus
   the offset, as Vensim) and ``GET TIME VALUE(2, 0, measure)`` (the computer's
