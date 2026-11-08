@@ -176,7 +176,8 @@ class Section():
                 test_input.get_abstract_component()
                 for test_input in self.test_inputs],
             split=self.split,
-            views_dict=self.views_dict
+            views_dict=self.views_dict,
+            view_titles=getattr(self, "view_titles", None)
         )
 
     def _merge_components(self) -> List[AbstractElement]:

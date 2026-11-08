@@ -117,6 +117,12 @@ def number(value) -> str:
     return repr(value)
 
 
+def _unquoted(name: str) -> str:
+    """A Vensim name without the quotes around it ("x-y" → x-y)."""
+    name = name.strip()
+    return name[1:-1] if len(name) > 1 and name[0] == name[-1] == '"' else name
+
+
 def jl_string(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
 
@@ -716,7 +722,10 @@ class DSLBuilder:
         variables = [e for e in els if e.kind != "parameter"]
         hidden_params = [d for d in self.hidden.get(view, []) if " = " in d.split(",")[0]]
         hidden_vars = [d for d in self.hidden.get(view, []) if d not in hidden_params]
-        out = [f"# {'View ' + repr(view) if view else 'The equations'}: {len(els)} variables.", "",
+        # the view's name as written in the model: the set's title
+        title = (getattr(self.section, "view_titles", None) or {}).get(view, view)
+        out = [f"# {'View ' + repr(title) if view else 'The equations'}: {len(els)} variables.", "",
+               f"{value} = @equations title = {jl_string(title)} begin" if view else
                f"{value} = @equations begin"]
         if params or hidden_params:
             out.append("    @parameters begin")
@@ -829,16 +838,30 @@ class DSLBuilder:
             self.missing_units.append(el.name)
         items = [f'unit = {"NoUnits" if unit is None else "u" + jl_string(unit)}']
         doc = " ".join((el.documentation or "").split())
-        if el.limits and any(x is not None for x in el.limits):
-            lo, hi = el.limits[:2]
-            bound = lambda x: "?" if x is None or np.isinf(x) else number(x)
-            rng = f"[{bound(lo)}, {bound(hi)}]"
-            doc = (doc + " " + rng).strip()
         if doc:
             items.append(f"description = {jl_string(doc)}")
+        # the name as written in the model, for tables and interfaces (variables(m))
+        items.append(f"title = {jl_string(_unquoted(el.name))}")
+        limits = self._limits(el)
+        if limits:
+            items.append(f"limits = {limits}")
         if any(isinstance(c.ast, ae.IntegStructure) and c.ast.non_negative for c in el.components):
             items.append("nonnegative = true")
         return "[" + ", ".join(items) + "]"
+
+    @staticmethod
+    def _limits(el) -> Optional[str]:
+        """Vensim's [min, max, step] as a Julia tuple: (min, max) or
+        (min, max, step), ±Inf for a bound not given; None without limits."""
+        lim = [x for x in (el.limits or ())]
+        if not lim or all(x is None or (isinstance(x, float) and np.isnan(x)) for x in lim):
+            return None
+        lo = -np.inf if lim[0] is None else lim[0]
+        hi = np.inf if len(lim) < 2 or lim[1] is None else lim[1]
+        out = [number(lo), number(hi)]
+        if len(lim) > 2 and lim[2] is not None and not np.isnan(lim[2]):
+            out.append(number(lim[2]))
+        return "(" + ", ".join(out) + ")"
 
     @staticmethod
     def _unit_item(e: Element) -> str:
@@ -854,7 +877,10 @@ class DSLBuilder:
         return t
 
     def _hide(self, view: str, declaration: str):
-        self.hidden.setdefault(view, []).append(declaration)
+        # a variable the translator adds (not in the original model): marked,
+        # so that tables and interfaces can leave it out
+        assert declaration.endswith("]"), declaration
+        self.hidden.setdefault(view, []).append(declaration[:-1] + ", helper = true]")
 
     def _write_element(self, e: Element):
         meta = self._meta(e)

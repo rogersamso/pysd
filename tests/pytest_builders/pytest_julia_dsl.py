@@ -99,7 +99,7 @@ y = WITH LOOKUP(x, ([(0,0)-(10,1)],(0,0),(10,1)))
 	~		|
 """)
     assert "y_lookup = piecewise_linear(0 => 0, 10 => 1),\n" in code
-    assert '[unit = NoUnits, description = "The lookup of y."]' in code   # y has no description
+    assert '[unit = NoUnits, description = "The lookup of y.", helper = true]' in code   # y has no description
     assert "y ~ y_lookup(x)" in code
 
 
@@ -334,6 +334,28 @@ def test_split_views(tmp_path):
     assert len(views) > 3                               # a file per view, dims and inputs
     text = main.read_text(encoding="utf-8")
     assert all(f'include("{v}")' in text for v in views)
+    # each set has its view's name as written in the model as its title
+    code = "\n".join((main.parent / v).read_text(encoding="utf-8") for v in views)
+    assert '= @equations title = "View-2" begin' in code and '= @equations title = "View 1" begin' in code
+    assert ", view = " not in code                     # not on each declaration
+
+
+def test_names_and_limits_are_metadata(tmp_path):
+    _, code = translate(tmp_path, """
+"Fraction of CO2: kept" = 0.5
+	~	Dmnl [0, 1, 0.01]
+	~	How much is kept.
+	|
+
+Rate = 2
+	~	1/Month [0, ?]
+	~		|
+""")
+    # the model's own name, and the limits apart from the description
+    assert re.search(r'fraction_of_co2_kept = 0\.5,\s+\[unit = NoUnits, description = "How much is kept\.", '
+                     r'title = "Fraction of CO2: kept", limits = \(0, 1, 0\.01\)\]', code)
+    assert 'title = "Rate", limits = (0, Inf)]' in code
+    assert "[0, 1]" not in code
 
 
 def test_initial_of_a_constant_expression_is_its_value(tmp_path):

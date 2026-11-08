@@ -395,6 +395,9 @@ class AbstractSection:
     views_dict: dict
         The dictionary of the views. Giving the variables classified at
         any level in order to split them by files.
+    view_titles: dict (optional)
+        The views' names as written in the model, by the names used
+        in views_dict. None by default.
 
     """
     name: str
@@ -408,6 +411,7 @@ class AbstractSection:
     test_inputs: Tuple[AbstractTestInput]
     split: bool
     views_dict: Union[dict, None]
+    view_titles: Union[dict, None] = None
 
     def __str__(self) -> str:  # pragma: no cover
         return "AbstractSection (%s):\t%s (%s)\n" % (

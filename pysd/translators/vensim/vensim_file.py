@@ -174,6 +174,7 @@ class VensimFile():
 
         grammar = vu.Grammar.get("sketch")
         view_elements = {}
+        titles = {}  # the views' names as written, by their lowercase names
         for module in sketch:
             for sketch_line in module.split("\n"):
                 # parsed line could have information about new view name
@@ -183,6 +184,7 @@ class VensimFile():
                 if parsed.view_name:
                     view_name = parsed.view_name
                     view_elements[view_name] = set()
+                    titles[view_name] = parsed.view_title
 
                 elif parsed.variable_name:
                     view_elements[view_name].add(parsed.variable_name)
@@ -232,6 +234,11 @@ class VensimFile():
 
         self.sections[0].split = True
         self.sections[0].views_dict = views_dict
+        # the views' names as written in the model, by their clean names
+        # (for builders that show them, e.g. Julia's)
+        self.sections[0].view_titles = {
+            self._clean_file_names(name)[0]: titles.get(name, name)
+            for name in non_empty_views}
 
     def get_abstract_model(self) -> AbstractModel:
         """
@@ -365,6 +372,7 @@ class SketchVisitor(parsimonious.NodeVisitor):
 
     def visit_view_name(self, n, vc):
         self.view_name = n.text.lower()
+        self.view_title = n.text.strip()  # as written
 
     def visit_var_definition(self, n, vc):
         if int(vc[10]) % 2 != 0:  # not a shadow variable
