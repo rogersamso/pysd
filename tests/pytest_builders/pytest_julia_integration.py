@@ -260,7 +260,7 @@ class TestTranslationAllModels:
         content = jl_path.read_text(encoding="utf-8")
 
         assert "using ModelingToolkit, OrdinaryDiffEq" in content, f"{folder}: missing 'using'"
-        assert "@named sys = ODESystem(eqs, t)" in content, f"{folder}: missing the system"
+        assert "@named sys = System(eqs, t)" in content, f"{folder}: missing the system"
         assert "run_model" in content, f"{folder}: missing 'run_model'"
 
 
@@ -303,7 +303,7 @@ class TestTranslationCleanModels:
         jl_path = translate_to_julia(dst, backend="mtk")
         content = jl_path.read_text(encoding="utf-8")
         # Every model has at minimum the system
-        assert "@named sys = ODESystem(eqs, t)" in content
+        assert "@named sys = System(eqs, t)" in content
 
     @pytest.mark.parametrize(
         "folder,mdl_path",
@@ -378,7 +378,7 @@ class TestTranslationFeatures:
     def test_game_passthrough(self, tmp_path):
         """GAME should not break translation."""
         content = self._translate("game", tmp_path)
-        assert "@named sys = ODESystem(eqs, t)" in content
+        assert "@named sys = System(eqs, t)" in content
 
     @pytest.mark.filterwarnings("ignore::UserWarning")
     def test_delay_emits_pipeline_levels(self, tmp_path):
@@ -506,7 +506,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_delay_fixed test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "@named sys = ODESystem(eqs, t)" in content
+        assert "@named sys = System(eqs, t)" in content
 
     def test_delay_fixed_emits_tick_records(self, tmp_path, julia_model):
         """DELAY FIXED: its input recorded at every tick, read N ticks later
@@ -530,7 +530,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_trend test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "@named sys = ODESystem(eqs, t)" in content
+        assert "@named sys = System(eqs, t)" in content
 
     def test_trend_emits_smooth_stock_and_output(self, tmp_path, julia_model):
         """TREND must introduce a smooth level stock and an algebraic output."""
@@ -552,7 +552,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_forecast test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "@named sys = ODESystem(eqs, t)" in content
+        assert "@named sys = System(eqs, t)" in content
 
     def test_forecast_emits_smooth_stock_and_projection(self, tmp_path, julia_model):
         """FORECAST must introduce a smooth level and project input forward."""
@@ -574,7 +574,7 @@ class TestNewConstructsTranslation:
         if not mdl.exists():
             pytest.skip("julia_sample_if_true test model not found")
         content = self._translate(mdl, tmp_path)
-        assert "@named sys = ODESystem(eqs, t)" in content
+        assert "@named sys = System(eqs, t)" in content
 
     def test_sample_if_true_emits_a_tick_record(self, tmp_path, julia_model):
         """SAMPLE IF TRUE: its value recorded at every tick, and held in

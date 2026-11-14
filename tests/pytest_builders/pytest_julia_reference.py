@@ -94,9 +94,6 @@ MTK_SCOPE = os.environ.get("PYSD_JULIA_MTK", "all")
 
 #: (case, backend) -> reason.  Strict xfail: remove the entry once it passes.
 KNOWN_FAILURES = {
-    # MTK: VECTOR SELECT with symbolic selections: right values, but building
-    # the system takes more than the 600 s timeout (about 15 minutes)
-    ("vensim:vector_select", "mtk"): "MTK: building the system takes longer than the timeout",
     # MTK: its symbolic simplification changes the last digit before a rounding
     ("vensim:subscripted_round", "mtk"): "values differ from the reference (#499)",
 }
@@ -124,7 +121,7 @@ CASES, PYTHON_XFAIL = _cases()
 
 #: Julia packages the generated models load, per backend.
 JULIA_PACKAGES = {
-    "mtk": ["PySD", "OrdinaryDiffEq", "NCDatasets", "DataInterpolations",
+    "mtk": ["PySD", "OrdinaryDiffEq", "OrdinaryDiffEqLowOrderRK", "NCDatasets", "DataInterpolations",
             "ModelingToolkit", "Symbolics"],
     "dsl": ["PySD", "DimensionalData"],
 }

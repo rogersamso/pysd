@@ -131,7 +131,7 @@ def _ast_children(node) -> list:
 
 
 #: PySD.jl version the generated models are written for (checked on load).
-PYSD_JL_VERSION = "0.11.0"
+PYSD_JL_VERSION = "0.14.0"
 
 # Control variable identifiers produced by Vensim
 # Structures that expand to auxiliary state variables (handled at element level)
@@ -4368,7 +4368,7 @@ class JuliaSectionBuilder:
     # ------------------------------------------------------------------
 
     def _file_header(self, extra_packages: bool = False) -> str:
-        uses = ["ModelingToolkit", "OrdinaryDiffEq", "PySD", "NCDatasets"]
+        uses = ["ModelingToolkit", "OrdinaryDiffEq", "OrdinaryDiffEqLowOrderRK", "PySD", "NCDatasets"]
         has_lookups = bool(self.lookup_const_decls)
         if has_lookups or extra_packages:
             uses.append("DataInterpolations")
@@ -4535,7 +4535,10 @@ class JuliaSectionBuilder:
             lines.append("")
         if self.stock_decls or self.aux_decls:
             lines.append("# State and auxiliary variables")
-            lines.extend(self.stock_decls)
+            # irreducible: mtkcompile must keep the stocks as unknowns (it may
+            # otherwise keep an alias instead and make the stock observed, and
+            # u0 is matched to the unknowns by name)
+            lines.extend(f"{d} [irreducible = true]" for d in self.stock_decls)
             lines.extend(self.aux_decls)
             lines.append("")
         if self.param_decls:
@@ -4790,7 +4793,7 @@ class JuliaSectionBuilder:
                 end
                 """).replace("{TAB_PARAM}", tab_param).replace("{TAB_LOAD}", tab_load)
         ts = self.control_vals.get("time_step") or "time_step"
-        # The unknowns are matched to u0 by name (structural_simplify may
+        # The unknowns are matched to u0 by name (mtkcompile may
         # reorder them, and may add unknowns from algebraic loops, which start
         # at 0.0).  saveat is needed so that a system without unknowns is
         # still saved at every step.
@@ -4887,8 +4890,8 @@ class JuliaSectionBuilder:
 
     def _system_block(self) -> str:
         return (
-            "@named sys = ODESystem(eqs, t)\n"
-            "sys = structural_simplify(sys)\n"
+            "@named sys = System(eqs, t)\n"
+            "sys = mtkcompile(sys)\n"
         )
 
     def _full_file_content(self, equations: List[str]) -> str:

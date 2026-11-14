@@ -240,7 +240,7 @@ def translate_to_julia(
         (``@equations`` and ``Model``): a folder ``<model>_dsl/`` with one
         file per view (with ``split_views=True``), the dimensions and the
         input sheets.  ``"mtk"`` emits a ``ModelingToolkit.jl``
-        ``ODESystem``, for symbolic work on the model.
+        ``System``, for symbolic work on the model.
 
     subview_sep: list (optional)
         Passed to ``parse_sketch`` when ``split_views=True`` (Vensim only).

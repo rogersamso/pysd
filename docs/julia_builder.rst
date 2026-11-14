@@ -19,13 +19,13 @@ into Julia, to run without Python or PySD.  Two backends are available:
        Julia; changing parameters and inputs between runs; derivatives and
        uncertainties through a run
    * - ``"mtk"``
-     - Writes a ``ModelingToolkit.ODESystem``; ModelingToolkit simplifies it
+     - Writes a ``ModelingToolkit.System``; ModelingToolkit simplifies it
        symbolically before solving (see `The MTK backend`_)
      - Small-to-medium models where you want symbolic analysis, LaTeX
        export of the simplified system, or automatic sparsity detection
 
 .. note::
-   The MTK backend runs ``structural_simplify`` before solving, which can
+   The MTK backend runs ``mtkcompile`` before solving, which can
    take minutes to hours for large subscripted models.  For large models use
    the DSL backend.
 
@@ -44,7 +44,7 @@ GitHub at the version this PySD's translated models need (0.11) and add the
 clone (``Pkg.add(url=...)`` can't, as PySD.jl's test models are a git
 submodule)::
 
-   git clone --branch v0.11.0 https://github.com/rogersamso/PySD.jl
+   git clone --branch v0.14.0 https://github.com/rogersamso/PySD.jl
    julia -e 'using Pkg; Pkg.develop(path="PySD.jl")'
 
 Working on PySD from a git checkout, use its submodule instead, which is at
@@ -233,7 +233,7 @@ What a translated model gives you, besides running:
   form (``stock[north,a]``); ``DimStack(r)`` is a dataset, as xarray's, a
   layer per variable over the time and its dimensions.
 
-These need PySD.jl 0.10.0, which the model's package requires.
+These need PySD.jl 0.14.0, which the model's package requires.
 
 What it translates: stocks, auxiliaries and constants; subscripts (ranges,
 subranges, ranges defined with other ranges, mappings, arrays of up to 3
@@ -292,7 +292,8 @@ The MTK backend
 ---------------
 
 ``backend="mtk"`` writes one ``model.jl``: the variables and parameters, the
-equations as a ``ModelingToolkit.ODESystem``, its structural simplification,
+equations as a ``ModelingToolkit.System``, its structural simplification
+(``mtkcompile``),
 and ``run_model``.  It can be run directly::
 
    julia --project=/path/to/PySD.jl model.jl
@@ -632,7 +633,7 @@ not yet).
        from)
    * - ``VECTOR SELECT``
      - Partial (the error actions are not checked; with selections that are
-       variables, building the system can take very long)
+       variables, building the system takes about a minute)
    * - ``GET TIME VALUE``
      - Supported for the current time plus an offset (``GET TIME VALUE(0,
        offset, 0)``), as the Python builder
@@ -723,7 +724,7 @@ Limitations
 
 - **MTK structural analysis** scales poorly with model size.  For models
   with hundreds of subscripted equations (which expand into thousands of
-  scalar equations) ``structural_simplify`` can take hours.  Use the DSL
+  scalar equations) ``mtkcompile`` can take hours.  Use the DSL
   backend for large models.
 
 - **EXCEPT subscript exclusion** on 4-D or higher subscripts emits a

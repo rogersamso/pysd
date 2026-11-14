@@ -8,7 +8,7 @@ New Features
 - **Julia builder (experimental).** The new :py:func:`pysd.translate_to_julia`
   translates Vensim and XMILE models to Julia, to run them with
   `PySD.jl <https://github.com/rogersamso/PySD.jl>`_ and SciML's solvers.
-  Translated models need PySD.jl 0.11.0.  See :doc:`julia_builder`.
+  Translated models need PySD.jl 0.14.0.  See :doc:`julia_builder`.
   (`@rogersamso <https://github.com/rogersamso>`_)
 
   - Two backends.  ``backend="dsl"`` (the default) writes the model in
@@ -27,7 +27,8 @@ New Features
     (``run_model(m, solver)``, ``ODEProblem(m)``), results as tables
     (``DataFrame(r)``, ``DimStack(r)``), new constants, lookups and data
     between runs, and a web page to explore a model (PySDExplorer).
-  - MTK backend output: a ModelingToolkit ``ODESystem``.  The results are
+  - MTK backend output: a ModelingToolkit ``System`` (ModelingToolkit 10
+    or 11, with Symbolics 6 or 7).  The results are
     written to NetCDF, and ``DATA`` variables can come from another model's
     results (``nc_data_files``) or ``.tab`` files (``tab_data_files``).
     External data can be written to a JSON file read at start-up
@@ -46,8 +47,7 @@ New Features
     evaluated, with an error naming it, as in the Python builder.
   - Results as in the Python builder.  The Python pathway's test models
     match Vensim's output with the DSL backend (186 of 186) and the MTK
-    backend (184; ``VECTOR SELECT`` takes too long for ModelingToolkit to
-    build, and one rounding test differs in the last digit).  The maths
+    backend (185; one rounding test differs in the last digit).  The maths
     functions give Python PySD's last digits (C maths library, numpy's
     order of summation, LAPACK's inverse) and NaN outside their domain.
   - Any solver.  Fixed delays, ``SAMPLE IF TRUE`` and switches on ``Time``

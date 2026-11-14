@@ -980,6 +980,8 @@ class TestJuliaModelBuilder:
         path = JuliaModelBuilder(model).build_model()
         content = path.read_text()
         assert "@variables population(t)" in content
+        # mtkcompile keeps stocks as unknowns (u0 is matched to them by name)
+        assert "@variables population(t) [irreducible = true]" in content
 
     def test_output_contains_parameter_declaration(self, tmp_path):
         model = self._minimal_model(tmp_path)
@@ -1003,8 +1005,8 @@ class TestJuliaModelBuilder:
         model = self._minimal_model(tmp_path)
         path = JuliaModelBuilder(model).build_model()
         content = path.read_text()
-        assert "ODESystem" in content
-        assert "structural_simplify" in content
+        assert "System(eqs, t)" in content
+        assert "mtkcompile" in content
 
     def test_output_contains_run_model_function(self, tmp_path):
         model = self._minimal_model(tmp_path)
@@ -1015,7 +1017,7 @@ class TestJuliaModelBuilder:
     def test_run_model_skips_initializeprob(self, tmp_path):
         """run_model must skip MTK's initialization system (build_initializeprob=false)
         and fill missing state variables with 0.0 via unknowns(sys). After
-        structural_simplify, MTK may promote algebraic-loop variables to state
+        mtkcompile, MTK may promote algebraic-loop variables to state
         variables with no explicit u0 entry; iterating unknowns(sys) ensures all
         are covered. The initialization system itself OOMs on large models."""
         model = self._minimal_model(tmp_path)
@@ -1270,7 +1272,7 @@ class TestTranslateToJulia:
         assert path.suffix == ".jl"
         content = path.read_text()
         assert "using ModelingToolkit, OrdinaryDiffEq" in content
-        assert "@named sys = ODESystem(eqs, t)" in content
+        assert "@named sys = System(eqs, t)" in content
         assert "run_model" in content
 
 
@@ -5495,8 +5497,8 @@ class TestMtkOutput:
 
     def test_mtk_has_ode_system(self, tmp_path):
         content = self._build(tmp_path)
-        assert "ODESystem" in content
-        assert "structural_simplify" in content
+        assert "System(eqs, t)" in content
+        assert "mtkcompile" in content
 
     # ---- MTK backend u0 ---------------------------------------------------
 

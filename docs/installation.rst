@@ -121,7 +121,7 @@ GitHub at the version translated models need and add the clone
 
 .. code-block:: bash
 
-   git clone --branch v0.11.0 https://github.com/rogersamso/PySD.jl
+   git clone --branch v0.14.0 https://github.com/rogersamso/PySD.jl
    julia -e 'using Pkg; Pkg.develop(path="PySD.jl")'
 
 From a git checkout of PySD, use its submodule instead:
