@@ -99,7 +99,8 @@ Install via `juliaup <https://github.com/JuliaLang/juliaup>`_:
 
    curl -fsSL https://install.julialang.org | sh
 
-Then install the required Julia packages:
+The default DSL backend needs only PySD.jl (below). For the MTK backend,
+also install:
 
 .. code-block:: bash
 
@@ -113,7 +114,17 @@ Then install the required Julia packages:
        "JSON3",
    ])'
 
-Finally, install the ``PySD.jl`` companion library from the PySD submodule:
+Finally, install the ``PySD.jl`` companion library.  ``pip install pysd``
+doesn't include it, and it isn't in Julia's General registry, so clone it from
+GitHub at the version translated models need and add the clone
+(``Pkg.add(url=...)`` can't, as PySD.jl's test models are a git submodule):
+
+.. code-block:: bash
+
+   git clone --branch v0.11.0 https://github.com/rogersamso/PySD.jl
+   julia -e 'using Pkg; Pkg.develop(path="PySD.jl")'
+
+From a git checkout of PySD, use its submodule instead:
 
 .. code-block:: bash
 

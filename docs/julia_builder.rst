@@ -38,9 +38,17 @@ Julia 1.10 or later. Install via `juliaup <https://github.com/JuliaLang/juliaup>
    curl -fsSL https://install.julialang.org | sh
 
 Then install the ``PySD.jl`` companion library, which the translated models
-use.  It lives in a submodule of the PySD repo
-(``pysd/builders/julia/PySD.jl/``) and can also be found at
-https://github.com/rogersamso/PySD.jl.  From the root of your PySD checkout::
+use (https://github.com/rogersamso/PySD.jl).  ``pip install pysd`` doesn't
+include it, and it isn't in Julia's General registry, so clone it from
+GitHub at the version this PySD's translated models need (0.11) and add the
+clone (``Pkg.add(url=...)`` can't, as PySD.jl's test models are a git
+submodule)::
+
+   git clone --branch v0.11.0 https://github.com/rogersamso/PySD.jl
+   julia -e 'using Pkg; Pkg.develop(path="PySD.jl")'
+
+Working on PySD from a git checkout, use its submodule instead, which is at
+that version::
 
    git submodule update --init pysd/builders/julia/PySD.jl
    julia -e 'using Pkg; Pkg.develop(path="pysd/builders/julia/PySD.jl")'
